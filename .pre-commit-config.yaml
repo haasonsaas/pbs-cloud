@@ -31,6 +31,6 @@ repos:
 
       - id: cargo-test
         name: cargo test
-        entry: cargo test --all
+        entry: ./scripts/test.sh
         language: system
         pass_filenames: false

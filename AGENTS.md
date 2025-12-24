@@ -32,7 +32,7 @@
 
 ## Build & test
 - Build: `cargo build --release`
-- Test: `cargo test`
+- Test: `./scripts/test.sh` (sets TMPDIR to `target/tmp` for low-space environments)
 - Format (CI): `cargo fmt --all -- --check`
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
