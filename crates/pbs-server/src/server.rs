@@ -4507,10 +4507,50 @@ async fn handle_verify_api(
                 let snapshot_path = format!("{}/{}", group.path(), snapshot);
                 match datastore_clone.read_manifest_any(&snapshot_path).await {
                     Ok(mut manifest) => {
-                        let verify_state = serde_json::json!({
-                            "upid": upid_clone.clone(),
-                            "state": "ok",
-                        });
+                        let prefix = format!("{}/", snapshot_path);
+                        let mut missing = Vec::new();
+                        let existing = match datastore_clone.backend().list_files(&prefix).await {
+                            Ok(files) => {
+                                let mut set = std::collections::HashSet::new();
+                                for file in files {
+                                    if let Some(rel) = file.strip_prefix(&prefix) {
+                                        if !rel.is_empty() {
+                                            set.insert(rel.to_string());
+                                        }
+                                    }
+                                }
+                                Some(set)
+                            }
+                            Err(e) => {
+                                state_clone
+                                    .tasks
+                                    .log(
+                                        &upid_clone,
+                                        &format!("Failed to list files {}: {}", snapshot_path, e),
+                                    )
+                                    .await;
+                                None
+                            }
+                        };
+                        if let Some(existing) = existing {
+                            for file in &manifest.files {
+                                if !existing.contains(&file.filename) {
+                                    missing.push(file.filename.clone());
+                                }
+                            }
+                        }
+
+                        let verify_state = if missing.is_empty() {
+                            serde_json::json!({
+                                "upid": upid_clone.clone(),
+                                "state": "ok",
+                            })
+                        } else {
+                            serde_json::json!({
+                                "upid": upid_clone.clone(),
+                                "state": "failed",
+                            })
+                        };
                         update_manifest_unprotected(&mut manifest, "verify_state", verify_state);
                         if let Err(e) = datastore_clone
                             .store_manifest_at(&snapshot_path, &manifest)
@@ -4524,8 +4564,21 @@ async fn handle_verify_api(
                                     &format!("Failed to store manifest {}: {}", snapshot_path, e),
                                 )
                                 .await;
-                        } else {
+                        } else if missing.is_empty() {
                             ok = ok.saturating_add(1);
+                        } else {
+                            failed = failed.saturating_add(1);
+                            state_clone
+                                .tasks
+                                .log(
+                                    &upid_clone,
+                                    &format!(
+                                        "Missing files in {}: {}",
+                                        snapshot_path,
+                                        missing.join(", ")
+                                    ),
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {
