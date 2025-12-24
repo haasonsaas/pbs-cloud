@@ -1136,24 +1136,38 @@ impl SessionManager {
         Ok(manifest)
     }
 
-    /// Clean up expired sessions
-    pub async fn cleanup_expired(&self) {
+    /// Clean up expired sessions and return removed session IDs.
+    pub async fn cleanup_expired(&self) -> (Vec<String>, Vec<String>) {
         let now = Utc::now();
         let timeout = chrono::Duration::seconds(self.timeout_secs as i64);
 
         // Cleanup backup sessions
+        let mut expired_backup = Vec::new();
         {
             let mut sessions = self.backup_sessions.write().await;
-            sessions
-                .retain(|_, session| now.signed_duration_since(session.last_activity) < timeout);
+            sessions.retain(|id, session| {
+                let keep = now.signed_duration_since(session.last_activity) < timeout;
+                if !keep {
+                    expired_backup.push(id.clone());
+                }
+                keep
+            });
         }
 
         // Cleanup reader sessions
+        let mut expired_reader = Vec::new();
         {
             let mut sessions = self.reader_sessions.write().await;
-            sessions
-                .retain(|_, session| now.signed_duration_since(session.last_activity) < timeout);
+            sessions.retain(|id, session| {
+                let keep = now.signed_duration_since(session.last_activity) < timeout;
+                if !keep {
+                    expired_reader.push(id.clone());
+                }
+                keep
+            });
         }
+
+        (expired_backup, expired_reader)
     }
 
     /// Get session count
@@ -1325,7 +1339,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         // Cleanup
-        manager.cleanup_expired().await;
+        let _ = manager.cleanup_expired().await;
 
         // Session should be gone
         assert!(manager

@@ -86,6 +86,8 @@
 - `/api2/json/admin/datastore/<store>/change-owner` (POST) group ownership.
 - `/api2/json/admin/datastore/<store>/gc` (POST) GC.
 - `/api2/json/admin/datastore/<store>/prune` (POST) prune.
+- `/api2/json/admin/verify` (GET) verification job list (stubbed).
+- `/api2/json/admin/verify/<store>/run` (POST) run verification task.
 
 ## Storage layout
 - Manifests: `index.json.blob` (DataBlob-encoded JSON), with legacy fallback to `index.json`.
@@ -101,6 +103,7 @@
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
+- Verification tasks perform manifest-only checks (no deep data verification).
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.

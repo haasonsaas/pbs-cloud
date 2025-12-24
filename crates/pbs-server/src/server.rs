@@ -319,7 +319,30 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             // Clean up expired sessions
-            state_for_cleanup.sessions.cleanup_expired().await;
+            let (expired_backup, expired_reader) =
+                state_for_cleanup.sessions.cleanup_expired().await;
+            for session_id in expired_backup {
+                if let Some(upid) =
+                    take_session_task(&state_for_cleanup.backup_tasks, &session_id).await
+                {
+                    state_for_cleanup
+                        .tasks
+                        .log(&upid, "Backup session expired")
+                        .await;
+                    state_for_cleanup.tasks.finish(&upid, "ABORTED").await;
+                }
+            }
+            for session_id in expired_reader {
+                if let Some(upid) =
+                    take_session_task(&state_for_cleanup.reader_tasks, &session_id).await
+                {
+                    state_for_cleanup
+                        .tasks
+                        .log(&upid, "Reader session expired")
+                        .await;
+                    state_for_cleanup.tasks.finish(&upid, "ABORTED").await;
+                }
+            }
             // Clean up rate limiter state
             state_for_cleanup.rate_limiter.cleanup();
             // Update session metrics
@@ -838,6 +861,13 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::DatastoreAdmin, |ctx| {
                 let state = state.clone();
                 async move { handle_prune(state, &ctx, req).await }
+            })
+            .await
+        }
+        (_, p) if p.starts_with("/api2/json/admin/verify") => {
+            with_auth(auth_ctx, Permission::DatastoreAdmin, |ctx| {
+                let state = state.clone();
+                async move { handle_verify_api(state, &ctx, req).await }
             })
             .await
         }
@@ -4398,6 +4428,141 @@ async fn handle_prune(
         .unwrap_or_else(|| "default".to_string());
 
     handle_prune_body(state, ctx, &store, body).await
+}
+
+async fn handle_verify_api(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let path = uri.path();
+    let rest = path
+        .trim_start_matches("/api2/json/admin/verify")
+        .trim_start_matches('/');
+    if rest.is_empty() {
+        if req.method() != Method::GET {
+            return not_found();
+        }
+        return json_response(StatusCode::OK, &serde_json::json!({ "data": [] }));
+    }
+
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 2 || parts[1] != "run" || req.method() != Method::POST {
+        return not_found();
+    }
+    let store = parts[0];
+    if let Err(e) = validate_datastore_name(store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
+
+    let auth_id = task_auth_id(ctx);
+    let upid = state
+        .tasks
+        .create(&auth_id, "verify", Some(store), Some(store))
+        .await;
+    let state_clone = state.clone();
+    let datastore_clone = datastore.clone();
+    let upid_clone = upid.clone();
+    let store_name = store.to_string();
+    tokio::spawn(async move {
+        state_clone
+            .tasks
+            .log(
+                &upid_clone,
+                &format!("Verification started for {}", store_name),
+            )
+            .await;
+
+        let groups = match datastore_clone.list_backup_groups().await {
+            Ok(groups) => groups,
+            Err(e) => {
+                state_clone
+                    .tasks
+                    .log(&upid_clone, &format!("Failed to list groups: {}", e))
+                    .await;
+                state_clone.tasks.finish(&upid_clone, "ERROR").await;
+                return;
+            }
+        };
+        let mut total = 0u64;
+        let mut ok = 0u64;
+        let mut failed = 0u64;
+
+        for group in groups {
+            let snapshots = datastore_clone
+                .list_snapshots(
+                    group.namespace.as_deref(),
+                    &group.backup_type,
+                    &group.backup_id,
+                )
+                .await
+                .unwrap_or_default();
+            for snapshot in snapshots {
+                total = total.saturating_add(1);
+                let snapshot_path = format!("{}/{}", group.path(), snapshot);
+                match datastore_clone.read_manifest_any(&snapshot_path).await {
+                    Ok(mut manifest) => {
+                        let verify_state = serde_json::json!({
+                            "upid": upid_clone.clone(),
+                            "state": "ok",
+                        });
+                        update_manifest_unprotected(&mut manifest, "verify_state", verify_state);
+                        if let Err(e) = datastore_clone
+                            .store_manifest_at(&snapshot_path, &manifest)
+                            .await
+                        {
+                            failed = failed.saturating_add(1);
+                            state_clone
+                                .tasks
+                                .log(
+                                    &upid_clone,
+                                    &format!("Failed to store manifest {}: {}", snapshot_path, e),
+                                )
+                                .await;
+                        } else {
+                            ok = ok.saturating_add(1);
+                        }
+                    }
+                    Err(e) => {
+                        failed = failed.saturating_add(1);
+                        state_clone
+                            .tasks
+                            .log(
+                                &upid_clone,
+                                &format!("Missing manifest {}: {}", snapshot_path, e),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        state_clone
+            .tasks
+            .log(
+                &upid_clone,
+                &format!(
+                    "Verification finished: total={}, ok={}, failed={}",
+                    total, ok, failed
+                ),
+            )
+            .await;
+        if failed > 0 {
+            state_clone
+                .tasks
+                .finish(&upid_clone, &format!("WARNINGS: {}", failed))
+                .await;
+        } else {
+            state_clone.tasks.finish(&upid_clone, "OK").await;
+        }
+    });
+
+    json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
 }
 
 // === Response helpers ===
