@@ -401,6 +401,38 @@ impl Default for AuthManager {
     }
 }
 
+impl AuthManager {
+    /// Restore a user from persistence (for loading from disk)
+    pub async fn restore_user(&self, user: User) {
+        let mut users = self.users.write().await;
+        let mut index = self.username_index.write().await;
+        index.insert(user.username.clone(), user.id.clone());
+        users.insert(user.id.clone(), user);
+    }
+
+    /// Restore a token from persistence (for loading from disk)
+    pub async fn restore_token(&self, token: ApiToken) {
+        let mut tokens = self.tokens.write().await;
+        tokens.insert(token.id.clone(), token);
+    }
+
+    /// Get the number of users
+    pub async fn user_count(&self) -> usize {
+        self.users.read().await.len()
+    }
+
+    /// Get the number of tokens
+    pub async fn token_count(&self) -> usize {
+        self.tokens.read().await.len()
+    }
+
+    /// List all tokens (for persistence)
+    pub async fn list_all_tokens(&self) -> Vec<ApiToken> {
+        let tokens = self.tokens.read().await;
+        tokens.values().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,5 +34,22 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 
+# TLS support
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+
+# Rate limiting
+governor = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
+
+# Additional utilities
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+url = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

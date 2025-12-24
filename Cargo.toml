@@ -23,6 +23,12 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 h2 = "0.4"
 
+# TLS support
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+rcgen = "0.13"  # For generating self-signed certs
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -38,6 +44,12 @@ rand = "0.8"
 aws-sdk-s3 = "1.61"
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 
+# Rate limiting
+governor = "0.7"
+
+# Metrics
+prometheus = "0.13"
+
 # Utilities
 thiserror = "2.0"
 anyhow = "1.0"
@@ -51,6 +63,9 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 hmac = "0.12"
 tempfile = "3.14"
+parking_lot = "0.12"
+dashmap = "6.1"
+url = "2.5"
 
 # Internal crates
 pbs-core = { path = "crates/pbs-core" }

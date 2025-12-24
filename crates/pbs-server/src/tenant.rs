@@ -145,6 +145,19 @@ impl Default for TenantManager {
     }
 }
 
+impl TenantManager {
+    /// Restore a tenant from persistence (for loading from disk)
+    pub async fn restore_tenant(&self, tenant: Tenant) {
+        let mut tenants = self.tenants.write().await;
+        tenants.insert(tenant.id.clone(), tenant);
+    }
+
+    /// Get the number of tenants
+    pub async fn tenant_count(&self) -> usize {
+        self.tenants.read().await.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

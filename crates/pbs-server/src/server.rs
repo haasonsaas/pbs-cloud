@@ -1,10 +1,11 @@
 //! HTTP/2 server implementation
 //!
-//! Handles both REST API and PBS backup protocol.
+//! Handles both REST API and PBS backup protocol with TLS, rate limiting, and metrics.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -15,14 +16,20 @@ use hyper_util::rt::TokioIo;
 use pbs_core::{ChunkDigest, CryptoConfig, Chunk};
 use pbs_storage::{Datastore, LocalBackend, S3Backend, StorageBackend};
 use tokio::net::TcpListener;
-use tracing::{error, info, instrument, warn};
+use tokio_rustls::TlsAcceptor;
+use tracing::{error, info, instrument, warn, debug};
 
 use crate::auth::{AuthContext, AuthManager, Permission};
 use crate::billing::{BillingManager, UsageEvent, UsageEventType};
 use crate::config::{ServerConfig, StorageConfig};
+use crate::metrics::{Metrics, MetricsConfig};
+use crate::persistence::{PersistenceConfig, PersistenceManager};
 use crate::protocol::{ApiError, BackupParams, PROTOCOL_HEADER};
+use crate::rate_limit::{RateLimitConfig, RateLimiter_, RateLimitResult};
 use crate::session::SessionManager;
+use crate::streaming::{BackupProtocolHandler, ReaderProtocolHandler, FinishBackupResponse};
 use crate::tenant::TenantManager;
+use crate::tls::{TlsConfig, create_tls_acceptor};
 
 /// Server state
 pub struct ServerState {
@@ -40,6 +47,14 @@ pub struct ServerState {
     pub tenants: Arc<TenantManager>,
     /// Billing manager
     pub billing: Arc<BillingManager>,
+    /// Rate limiter
+    pub rate_limiter: Arc<RateLimiter_>,
+    /// Metrics
+    pub metrics: Arc<Metrics>,
+    /// Persistence manager
+    pub persistence: Arc<PersistenceManager>,
+    /// TLS acceptor (None if TLS disabled)
+    pub tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl ServerState {
@@ -71,14 +86,61 @@ impl ServerState {
 
         let (billing, _rx) = BillingManager::new();
 
+        // Initialize persistence
+        let persistence_config = PersistenceConfig::new(
+            config.data_dir.as_deref().unwrap_or("~/.pbs-cloud")
+        );
+        let persistence = Arc::new(PersistenceManager::new(persistence_config).await?);
+
+        // Initialize metrics
+        let metrics = Arc::new(Metrics::new(MetricsConfig::default())?);
+
+        // Initialize rate limiter
+        let rate_limiter = Arc::new(RateLimiter_::new(
+            config.rate_limit.clone().unwrap_or_default()
+        ));
+
+        // Initialize TLS
+        let tls_acceptor = create_tls_acceptor(&config.tls.clone().unwrap_or_default())?;
+
+        // Create auth and tenant managers
+        let auth = Arc::new(AuthManager::default());
+        let tenants = Arc::new(TenantManager::default());
+
+        // Load persisted data
+        let users = persistence.load_users().await.unwrap_or_default();
+        let tokens = persistence.load_tokens().await.unwrap_or_default();
+        let tenant_list = persistence.load_tenants().await.unwrap_or_default();
+
+        // Restore state from persistence
+        for user in users {
+            auth.restore_user(user).await;
+        }
+        for token in tokens {
+            auth.restore_token(token).await;
+        }
+        for tenant in tenant_list {
+            tenants.restore_tenant(tenant).await;
+        }
+
+        info!("Loaded {} users, {} tokens, {} tenants from persistence",
+            auth.user_count().await,
+            auth.token_count().await,
+            tenants.tenant_count().await
+        );
+
         Ok(Self {
             config,
             backend,
             datastores,
             sessions: Arc::new(SessionManager::default()),
-            auth: Arc::new(AuthManager::default()),
-            tenants: Arc::new(TenantManager::default()),
+            auth,
+            tenants,
             billing: Arc::new(billing),
+            rate_limiter,
+            metrics,
+            persistence,
+            tls_acceptor,
         })
     }
 
@@ -91,6 +153,20 @@ impl ServerState {
     pub fn default_datastore(&self) -> Arc<Datastore> {
         self.datastores.get("default").cloned().unwrap()
     }
+
+    /// Save current state to persistence
+    pub async fn save_state(&self) -> anyhow::Result<()> {
+        let users = self.auth.list_users(None).await;
+        let tokens = self.auth.list_all_tokens().await;
+        let tenants = self.tenants.list_tenants().await;
+
+        self.persistence.save_users(&users).await?;
+        self.persistence.save_tokens(&tokens).await?;
+        self.persistence.save_tenants(&tenants).await?;
+
+        debug!("Saved state to persistence");
+        Ok(())
+    }
 }
 
 /// Start the HTTP/2 server
@@ -99,14 +175,16 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
     let addr: SocketAddr = state.config.listen_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
 
-    info!("PBS Cloud Server listening on {}", addr);
+    let protocol = if state.tls_acceptor.is_some() { "https" } else { "http" };
+    info!("PBS Cloud Server listening on {}://{}", protocol, addr);
 
     // Create root user if no users exist
-    if state.auth.list_users(None).await.is_empty() {
+    if state.auth.user_count().await == 0 {
         let default_tenant = &state.config.tenants.default_tenant;
 
         // Create default tenant
-        state.tenants.create_tenant(default_tenant).await;
+        let tenant = state.tenants.create_tenant(default_tenant).await;
+        info!("Created default tenant: {}", tenant.name);
 
         // Create root user
         match state.auth.create_root_user(default_tenant).await {
@@ -114,6 +192,11 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 info!("Created root user: {}", user.username);
                 info!("Root API token: {}", token);
                 info!("Save this token - it won't be shown again!");
+
+                // Save immediately
+                if let Err(e) = state.save_state().await {
+                    warn!("Failed to save initial state: {}", e);
+                }
             }
             Err(e) => {
                 warn!("Failed to create root user: {}", e);
@@ -121,23 +204,73 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
         }
     }
 
+    // Spawn periodic tasks
+    let state_for_cleanup = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            // Clean up expired sessions
+            state_for_cleanup.sessions.cleanup_expired().await;
+            // Clean up rate limiter state
+            state_for_cleanup.rate_limiter.cleanup();
+            // Update session metrics
+            let (backup_count, reader_count) = state_for_cleanup.sessions.session_count().await;
+            state_for_cleanup.metrics.update_session_counts(backup_count, reader_count);
+        }
+    });
+
+    // Spawn periodic persistence save
+    let state_for_save = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Every 5 minutes
+        loop {
+            interval.tick().await;
+            if let Err(e) = state_for_save.save_state().await {
+                error!("Failed to save state: {}", e);
+            }
+        }
+    });
+
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let state = state.clone();
 
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
+            // Handle TLS if enabled
+            let result = if let Some(ref acceptor) = state.tls_acceptor {
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        let io = TokioIo::new(tls_stream);
+                        http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                            .serve_connection(
+                                io,
+                                service_fn(move |req| {
+                                    let state = state.clone();
+                                    handle_request(state, peer_addr, req)
+                                }),
+                            )
+                            .await
+                    }
+                    Err(e) => {
+                        debug!("TLS handshake failed: {:?}", e);
+                        return;
+                    }
+                }
+            } else {
+                let io = TokioIo::new(stream);
+                http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let state = state.clone();
+                            handle_request(state, peer_addr, req)
+                        }),
+                    )
+                    .await
+            };
 
-            if let Err(err) = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(
-                    io,
-                    service_fn(move |req| {
-                        let state = state.clone();
-                        handle_request(state, peer_addr, req)
-                    }),
-                )
-                .await
-            {
+            if let Err(err) = result {
                 error!("Error serving connection: {:?}", err);
             }
         });
@@ -150,15 +283,24 @@ async fn handle_request(
     peer_addr: SocketAddr,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    info!("{} {} from {}", method, path, peer_addr);
+    debug!("{} {} from {}", method, path, peer_addr);
+
+    // Check rate limit for IP (before auth)
+    if let RateLimitResult::Limited { retry_after_secs, limit, remaining } =
+        state.rate_limiter.check_ip(peer_addr.ip())
+    {
+        state.metrics.record_request(&path, method.as_str(), 429, start.elapsed().as_secs_f64());
+        return Ok(rate_limited_response(retry_after_secs, limit, remaining));
+    }
 
     // Check for protocol upgrade (backup/restore sessions)
     if let Some(upgrade) = req.headers().get("upgrade") {
         if upgrade.to_str().unwrap_or("") == PROTOCOL_HEADER {
-            return Ok(handle_protocol_upgrade(&state, &req).await);
+            return Ok(handle_protocol_upgrade(state.clone(), &req).await);
         }
     }
 
@@ -166,9 +308,25 @@ async fn handle_request(
     let auth_ctx = if is_public_endpoint(&path) {
         None
     } else {
-        match authenticate(&state, &req).await {
-            Ok(ctx) => Some(ctx),
-            Err(e) => return Ok(error_response(e)),
+        match authenticate(state.clone(), &req).await {
+            Ok(ctx) => {
+                state.metrics.record_auth_attempt(true);
+
+                // Check tenant rate limit
+                if let RateLimitResult::Limited { retry_after_secs, limit, remaining } =
+                    state.rate_limiter.check_tenant(&ctx.user.tenant_id)
+                {
+                    state.metrics.record_request(&path, method.as_str(), 429, start.elapsed().as_secs_f64());
+                    return Ok(rate_limited_response(retry_after_secs, limit, remaining));
+                }
+
+                Some(ctx)
+            }
+            Err(e) => {
+                state.metrics.record_auth_attempt(false);
+                state.metrics.record_request(&path, method.as_str(), 401, start.elapsed().as_secs_f64());
+                return Ok(error_response(e));
+            }
         }
     };
 
@@ -180,14 +338,17 @@ async fn handle_request(
     }
 
     // Route to appropriate handler
-    let response = match (method, path.as_str()) {
+    let response = match (method.clone(), path.as_str()) {
         // Public endpoints
         (Method::GET, "/api2/json/version") => handle_version().await,
         (Method::GET, "/api2/json/access/ticket") => handle_auth_info().await,
 
+        // Metrics endpoint
+        (Method::GET, "/metrics") => handle_metrics(state.clone()).await,
+
         // Auth endpoints
         (Method::POST, "/api2/json/access/ticket") => {
-            handle_login(&state, req).await
+            handle_login(state.clone(), req).await
         }
 
         // API v2 routes (require auth)
@@ -198,18 +359,135 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
                 let path = p.to_string();
-                async move { handle_datastore_api(&state, &ctx, &path).await }
+                async move { handle_datastore_api(state, &ctx, &path).await }
             }).await
         }
         (Method::GET, "/api2/json/status") => {
-            with_auth(auth_ctx, Permission::Read, |_| async { handle_status().await }).await
+            with_auth(auth_ctx, Permission::Read, |_| {
+                let state = state.clone();
+                async move { handle_status(state).await }
+            }).await
         }
 
         // Backup protocol endpoints
         (Method::POST, p) if p.starts_with("/api2/json/admin/datastore/") && p.contains("/backup") => {
             with_auth(auth_ctx, Permission::Backup, |ctx| {
                 let state = state.clone();
-                async move { handle_start_backup(&state, &ctx, req).await }
+                async move { handle_start_backup(state, &ctx, req).await }
+            }).await
+        }
+
+        // Reader/Restore endpoints
+        (Method::POST, p) if p.starts_with("/api2/json/admin/datastore/") && p.contains("/reader") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_start_reader(state, &ctx, req).await }
+            }).await
+        }
+
+        // Session-based backup operations
+        (Method::POST, "/api2/json/backup/fixed_chunk") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_upload_chunk(state, &ctx, req, "fixed").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/dynamic_chunk") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_upload_chunk(state, &ctx, req, "dynamic").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/fixed_index") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_create_index(state, &ctx, req, "fixed").await }
+            }).await
+        }
+        (Method::PUT, "/api2/json/backup/fixed_index") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_append_index(state, &ctx, req, "fixed").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/fixed_close") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_close_index(state, &ctx, req, "fixed").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/dynamic_index") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_create_index(state, &ctx, req, "dynamic").await }
+            }).await
+        }
+        (Method::PUT, "/api2/json/backup/dynamic_index") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_append_index(state, &ctx, req, "dynamic").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/dynamic_close") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_close_index(state, &ctx, req, "dynamic").await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/blob") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_upload_blob(state, &ctx, req).await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/finish") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_finish_backup(state, &ctx, req).await }
+            }).await
+        }
+        (Method::POST, "/api2/json/backup/known_chunks") => {
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_known_chunks(state, &ctx, req).await }
+            }).await
+        }
+
+        // Reader/Restore operations
+        (Method::GET, "/api2/json/reader/download_chunk") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_download_chunk(state, &ctx, req).await }
+            }).await
+        }
+        (Method::GET, "/api2/json/reader/fixed_index") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_read_index(state, &ctx, req, "fixed").await }
+            }).await
+        }
+        (Method::GET, "/api2/json/reader/dynamic_index") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_read_index(state, &ctx, req, "dynamic").await }
+            }).await
+        }
+        (Method::GET, "/api2/json/reader/blob") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_read_blob(state, &ctx, req).await }
+            }).await
+        }
+        (Method::GET, "/api2/json/reader/manifest") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_read_manifest(state, &ctx, req).await }
+            }).await
+        }
+        (Method::POST, "/api2/json/reader/close") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_close_reader(state, &ctx, req).await }
             }).await
         }
 
@@ -217,13 +495,13 @@ async fn handle_request(
         (Method::GET, "/api2/json/tenants") => {
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
-                async move { handle_list_tenants(&state).await }
+                async move { handle_list_tenants(state).await }
             }).await
         }
         (Method::POST, "/api2/json/tenants") => {
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
-                async move { handle_create_tenant(&state, req).await }
+                async move { handle_create_tenant(state, req).await }
             }).await
         }
 
@@ -231,25 +509,25 @@ async fn handle_request(
         (Method::GET, "/api2/json/access/users") => {
             with_auth(auth_ctx, Permission::Admin, |ctx| {
                 let state = state.clone();
-                async move { handle_list_users(&state, &ctx).await }
+                async move { handle_list_users(state, &ctx).await }
             }).await
         }
         (Method::POST, "/api2/json/access/users") => {
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
-                async move { handle_create_user(&state, req).await }
+                async move { handle_create_user(state, req).await }
             }).await
         }
         (Method::GET, "/api2/json/access/tokens") => {
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
-                async move { handle_list_tokens(&state, &ctx).await }
+                async move { handle_list_tokens(state, &ctx).await }
             }).await
         }
         (Method::POST, "/api2/json/access/tokens") => {
             with_auth(auth_ctx, Permission::Backup, |ctx| {
                 let state = state.clone();
-                async move { handle_create_token(&state, &ctx, req).await }
+                async move { handle_create_token(state, &ctx, req).await }
             }).await
         }
 
@@ -257,13 +535,25 @@ async fn handle_request(
         (Method::GET, "/api2/json/billing/usage") => {
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
-                async move { handle_get_usage(&state, &ctx).await }
+                async move { handle_get_usage(state, &ctx).await }
+            }).await
+        }
+
+        // Rate limit info
+        (Method::GET, "/api2/json/rate_limit") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_rate_limit_info(state, &ctx).await }
             }).await
         }
 
         // Default: 404
         _ => not_found(),
     };
+
+    // Record metrics
+    let status = response.status().as_u16();
+    state.metrics.record_request(&path, method.as_str(), status, start.elapsed().as_secs_f64());
 
     Ok(response)
 }
@@ -272,13 +562,13 @@ async fn handle_request(
 fn is_public_endpoint(path: &str) -> bool {
     matches!(
         path,
-        "/api2/json/version" | "/api2/json/access/ticket"
+        "/api2/json/version" | "/api2/json/access/ticket" | "/metrics"
     )
 }
 
 /// Authenticate a request
 async fn authenticate(
-    state: &ServerState,
+    state: Arc<ServerState>,
     req: &Request<Incoming>,
 ) -> Result<AuthContext, ApiError> {
     // Check Authorization header
@@ -333,6 +623,16 @@ where
     }
 }
 
+/// Extract query parameter
+fn get_query_param(uri: &hyper::Uri, name: &str) -> Option<String> {
+    uri.query()
+        .and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_string())
+        })
+}
+
 // === Handler implementations ===
 
 async fn handle_version() -> Response<Full<Bytes>> {
@@ -356,7 +656,16 @@ async fn handle_auth_info() -> Response<Full<Bytes>> {
     json_response(StatusCode::OK, &info)
 }
 
-async fn handle_login(state: &ServerState, req: Request<Incoming>) -> Response<Full<Bytes>> {
+async fn handle_metrics(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let output = state.metrics.export();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(Full::new(Bytes::from(output)))
+        .unwrap()
+}
+
+async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return bad_request("Failed to read request body"),
@@ -405,7 +714,7 @@ async fn handle_nodes() -> Response<Full<Bytes>> {
 }
 
 async fn handle_datastore_api(
-    state: &ServerState,
+    state: Arc<ServerState>,
     ctx: &AuthContext,
     path: &str,
 ) -> Response<Full<Bytes>> {
@@ -460,20 +769,24 @@ async fn handle_datastore_api(
             json_response(StatusCode::OK, &serde_json::json!({"data": group_info}))
         }
         "snapshots" => {
-            // TODO: Parse query params for backup-type and backup-id
             json_response(StatusCode::OK, &serde_json::json!({"data": []}))
         }
         _ => not_found(),
     }
 }
 
-async fn handle_status() -> Response<Full<Bytes>> {
+async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
     let status = serde_json::json!({
         "data": {
             "uptime": 0,
             "tasks": {
-                "running": 0,
+                "running": backup_sessions + reader_sessions,
                 "scheduled": 0
+            },
+            "sessions": {
+                "backup": backup_sessions,
+                "reader": reader_sessions
             }
         }
     });
@@ -481,11 +794,10 @@ async fn handle_status() -> Response<Full<Bytes>> {
 }
 
 async fn handle_protocol_upgrade(
-    state: &ServerState,
+    state: Arc<ServerState>,
     req: &Request<Incoming>,
 ) -> Response<Full<Bytes>> {
-    // This would initiate the HTTP/2 upgrade for backup/restore
-    // Full implementation would handle the streaming protocol
+    // Protocol upgrade for streaming - this is handled via HTTP/2 streams
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("upgrade", PROTOCOL_HEADER)
@@ -494,7 +806,7 @@ async fn handle_protocol_upgrade(
 }
 
 async fn handle_start_backup(
-    state: &ServerState,
+    state: Arc<ServerState>,
     ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
@@ -508,28 +820,423 @@ async fn handle_start_backup(
         Err(_) => return bad_request("Invalid backup parameters"),
     };
 
-    let datastore = state.default_datastore();
-    let session_id = state.sessions.create_backup_session(
-        &ctx.user.tenant_id,
-        params,
-        datastore,
-    ).await;
-
-    let response = serde_json::json!({
-        "data": {
-            "session_id": session_id
+    let handler = BackupProtocolHandler::new(state);
+    match handler.start_backup(ctx, params).await {
+        Ok(session_id) => {
+            json_response(StatusCode::OK, &serde_json::json!({"data": {"session_id": session_id}}))
         }
-    });
-    json_response(StatusCode::OK, &response)
+        Err(e) => error_response(e),
+    }
 }
 
-async fn handle_list_tenants(state: &ServerState) -> Response<Full<Bytes>> {
+async fn handle_start_reader(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ReaderParams {
+        backup_type: String,
+        backup_id: String,
+        backup_time: String,
+    }
+
+    let params: ReaderParams = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return bad_request("Invalid reader parameters"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    match handler.start_reader(ctx, &params.backup_type, &params.backup_id, &params.backup_time).await {
+        Ok(session_id) => {
+            json_response(StatusCode::OK, &serde_json::json!({"data": {"session_id": session_id}}))
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_upload_chunk(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+    chunk_type: &str,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let digest_str = match get_query_param(req.uri(), "digest") {
+        Some(d) => d,
+        None => return bad_request("Missing digest"),
+    };
+
+    let digest = match ChunkDigest::from_hex(&digest_str) {
+        Ok(d) => d,
+        Err(_) => return bad_request("Invalid digest format"),
+    };
+
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return bad_request("Failed to read chunk data"),
+    };
+
+    // Check upload rate limit
+    if let RateLimitResult::Limited { retry_after_secs, limit, remaining } =
+        state.rate_limiter.check_upload(&ctx.user.tenant_id, body.len() as u64)
+    {
+        return rate_limited_response(retry_after_secs, limit, remaining);
+    }
+
+    let handler = BackupProtocolHandler::new(state.clone());
+    let result = if chunk_type == "fixed" {
+        handler.upload_fixed_chunk(&session_id, digest, body).await
+    } else {
+        handler.upload_dynamic_chunk(&session_id, digest, body).await
+    };
+
+    match result {
+        Ok(stored) => json_response(StatusCode::OK, &serde_json::json!({"data": {"stored": stored}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_create_index(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+    index_type: &str,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+
+    let result = if index_type == "fixed" {
+        let chunk_size = get_query_param(req.uri(), "chunk_size")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4 * 1024 * 1024); // 4MB default
+        handler.create_fixed_index(&session_id, &name, chunk_size).await
+    } else {
+        handler.create_dynamic_index(&session_id, &name).await
+    };
+
+    match result {
+        Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_append_index(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+    index_type: &str,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+    let digest_str = match get_query_param(req.uri(), "digest") {
+        Some(d) => d,
+        None => return bad_request("Missing digest"),
+    };
+    let size: u64 = get_query_param(req.uri(), "size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let digest = match ChunkDigest::from_hex(&digest_str) {
+        Ok(d) => d,
+        Err(_) => return bad_request("Invalid digest format"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+
+    let result = if index_type == "fixed" {
+        handler.append_fixed_index(&session_id, &name, digest, size).await
+    } else {
+        let offset: u64 = get_query_param(req.uri(), "offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        handler.append_dynamic_index(&session_id, &name, digest, offset, size).await
+    };
+
+    match result {
+        Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_close_index(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+    index_type: &str,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+
+    let result = if index_type == "fixed" {
+        handler.close_fixed_index(&session_id, &name).await
+    } else {
+        handler.close_dynamic_index(&session_id, &name).await
+    };
+
+    match result {
+        Ok((size, digest)) => json_response(StatusCode::OK, &serde_json::json!({
+            "data": {
+                "size": size,
+                "digest": digest.to_hex()
+            }
+        })),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_upload_blob(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return bad_request("Failed to read blob data"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+    match handler.upload_blob(&session_id, &name, body).await {
+        Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_finish_backup(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+    match handler.finish_backup(&session_id, &ctx.user.tenant_id).await {
+        Ok(result) => {
+            state.metrics.record_backup(&ctx.user.tenant_id, "backup", result.total_bytes);
+            let response: FinishBackupResponse = result.into();
+            json_response(StatusCode::OK, &serde_json::json!({"data": response}))
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_known_chunks(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct KnownChunksRequest {
+        digests: Vec<String>,
+    }
+
+    let params: KnownChunksRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return bad_request("Invalid JSON"),
+    };
+
+    let digests: Result<Vec<_>, _> = params.digests.iter()
+        .map(|s| ChunkDigest::from_hex(s))
+        .collect();
+
+    let digests = match digests {
+        Ok(d) => d,
+        Err(_) => return bad_request("Invalid digest format"),
+    };
+
+    let handler = BackupProtocolHandler::new(state.clone());
+    match handler.check_known_chunks(&session_id, &digests).await {
+        Ok(known) => json_response(StatusCode::OK, &serde_json::json!({"data": {"known": known}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_download_chunk(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let digest_str = match get_query_param(req.uri(), "digest") {
+        Some(d) => d,
+        None => return bad_request("Missing digest"),
+    };
+
+    let digest = match ChunkDigest::from_hex(&digest_str) {
+        Ok(d) => d,
+        Err(_) => return bad_request("Invalid digest format"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    match handler.download_chunk(&session_id, &digest, &ctx.user.tenant_id).await {
+        Ok(data) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(Full::new(Bytes::from(data)))
+                .unwrap()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_read_index(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+    index_type: &str,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    let result = if index_type == "fixed" {
+        handler.read_fixed_index(&session_id, &name).await
+    } else {
+        handler.read_dynamic_index(&session_id, &name).await
+    };
+
+    match result {
+        Ok(data) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(Full::new(Bytes::from(data)))
+                .unwrap()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_read_blob(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+    let name = match get_query_param(req.uri(), "name") {
+        Some(n) => n,
+        None => return bad_request("Missing name"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    match handler.read_blob(&session_id, &name).await {
+        Ok(data) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(Full::new(Bytes::from(data)))
+                .unwrap()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_read_manifest(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    match handler.read_manifest(&session_id).await {
+        Ok(json) => json_response(StatusCode::OK, &serde_json::json!({"data": json})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_close_reader(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let session_id = match get_query_param(req.uri(), "session_id") {
+        Some(id) => id,
+        None => return bad_request("Missing session_id"),
+    };
+
+    let handler = ReaderProtocolHandler::new(state.clone());
+    match handler.close_reader(&session_id).await {
+        Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_list_tenants(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let tenants = state.tenants.list_tenants().await;
     json_response(StatusCode::OK, &serde_json::json!({"data": tenants}))
 }
 
 async fn handle_create_tenant(
-    state: &ServerState,
+    state: Arc<ServerState>,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -548,10 +1255,16 @@ async fn handle_create_tenant(
     };
 
     let tenant = state.tenants.create_tenant(&params.name).await;
+
+    // Save state
+    if let Err(e) = state.save_state().await {
+        warn!("Failed to save state after tenant creation: {}", e);
+    }
+
     json_response(StatusCode::CREATED, &serde_json::json!({"data": tenant}))
 }
 
-async fn handle_list_users(state: &ServerState, ctx: &AuthContext) -> Response<Full<Bytes>> {
+async fn handle_list_users(state: Arc<ServerState>, ctx: &AuthContext) -> Response<Full<Bytes>> {
     // Admins see all users, others only see their tenant's users
     let tenant_filter = if ctx.permission == Permission::Admin {
         None
@@ -564,7 +1277,7 @@ async fn handle_list_users(state: &ServerState, ctx: &AuthContext) -> Response<F
 }
 
 async fn handle_create_user(
-    state: &ServerState,
+    state: Arc<ServerState>,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -593,18 +1306,24 @@ async fn handle_create_user(
     };
 
     match state.auth.create_user(&params.username, &params.tenant_id, permission).await {
-        Ok(user) => json_response(StatusCode::CREATED, &serde_json::json!({"data": user})),
+        Ok(user) => {
+            // Save state
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after user creation: {}", e);
+            }
+            json_response(StatusCode::CREATED, &serde_json::json!({"data": user}))
+        }
         Err(e) => error_response(e),
     }
 }
 
-async fn handle_list_tokens(state: &ServerState, ctx: &AuthContext) -> Response<Full<Bytes>> {
+async fn handle_list_tokens(state: Arc<ServerState>, ctx: &AuthContext) -> Response<Full<Bytes>> {
     let tokens = state.auth.list_tokens(&ctx.user.id).await;
     json_response(StatusCode::OK, &serde_json::json!({"data": tokens}))
 }
 
 async fn handle_create_token(
-    state: &ServerState,
+    state: Arc<ServerState>,
     ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
@@ -634,6 +1353,11 @@ async fn handle_create_token(
 
     match state.auth.create_token(&ctx.user.id, &params.name, permission, None).await {
         Ok((token, token_string)) => {
+            // Save state
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after token creation: {}", e);
+            }
+
             let response = serde_json::json!({
                 "data": {
                     "token": token,
@@ -646,9 +1370,20 @@ async fn handle_create_token(
     }
 }
 
-async fn handle_get_usage(state: &ServerState, ctx: &AuthContext) -> Response<Full<Bytes>> {
+async fn handle_get_usage(state: Arc<ServerState>, ctx: &AuthContext) -> Response<Full<Bytes>> {
     let usage = state.billing.get_usage(&ctx.user.tenant_id).await;
     json_response(StatusCode::OK, &serde_json::json!({"data": usage}))
+}
+
+async fn handle_rate_limit_info(state: Arc<ServerState>, ctx: &AuthContext) -> Response<Full<Bytes>> {
+    let stats = state.rate_limiter.get_tenant_stats(&ctx.user.tenant_id);
+    json_response(StatusCode::OK, &serde_json::json!({
+        "data": {
+            "upload_bytes_used": stats.upload_bytes_used,
+            "upload_bytes_limit": stats.upload_bytes_limit,
+            "requests_per_minute_limit": stats.requests_per_minute_limit
+        }
+    }))
 }
 
 // === Response helpers ===
@@ -668,10 +1403,26 @@ fn error_response(error: ApiError) -> Response<Full<Bytes>> {
         401 => StatusCode::UNAUTHORIZED,
         403 => StatusCode::FORBIDDEN,
         404 => StatusCode::NOT_FOUND,
+        429 => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let body = serde_json::json!({"error": error.message});
     json_response(status, &body)
+}
+
+fn rate_limited_response(retry_after: u32, limit: u32, remaining: u32) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "error": "Rate limit exceeded",
+        "retry_after": retry_after
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .header("Retry-After", retry_after.to_string())
+        .header("X-RateLimit-Limit", limit.to_string())
+        .header("X-RateLimit-Remaining", remaining.to_string())
+        .body(Full::new(Bytes::from(serde_json::to_string(&body).unwrap())))
+        .unwrap()
 }
 
 fn not_found() -> Response<Full<Bytes>> {

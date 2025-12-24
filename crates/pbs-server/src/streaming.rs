@@ -1,0 +1,444 @@
+//! HTTP/2 streaming backup protocol implementation
+//!
+//! Implements the PBS backup/restore protocol for streaming data transfer.
+
+use std::sync::Arc;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{Request, Response, StatusCode, body::Incoming};
+use pbs_core::{Chunk, ChunkDigest};
+use tracing::{info, debug, warn, error, instrument};
+
+use crate::auth::AuthContext;
+use crate::billing::{UsageEvent, UsageEventType};
+use crate::protocol::{ApiError, BackupParams};
+use crate::server::ServerState;
+use crate::session::{SessionState, BackupSession, ReaderSession};
+
+/// Handle backup protocol requests within a session
+pub struct BackupProtocolHandler {
+    state: Arc<ServerState>,
+}
+
+impl BackupProtocolHandler {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+
+    /// Start a new backup session
+    #[instrument(skip(self, ctx, params))]
+    pub async fn start_backup(
+        &self,
+        ctx: &AuthContext,
+        params: BackupParams,
+    ) -> Result<String, ApiError> {
+        info!(
+            "Starting backup session: {}/{}/{}",
+            params.backup_type, params.backup_id, params.backup_time
+        );
+
+        let datastore = self.state.default_datastore();
+        let session_id = self.state.sessions.create_backup_session(
+            &ctx.user.tenant_id,
+            params.clone(),
+            datastore,
+        ).await;
+
+        // Record backup event
+        self.state.billing.record_event(
+            UsageEvent::new(&ctx.user.tenant_id, UsageEventType::BackupCreated, 0)
+        ).await;
+
+        info!("Created backup session: {}", session_id);
+        Ok(session_id)
+    }
+
+    /// Upload a fixed-size chunk
+    #[instrument(skip(self, data), fields(session_id = %session_id, digest = %digest))]
+    pub async fn upload_fixed_chunk(
+        &self,
+        session_id: &str,
+        digest: ChunkDigest,
+        data: Vec<u8>,
+    ) -> Result<bool, ApiError> {
+        let datastore = self.state.default_datastore();
+
+        // Check if chunk already exists (deduplication)
+        let exists = datastore.chunk_exists(&digest).await
+            .map_err(|e| ApiError::internal(&e.to_string()))?;
+
+        if exists {
+            debug!("Chunk {} already exists, skipping upload", digest);
+            return Ok(false);
+        }
+
+        // Create and store the chunk
+        let chunk = Chunk::new(data)
+            .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+
+        // Verify digest matches
+        if chunk.digest() != &digest {
+            return Err(ApiError::bad_request("Chunk digest mismatch"));
+        }
+
+        let stored = datastore.store_chunk(&chunk).await
+            .map_err(|e| ApiError::internal(&e.to_string()))?;
+
+        // Mark chunk as uploaded in session
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.mark_chunk_uploaded(digest);
+            Ok(())
+        }).await?;
+
+        Ok(stored)
+    }
+
+    /// Upload a dynamic-size chunk
+    #[instrument(skip(self, data), fields(session_id = %session_id, digest = %digest))]
+    pub async fn upload_dynamic_chunk(
+        &self,
+        session_id: &str,
+        digest: ChunkDigest,
+        data: Vec<u8>,
+    ) -> Result<bool, ApiError> {
+        // Same as fixed chunk for now
+        self.upload_fixed_chunk(session_id, digest, data).await
+    }
+
+    /// Create a fixed index
+    pub async fn create_fixed_index(
+        &self,
+        session_id: &str,
+        name: &str,
+        chunk_size: u64,
+    ) -> Result<(), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.create_fixed_index(name, chunk_size);
+            Ok(())
+        }).await
+    }
+
+    /// Append to a fixed index
+    pub async fn append_fixed_index(
+        &self,
+        session_id: &str,
+        name: &str,
+        digest: ChunkDigest,
+        size: u64,
+    ) -> Result<(), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.append_fixed_index(name, digest, size)
+        }).await
+    }
+
+    /// Close a fixed index
+    pub async fn close_fixed_index(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(u64, ChunkDigest), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            let index = session.close_fixed_index(name)?;
+            let data = index.to_bytes();
+            let digest = ChunkDigest::from_data(&data);
+            Ok((data.len() as u64, digest))
+        }).await
+    }
+
+    /// Create a dynamic index
+    pub async fn create_dynamic_index(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.create_dynamic_index(name);
+            Ok(())
+        }).await
+    }
+
+    /// Append to a dynamic index
+    pub async fn append_dynamic_index(
+        &self,
+        session_id: &str,
+        name: &str,
+        digest: ChunkDigest,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.append_dynamic_index(name, digest, offset, size)
+        }).await
+    }
+
+    /// Close a dynamic index
+    pub async fn close_dynamic_index(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<(u64, ChunkDigest), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            let index = session.close_dynamic_index(name)?;
+            let data = index.to_bytes();
+            let digest = ChunkDigest::from_data(&data);
+            Ok((data.len() as u64, digest))
+        }).await
+    }
+
+    /// Upload a blob
+    pub async fn upload_blob(
+        &self,
+        session_id: &str,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        self.state.sessions.with_backup_session(session_id, |session| {
+            session.store_blob(name, data);
+            Ok(())
+        }).await
+    }
+
+    /// Finish the backup session
+    #[instrument(skip(self))]
+    pub async fn finish_backup(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+    ) -> Result<FinishResult, ApiError> {
+        info!("Finishing backup session: {}", session_id);
+
+        // Remove the session first so we own it
+        let mut session = self.state.sessions.remove_backup_session(session_id).await
+            .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+        // Finish the backup
+        let manifest = session.finish().await?;
+
+        // Calculate total size
+        let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+
+        // Update billing
+        self.state.billing.record_event(
+            UsageEvent::new(tenant_id, UsageEventType::StorageUpdated, total_bytes)
+        ).await;
+
+        // Update tenant usage
+        self.state.tenants.update_usage(tenant_id, total_bytes as i64).await;
+
+        info!(
+            "Backup completed: {} files, {} bytes",
+            manifest.files.len(),
+            total_bytes
+        );
+
+        Ok(FinishResult {
+            manifest_digest: ChunkDigest::from_data(manifest.to_json().unwrap().as_bytes()),
+            total_bytes,
+            chunk_count: manifest.files.len(),
+        })
+    }
+
+    /// Abort a backup session
+    pub async fn abort_backup(&self, session_id: &str) -> Result<(), ApiError> {
+        warn!("Aborting backup session: {}", session_id);
+        self.state.sessions.remove_backup_session(session_id).await;
+        Ok(())
+    }
+
+    /// Check known chunks (for deduplication)
+    pub async fn check_known_chunks(
+        &self,
+        session_id: &str,
+        digests: &[ChunkDigest],
+    ) -> Result<Vec<bool>, ApiError> {
+        let datastore = self.state.default_datastore();
+        let mut results = Vec::with_capacity(digests.len());
+
+        for digest in digests {
+            let exists = datastore.chunk_exists(digest).await
+                .map_err(|e| ApiError::internal(&e.to_string()))?;
+            results.push(exists);
+        }
+
+        Ok(results)
+    }
+}
+
+/// Result of finishing a backup
+#[derive(Debug)]
+pub struct FinishResult {
+    pub manifest_digest: ChunkDigest,
+    pub total_bytes: u64,
+    pub chunk_count: usize,
+}
+
+/// Handle restore/reader protocol requests
+pub struct ReaderProtocolHandler {
+    state: Arc<ServerState>,
+}
+
+impl ReaderProtocolHandler {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+
+    /// Start a new reader session
+    #[instrument(skip(self, ctx))]
+    pub async fn start_reader(
+        &self,
+        ctx: &AuthContext,
+        backup_type: &str,
+        backup_id: &str,
+        backup_time: &str,
+    ) -> Result<String, ApiError> {
+        info!(
+            "Starting reader session: {}/{}/{}",
+            backup_type, backup_id, backup_time
+        );
+
+        let datastore = self.state.default_datastore();
+        let session_id = self.state.sessions.create_reader_session(
+            &ctx.user.tenant_id,
+            backup_type,
+            backup_id,
+            backup_time,
+            datastore,
+        ).await;
+
+        info!("Created reader session: {}", session_id);
+        Ok(session_id)
+    }
+
+    /// Download a chunk
+    #[instrument(skip(self), fields(session_id = %session_id, digest = %digest))]
+    pub async fn download_chunk(
+        &self,
+        session_id: &str,
+        digest: &ChunkDigest,
+        tenant_id: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        // Read chunk directly from datastore
+        let datastore = self.state.default_datastore();
+        let chunk = datastore.read_chunk(digest).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+        let data = chunk.into_data();
+
+        // Record download for billing
+        self.state.billing.record_event(
+            UsageEvent::new(tenant_id, UsageEventType::DataRestored, data.len() as u64)
+        ).await;
+
+        Ok(data)
+    }
+
+    /// Read a fixed index
+    pub async fn read_fixed_index(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        // We need to get the snapshot path from the session, then read from datastore
+        let datastore = self.state.default_datastore();
+        let path = format!("{}", name); // Simplified - in real code get from session
+        let index = datastore.read_fixed_index(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+        Ok(index.to_bytes())
+    }
+
+    /// Read a dynamic index
+    pub async fn read_dynamic_index(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        let datastore = self.state.default_datastore();
+        let path = format!("{}", name);
+        let index = datastore.read_dynamic_index(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+        Ok(index.to_bytes())
+    }
+
+    /// Read a blob
+    pub async fn read_blob(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        let datastore = self.state.default_datastore();
+        let path = format!("{}", name);
+        datastore.read_blob(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))
+    }
+
+    /// Read the manifest
+    pub async fn read_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<String, ApiError> {
+        // For now, return a stub - in real implementation, read from session's snapshot path
+        let manifest = pbs_core::BackupManifest::new("vm", "backup-1");
+        manifest.to_json()
+            .map_err(|e| ApiError::internal(&e.to_string()))
+    }
+
+    /// Close a reader session
+    pub async fn close_reader(&self, session_id: &str) -> Result<(), ApiError> {
+        info!("Closing reader session: {}", session_id);
+        self.state.sessions.remove_reader_session(session_id).await;
+        Ok(())
+    }
+}
+
+/// Parse chunk upload request
+#[derive(Debug, serde::Deserialize)]
+pub struct ChunkUploadRequest {
+    pub digest: String,
+    #[serde(default)]
+    pub encoded_size: u64,
+}
+
+/// Parse index operation request
+#[derive(Debug, serde::Deserialize)]
+pub struct IndexRequest {
+    #[serde(default)]
+    pub chunk_size: u64,
+}
+
+/// Parse index append request
+#[derive(Debug, serde::Deserialize)]
+pub struct IndexAppendRequest {
+    pub digest: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Response for known chunks query
+#[derive(Debug, serde::Serialize)]
+pub struct KnownChunksResponse {
+    pub known: Vec<bool>,
+}
+
+/// Response for finish backup
+#[derive(Debug, serde::Serialize)]
+pub struct FinishBackupResponse {
+    pub manifest_digest: String,
+    pub total_bytes: u64,
+    pub chunk_count: usize,
+}
+
+impl From<FinishResult> for FinishBackupResponse {
+    fn from(result: FinishResult) -> Self {
+        Self {
+            manifest_digest: result.manifest_digest.to_hex(),
+            total_bytes: result.total_bytes,
+            chunk_count: result.chunk_count,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Integration tests would go here, requiring a full server setup
+}
