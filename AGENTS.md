@@ -100,6 +100,11 @@
 - `/api2/json/config/verify` (GET, POST) verification job config list/create.
 - `/api2/json/config/verify/<id>` (GET, PUT, DELETE) verification job config read/update/delete.
 
+## Access / identity
+- `/api2/json/access/users` (GET, POST), `/api2/json/access/users/<id>` (DELETE).
+- `/api2/json/access/tokens` (GET, POST), `/api2/json/access/tokens/<id>` (DELETE).
+- `/api2/json/access/permissions` (GET) effective permission map.
+
 ## Storage layout
 - Manifests: `index.json.blob` (DataBlob-encoded JSON), with legacy fallback to `index.json`.
 - Indexes: raw `.fidx`/`.didx` bytes (no DataBlob wrapper).
@@ -115,6 +120,8 @@
 - Verification jobs do not emit notification events yet.
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
+- `/api2/json/nodes/localhost/status` returns placeholder node stats (no real system probes yet).
+- `/api2/json/status/datastore-usage` omits RRD history/forecast fields.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
 - Task logs are capped to the most recent 1000 lines per task to limit persistence growth.
 - Verification tasks check manifest presence, archive file existence, size consistency, and chunk existence/digest integrity via index parsing.

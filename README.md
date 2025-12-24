@@ -354,6 +354,10 @@ curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
 # Get a ticket (use your root token in the password field)
 curl -X POST https://localhost:8007/api2/json/access/ticket \
   -d '{"username":"root@pam","password":"pbs_abc123..."}'
+
+# List effective permissions
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/access/permissions
 ```
 
 ### Tenant Management (Admin only)

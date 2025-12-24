@@ -1015,6 +1015,12 @@ async fn handle_request(
             })
             .await
         }
+        (Method::GET, "/api2/json/access/permissions") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| async move {
+                handle_permissions(&ctx, req).await
+            })
+            .await
+        }
         (Method::POST, "/api2/json/access/users") => {
             with_auth(auth_ctx, Permission::Admin, |ctx| {
                 let state = state.clone();
@@ -5212,6 +5218,55 @@ async fn handle_list_users(state: Arc<ServerState>, ctx: &AuthContext) -> Respon
 
     let users = state.auth.list_users(tenant_filter).await;
     json_response(StatusCode::OK, &serde_json::json!({"data": users}))
+}
+
+fn permission_privileges(permission: Permission) -> Vec<&'static str> {
+    match permission {
+        Permission::Read => vec!["Datastore.Audit", "Datastore.Read"],
+        Permission::Backup => vec!["Datastore.Audit", "Datastore.Read", "Datastore.Backup"],
+        Permission::DatastoreAdmin => vec![
+            "Datastore.Audit",
+            "Datastore.Read",
+            "Datastore.Backup",
+            "Datastore.Verify",
+            "Datastore.Prune",
+            "Datastore.Modify",
+        ],
+        Permission::Admin => vec![
+            "Datastore.Audit",
+            "Datastore.Read",
+            "Datastore.Backup",
+            "Datastore.Verify",
+            "Datastore.Prune",
+            "Datastore.Modify",
+            "Sys.Audit",
+            "Sys.Modify",
+            "Sys.PowerMgmt",
+            "Permissions.Modify",
+        ],
+    }
+}
+
+async fn handle_permissions(ctx: &AuthContext, req: Request<Incoming>) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let auth_id = get_query_param(&uri, "auth-id");
+    if let Some(requested) = auth_id.as_deref() {
+        let is_self = requested == ctx.user.username;
+        if !is_self && !ctx.allows(Permission::Admin) {
+            return error_response(ApiError::unauthorized("Insufficient permissions"));
+        }
+    }
+
+    let path = get_query_param(&uri, "path").unwrap_or_else(|| "/".to_string());
+    let mut privs = serde_json::Map::new();
+    for privilege in permission_privileges(ctx.permission) {
+        privs.insert(privilege.to_string(), serde_json::Value::Bool(true));
+    }
+
+    let mut data = serde_json::Map::new();
+    data.insert(path, serde_json::Value::Object(privs));
+
+    json_response(StatusCode::OK, &serde_json::json!({ "data": data }))
 }
 
 async fn handle_create_user(
