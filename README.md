@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml/badge.svg)](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-blue.svg)](https://www.rust-lang.org)
 
 A PBS-compatible backup server with S3 storage, multi-tenancy, and compliance features.
 
@@ -196,7 +196,7 @@ flowchart TD
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.88+
 - S3-compatible storage (or use local filesystem)
 
 ### Build
