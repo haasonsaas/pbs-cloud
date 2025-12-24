@@ -283,4 +283,222 @@ mod tests {
         assert!(validate_digest("a".repeat(63).as_str()).is_err()); // too short
         assert!(validate_digest("a".repeat(65).as_str()).is_err()); // too long
     }
+
+    // === Security-focused tests ===
+
+    #[test]
+    fn test_path_traversal_attacks() {
+        // Various path traversal attempts that should all fail
+        let attacks = [
+            "../",
+            "..\\",
+            "../..",
+            "..%2f",
+            "..%5c",
+            "%2e%2e/",
+            "....//",
+            "..../",
+            "..\\/",
+            "..;/",
+            "..%00/",
+            "..%0d/",
+            "..%0a/",
+            "foo/../bar",
+            "foo/..\\bar",
+        ];
+
+        for attack in attacks {
+            assert!(
+                validate_backup_id(attack).is_err(),
+                "Path traversal should be blocked: {}",
+                attack
+            );
+            assert!(
+                validate_filename(attack).is_err(),
+                "Path traversal should be blocked: {}",
+                attack
+            );
+        }
+    }
+
+    #[test]
+    fn test_null_byte_injection() {
+        // Null bytes can be used to truncate strings in some systems
+        let attacks = [
+            "file\x00.txt",
+            "file%00.txt",
+            "\x00malicious",
+        ];
+
+        for attack in attacks {
+            // These should either fail or be sanitized
+            let result = validate_filename(attack);
+            assert!(
+                result.is_err(),
+                "Null byte should be blocked: {:?}",
+                attack
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_injection_in_names() {
+        // Characters that could be dangerous in shell contexts
+        let attacks = [
+            "$(whoami)",
+            "`id`",
+            "; rm -rf /",
+            "| cat /etc/passwd",
+            "& echo pwned",
+            "$(cat /etc/passwd)",
+        ];
+
+        for attack in attacks {
+            assert!(
+                validate_backup_id(attack).is_err(),
+                "Command injection should be blocked: {}",
+                attack
+            );
+            assert!(
+                validate_filename(attack).is_err(),
+                "Command injection should be blocked: {}",
+                attack
+            );
+        }
+    }
+
+    #[test]
+    fn test_unicode_normalization_attacks() {
+        // Unicode lookalikes and normalization issues
+        let attacks = [
+            "ａｄｍｉｎ", // fullwidth characters
+            "admin\u{200b}", // zero-width space
+            "\u{202e}nimda", // right-to-left override
+        ];
+
+        for attack in attacks {
+            let result = validate_backup_id(attack);
+            // These should fail because they don't match the ASCII regex
+            assert!(
+                result.is_err(),
+                "Unicode attack should be blocked: {:?}",
+                attack
+            );
+        }
+    }
+
+    #[test]
+    fn test_windows_reserved_names() {
+        // Windows reserved device names
+        let reserved = [
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4",
+            "LPT1", "LPT2", "LPT3",
+            "con", "prn", "aux", // lowercase
+        ];
+
+        for name in reserved {
+            assert!(
+                validate_backup_id(name).is_err(),
+                "Windows reserved name should be blocked: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_injection_in_names() {
+        // SQL injection patterns that should be blocked by regex
+        let attacks = [
+            "'; DROP TABLE backups;--",
+            "1' OR '1'='1",
+            "admin'--",
+            "UNION SELECT * FROM users",
+        ];
+
+        for attack in attacks {
+            assert!(
+                validate_backup_id(attack).is_err(),
+                "SQL injection should be blocked: {}",
+                attack
+            );
+            assert!(
+                validate_username(attack).is_err(),
+                "SQL injection should be blocked: {}",
+                attack
+            );
+        }
+    }
+
+    #[test]
+    fn test_special_filenames() {
+        // Special files that should be blocked
+        let specials = [
+            ".",
+            "..",
+            ".htaccess",
+            ".git",
+            ".svn",
+            ".env",
+            ".ssh",
+        ];
+
+        for name in specials {
+            // Either blocked by reserved names or by starting-char validation
+            let result = validate_filename(name);
+            assert!(
+                result.is_err(),
+                "Special filename should be blocked: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_boundary_lengths() {
+        // Test exact boundary conditions
+
+        // backup_id max is 64 characters
+        let max_id = "a".repeat(64);
+        assert!(validate_backup_id(&max_id).is_ok());
+        let too_long_id = "a".repeat(65);
+        assert!(validate_backup_id(&too_long_id).is_err());
+
+        // filename max is 128 characters
+        let max_filename = "a".repeat(128);
+        assert!(validate_filename(&max_filename).is_ok());
+        let too_long_filename = "a".repeat(129);
+        assert!(validate_filename(&too_long_filename).is_err());
+
+        // username max is 64 characters
+        let max_username = "a".repeat(64);
+        assert!(validate_username(&max_username).is_ok());
+        let too_long_username = "a".repeat(65);
+        assert!(validate_username(&too_long_username).is_err());
+    }
+
+    #[test]
+    fn test_combined_attack_vectors() {
+        // Combinations of attack techniques
+        let attacks = [
+            "../etc/passwd\x00.txt",
+            "..\\..\\windows\\system32",
+            "$(cat ../../../etc/passwd)",
+            "`cat ../../../etc/passwd`",
+            "file.txt; rm -rf /",
+        ];
+
+        for attack in attacks {
+            assert!(
+                validate_backup_id(attack).is_err(),
+                "Combined attack should be blocked: {}",
+                attack
+            );
+            assert!(
+                validate_filename(attack).is_err(),
+                "Combined attack should be blocked: {}",
+                attack
+            );
+        }
+    }
 }

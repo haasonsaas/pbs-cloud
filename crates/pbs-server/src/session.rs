@@ -597,3 +597,147 @@ impl Default for SessionManager {
         Self::new(3600) // 1 hour timeout
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbs_storage::LocalBackend;
+    use tempfile::TempDir;
+
+    async fn create_test_datastore() -> Arc<Datastore> {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new_lazy(temp_dir.path()).await.unwrap();
+        let crypto = pbs_core::CryptoConfig::default(); // Unencrypted
+        Arc::new(Datastore::new("test", Arc::new(backend), crypto))
+    }
+
+    fn test_backup_params() -> crate::protocol::BackupParams {
+        crate::protocol::BackupParams {
+            backup_type: "vm".to_string(),
+            backup_id: "100".to_string(),
+            backup_time: "2024-01-01T00:00:00Z".to_string(),
+            encrypt: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_ownership_verification() {
+        let manager = SessionManager::new(3600);
+        let datastore = create_test_datastore().await;
+
+        // Create a session for tenant1
+        let params = test_backup_params();
+
+        let session_id = manager.create_backup_session(
+            "tenant1",
+            params,
+            datastore,
+        ).await;
+
+        // Verify tenant1 can access the session
+        let result = manager.verify_session_ownership(&session_id, "tenant1").await;
+        assert!(result.is_ok());
+
+        // Verify tenant2 cannot access the session
+        let result = manager.verify_session_ownership(&session_id, "tenant2").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, 403);
+        assert!(err.message.contains("different tenant"));
+    }
+
+    #[tokio::test]
+    async fn test_reader_session_ownership_verification() {
+        let manager = SessionManager::new(3600);
+        let datastore = create_test_datastore().await;
+
+        // Create a reader session for tenant1
+        let session_id = manager.create_reader_session(
+            "tenant1",
+            "vm",
+            "100",
+            "2024-01-01T00:00:00Z",
+            datastore,
+        ).await;
+
+        // Verify tenant1 can access the session
+        let result = manager.verify_reader_session_ownership(&session_id, "tenant1").await;
+        assert!(result.is_ok());
+
+        // Verify tenant2 cannot access the session
+        let result = manager.verify_reader_session_ownership(&session_id, "tenant2").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, 403);
+    }
+
+    #[tokio::test]
+    async fn test_verified_session_access() {
+        let manager = SessionManager::new(3600);
+        let datastore = create_test_datastore().await;
+
+        let params = test_backup_params();
+
+        let session_id = manager.create_backup_session(
+            "tenant1",
+            params,
+            datastore,
+        ).await;
+
+        // Tenant1 can modify the session
+        let result = manager.with_backup_session_verified(&session_id, "tenant1", |session| {
+            assert_eq!(session.tenant_id, "tenant1");
+            Ok(())
+        }).await;
+        assert!(result.is_ok());
+
+        // Tenant2 cannot modify the session
+        let result = manager.with_backup_session_verified(&session_id, "tenant2", |_session| {
+            Ok(())
+        }).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_nonexistent_session() {
+        let manager = SessionManager::new(3600);
+
+        // Verify ownership of nonexistent session fails with 404
+        let result = manager.verify_session_ownership("nonexistent", "tenant1").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, 404);
+
+        // Reader session
+        let result = manager.verify_reader_session_ownership("nonexistent", "tenant1").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, 404);
+    }
+
+    #[tokio::test]
+    async fn test_session_cleanup() {
+        let manager = SessionManager::new(1); // 1 second timeout for testing
+        let datastore = create_test_datastore().await;
+
+        let params = test_backup_params();
+
+        let session_id = manager.create_backup_session(
+            "tenant1",
+            params,
+            datastore.clone(),
+        ).await;
+
+        // Session exists
+        assert!(manager.verify_session_ownership(&session_id, "tenant1").await.is_ok());
+
+        // Wait for expiration
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Cleanup
+        manager.cleanup_expired().await;
+
+        // Session should be gone
+        assert!(manager.verify_session_ownership(&session_id, "tenant1").await.is_err());
+    }
+}
