@@ -598,24 +598,24 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                         };
 
                         let last_run = job_last_run_time(job_states.get(&job.id));
-                        let next_run = match job.schedule.as_deref() {
-                            Some(schedule) => {
-                                let spec = match parse_schedule_spec(schedule) {
-                                    Ok(spec) => spec,
-                                    Err(err) => {
-                                        warn!(
-                                            "Skipping verification job {} (invalid schedule): {}",
-                                            job.id, err.message
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let base = last_run.unwrap_or(now);
-                                let base_dt =
-                                    chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0);
-                                base_dt.and_then(|dt| next_run_after(&spec, dt))
-                            }
-                            None => compute_next_run(None, last_run, now, interval_secs),
+                        let next_run = if let Some(schedule) = job.schedule.as_deref() {
+                            let spec = match parse_calendar_event(schedule) {
+                                Ok(spec) => spec,
+                                Err(err) => {
+                                    warn!(
+                                        "Skipping verification job {} (invalid schedule): {}",
+                                        job.id, err.message
+                                    );
+                                    continue;
+                                }
+                            };
+                            let base = last_run.unwrap_or(now);
+                            let base_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0);
+                            base_dt
+                                .and_then(|dt| next_calendar_run(&spec, dt))
+                                .map(|dt| dt.timestamp())
+                        } else {
+                            compute_next_run(None, last_run, now, interval_secs)
                         };
                         let Some(next_run) = next_run else {
                             continue;
@@ -1553,45 +1553,34 @@ fn should_verify_snapshot(
 }
 
 #[derive(Clone, Debug)]
-enum ScheduleSpec {
-    Hourly,
-    Daily {
-        hour: u32,
-        minute: u32,
-    },
-    Weekly {
-        days: Vec<Weekday>,
-        hour: u32,
-        minute: u32,
-    },
-    Monthly {
-        day: u32,
-        hour: u32,
-        minute: u32,
-    },
-    Yearly {
-        month: u32,
-        day: u32,
-        hour: u32,
-        minute: u32,
-    },
+enum CalendarTimezone {
+    Local,
+    Fixed(chrono::FixedOffset),
 }
 
-fn parse_schedule_time(value: &str) -> Result<(u32, u32), ApiError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    if parts.len() != 2 {
-        return Err(ApiError::bad_request("Invalid schedule time"));
-    }
-    let hour: u32 = parts[0]
-        .parse()
-        .map_err(|_| ApiError::bad_request("Invalid schedule hour"))?;
-    let minute: u32 = parts[1]
-        .parse()
-        .map_err(|_| ApiError::bad_request("Invalid schedule minute"))?;
-    if hour > 23 || minute > 59 {
-        return Err(ApiError::bad_request("Invalid schedule time"));
-    }
-    Ok((hour, minute))
+#[derive(Clone, Debug)]
+enum FieldItem {
+    Single(u32),
+    Range(u32, u32),
+    Step { start: u32, step: u32 },
+}
+
+#[derive(Clone, Debug)]
+enum FieldMatch {
+    Any,
+    Items(Vec<FieldItem>),
+}
+
+#[derive(Clone, Debug)]
+struct CalendarSpec {
+    tz: CalendarTimezone,
+    years: FieldMatch,
+    months: FieldMatch,
+    days: FieldMatch,
+    weekdays: FieldMatch,
+    hours: FieldMatch,
+    minutes: FieldMatch,
+    seconds: FieldMatch,
 }
 
 fn parse_weekday(value: &str) -> Option<Weekday> {
@@ -1619,227 +1608,477 @@ fn weekday_index(day: Weekday) -> u32 {
     }
 }
 
-fn parse_weekday_list(value: &str) -> Result<Vec<Weekday>, ApiError> {
-    let mut days = Vec::new();
-    for token in value.split(',') {
-        let token = token.trim();
-        if token.is_empty() {
+fn parse_fixed_offset(value: &str) -> Result<chrono::FixedOffset, ApiError> {
+    let trimmed = value.trim();
+    let normalized = trimmed
+        .strip_prefix("UTC")
+        .or_else(|| trimmed.strip_prefix("utc"))
+        .unwrap_or(trimmed);
+    if normalized.is_empty() || normalized == "Z" || normalized == "z" {
+        return Ok(chrono::FixedOffset::east_opt(0).unwrap());
+    }
+
+    let (sign, rest) = normalized
+        .strip_prefix('+')
+        .map(|v| (1, v))
+        .or_else(|| normalized.strip_prefix('-').map(|v| (-1, v)))
+        .ok_or_else(|| ApiError::bad_request("Invalid schedule timezone"))?;
+
+    let rest = rest.replace(':', "");
+    let (hours, minutes) = match rest.len() {
+        1 | 2 => (rest.parse::<i32>().ok(), Some(0)),
+        3 | 4 => {
+            let (h, m) = rest.split_at(rest.len() - 2);
+            (h.parse::<i32>().ok(), m.parse::<i32>().ok())
+        }
+        _ => (None, None),
+    };
+    let Some(hours) = hours else {
+        return Err(ApiError::bad_request("Invalid schedule timezone"));
+    };
+    let minutes = minutes.unwrap_or(0);
+    if hours.abs() > 23 || minutes.abs() > 59 {
+        return Err(ApiError::bad_request("Invalid schedule timezone"));
+    }
+    let total = sign * (hours * 3600 + minutes * 60);
+    chrono::FixedOffset::east_opt(total)
+        .ok_or_else(|| ApiError::bad_request("Invalid schedule timezone"))
+}
+
+fn parse_timezone_token(token: &str) -> Result<Option<CalendarTimezone>, ApiError> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Some(value) = trimmed
+        .strip_prefix("TZ=")
+        .or_else(|| trimmed.strip_prefix("tz="))
+    {
+        return parse_fixed_offset(value).map(|offset| Some(CalendarTimezone::Fixed(offset)));
+    }
+    if trimmed.eq_ignore_ascii_case("local") {
+        return Ok(Some(CalendarTimezone::Local));
+    }
+    if trimmed.eq_ignore_ascii_case("utc")
+        || trimmed.starts_with("UTC")
+        || trimmed.starts_with("utc")
+    {
+        return parse_fixed_offset(trimmed).map(|offset| Some(CalendarTimezone::Fixed(offset)));
+    }
+    if trimmed.starts_with('+') || trimmed.starts_with('-') {
+        return parse_fixed_offset(trimmed).map(|offset| Some(CalendarTimezone::Fixed(offset)));
+    }
+    Ok(None)
+}
+
+fn parse_numeric_value(value: &str, min: u32, max: u32) -> Result<u32, ApiError> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|_| ApiError::bad_request("Invalid schedule value"))?;
+    if parsed < min || parsed > max {
+        return Err(ApiError::bad_request("Schedule value out of range"));
+    }
+    Ok(parsed)
+}
+
+fn parse_field_items<T>(
+    value: &str,
+    min: u32,
+    max: u32,
+    parse_value: T,
+) -> Result<FieldMatch, ApiError>
+where
+    T: Fn(&str) -> Result<u32, ApiError>,
+{
+    let mut items = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
             continue;
         }
-        if let Some((start, end)) = token.split_once("..") {
-            let start = parse_weekday(start.trim())
-                .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
-            let end = parse_weekday(end.trim())
-                .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
-            let start_idx = weekday_index(start);
-            let end_idx = weekday_index(end);
-            if start_idx <= end_idx {
-                for idx in start_idx..=end_idx {
-                    days.push(match idx {
-                        0 => Weekday::Mon,
-                        1 => Weekday::Tue,
-                        2 => Weekday::Wed,
-                        3 => Weekday::Thu,
-                        4 => Weekday::Fri,
-                        5 => Weekday::Sat,
-                        _ => Weekday::Sun,
-                    });
-                }
+        if part == "*" {
+            return Ok(FieldMatch::Any);
+        }
+        if let Some((left, right)) = part.split_once('/') {
+            if left.contains("..") {
+                return Err(ApiError::bad_request(
+                    "Schedule repetition with ranges is not supported",
+                ));
+            }
+            let start = if left == "*" { min } else { parse_value(left)? };
+            let step = parse_numeric_value(right, 1, max - min + 1)?;
+            items.push(FieldItem::Step { start, step });
+            continue;
+        }
+        if let Some((start, end)) = part.split_once("..") {
+            let start = if start == "*" {
+                min
             } else {
-                for idx in start_idx..=6 {
-                    days.push(match idx {
-                        0 => Weekday::Mon,
-                        1 => Weekday::Tue,
-                        2 => Weekday::Wed,
-                        3 => Weekday::Thu,
-                        4 => Weekday::Fri,
-                        5 => Weekday::Sat,
-                        _ => Weekday::Sun,
-                    });
-                }
-                for idx in 0..=end_idx {
-                    days.push(match idx {
-                        0 => Weekday::Mon,
-                        1 => Weekday::Tue,
-                        2 => Weekday::Wed,
-                        3 => Weekday::Thu,
-                        4 => Weekday::Fri,
-                        5 => Weekday::Sat,
-                        _ => Weekday::Sun,
-                    });
-                }
+                parse_value(start)?
+            };
+            let end = if end == "*" { max } else { parse_value(end)? };
+            if start > end {
+                return Err(ApiError::bad_request("Invalid schedule range"));
+            }
+            items.push(FieldItem::Range(start, end));
+            continue;
+        }
+        items.push(FieldItem::Single(parse_value(part)?));
+    }
+    if items.is_empty() {
+        return Err(ApiError::bad_request("Invalid schedule field"));
+    }
+    Ok(FieldMatch::Items(items))
+}
+
+fn parse_weekday_field(value: &str) -> Result<FieldMatch, ApiError> {
+    let mut items = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim().to_ascii_lowercase();
+        if part.is_empty() {
+            continue;
+        }
+        if part == "*" {
+            return Ok(FieldMatch::Any);
+        }
+        if let Some((left, right)) = part.split_once('/') {
+            if left.contains("..") {
+                return Err(ApiError::bad_request(
+                    "Schedule repetition with ranges is not supported",
+                ));
+            }
+            let start = if left == "*" {
+                0
+            } else if let Some(day) = parse_weekday(left) {
+                weekday_index(day)
+            } else {
+                parse_numeric_value(left, 0, 6)?
+            };
+            let step = parse_numeric_value(right, 1, 7)?;
+            items.push(FieldItem::Step { start, step });
+            continue;
+        }
+        if let Some((start, end)) = part.split_once("..") {
+            let start = if let Some(day) = parse_weekday(start.trim()) {
+                weekday_index(day)
+            } else {
+                parse_numeric_value(start, 0, 6)?
+            };
+            let end = if let Some(day) = parse_weekday(end.trim()) {
+                weekday_index(day)
+            } else {
+                parse_numeric_value(end, 0, 6)?
+            };
+            if start <= end {
+                items.push(FieldItem::Range(start, end));
+            } else {
+                items.push(FieldItem::Range(start, 6));
+                items.push(FieldItem::Range(0, end));
             }
             continue;
         }
-
-        let day = parse_weekday(token)
-            .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
-        days.push(day);
+        if let Some(day) = parse_weekday(&part) {
+            items.push(FieldItem::Single(weekday_index(day)));
+        } else {
+            items.push(FieldItem::Single(parse_numeric_value(&part, 0, 6)?));
+        }
     }
-    days.sort_by_key(|day| weekday_index(*day));
-    days.dedup();
-    if days.is_empty() {
+    if items.is_empty() {
         return Err(ApiError::bad_request("Invalid schedule weekday"));
     }
-    Ok(days)
+    Ok(FieldMatch::Items(items))
 }
 
-fn parse_schedule_spec(value: &str) -> Result<ScheduleSpec, ApiError> {
+fn parse_date_field(value: &str) -> Result<(FieldMatch, FieldMatch, FieldMatch), ApiError> {
+    let parts: Vec<&str> = value.split('-').collect();
+    match parts.len() {
+        2 => {
+            let months = parse_field_items(parts[0], 1, 12, |v| parse_numeric_value(v, 1, 12))?;
+            let days = parse_field_items(parts[1], 1, 31, |v| parse_numeric_value(v, 1, 31))?;
+            Ok((FieldMatch::Any, months, days))
+        }
+        3 => {
+            let years =
+                parse_field_items(parts[0], 1970, 9999, |v| parse_numeric_value(v, 1970, 9999))?;
+            let months = parse_field_items(parts[1], 1, 12, |v| parse_numeric_value(v, 1, 12))?;
+            let days = parse_field_items(parts[2], 1, 31, |v| parse_numeric_value(v, 1, 31))?;
+            Ok((years, months, days))
+        }
+        _ => Err(ApiError::bad_request("Invalid schedule date")),
+    }
+}
+
+fn parse_time_field(value: &str) -> Result<(FieldMatch, FieldMatch, FieldMatch), ApiError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(ApiError::bad_request("Invalid schedule time"));
+    }
+    let hours = parse_field_items(parts[0], 0, 23, |v| parse_numeric_value(v, 0, 23))?;
+    let minutes = parse_field_items(parts[1], 0, 59, |v| parse_numeric_value(v, 0, 59))?;
+    let seconds = if parts.len() == 3 {
+        parse_field_items(parts[2], 0, 59, |v| parse_numeric_value(v, 0, 59))?
+    } else {
+        FieldMatch::Items(vec![FieldItem::Single(0)])
+    };
+    Ok((hours, minutes, seconds))
+}
+
+fn expand_field(field: &FieldMatch, min: u32, max: u32) -> Vec<u32> {
+    match field {
+        FieldMatch::Any => (min..=max).collect(),
+        FieldMatch::Items(items) => {
+            let mut values = Vec::new();
+            for item in items {
+                match item {
+                    FieldItem::Single(value) => {
+                        if *value >= min && *value <= max {
+                            values.push(*value);
+                        }
+                    }
+                    FieldItem::Range(start, end) => {
+                        let start = (*start).max(min);
+                        let end = (*end).min(max);
+                        if start <= end {
+                            values.extend(start..=end);
+                        }
+                    }
+                    FieldItem::Step { start, step } => {
+                        let mut value = (*start).max(min);
+                        while value <= max {
+                            values.push(value);
+                            value = value.saturating_add(*step);
+                        }
+                    }
+                }
+            }
+            values.sort_unstable();
+            values.dedup();
+            values
+        }
+    }
+}
+
+fn field_matches(field: &FieldMatch, value: u32) -> bool {
+    match field {
+        FieldMatch::Any => true,
+        FieldMatch::Items(items) => items.iter().any(|item| match item {
+            FieldItem::Single(v) => *v == value,
+            FieldItem::Range(start, end) => value >= *start && value <= *end,
+            FieldItem::Step { start, step } => value >= *start && (value - *start) % *step == 0,
+        }),
+    }
+}
+
+fn normalize_schedule_alias(value: &str) -> Option<&'static str> {
+    match value {
+        "minutely" => Some("*-*-* *:*:00"),
+        "hourly" => Some("*-*-* *:00:00"),
+        "daily" => Some("*-*-* 00:00:00"),
+        "weekly" => Some("mon *-*-* 00:00:00"),
+        "monthly" => Some("*-*-01 00:00:00"),
+        "yearly" | "annually" => Some("*-01-01 00:00:00"),
+        "quarterly" => Some("*-1/3-01 00:00:00"),
+        "semiannually" | "semi-annually" => Some("*-1/6-01 00:00:00"),
+        _ => None,
+    }
+}
+
+fn parse_calendar_event(value: &str) -> Result<CalendarSpec, ApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(ApiError::bad_request("Invalid schedule"));
     }
-    let lowered = trimmed.to_ascii_lowercase();
-    let tokens: Vec<&str> = lowered.split_whitespace().collect();
-    match tokens.as_slice() {
-        ["hourly"] => Ok(ScheduleSpec::Hourly),
-        ["daily"] => Ok(ScheduleSpec::Daily { hour: 0, minute: 0 }),
-        ["weekly"] => Ok(ScheduleSpec::Weekly {
-            days: vec![Weekday::Mon],
-            hour: 0,
-            minute: 0,
-        }),
-        ["monthly"] => Ok(ScheduleSpec::Monthly {
-            day: 1,
-            hour: 0,
-            minute: 0,
-        }),
-        ["yearly"] | ["annually"] => Ok(ScheduleSpec::Yearly {
-            month: 1,
-            day: 1,
-            hour: 0,
-            minute: 0,
-        }),
-        [time] if time.contains(':') => {
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Daily { hour, minute })
+
+    let mut tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    if let Some(first) = tokens.first().copied() {
+        let first_lower = first.to_ascii_lowercase();
+        if let Some(alias) = normalize_schedule_alias(&first_lower) {
+            let mut alias_tokens = alias.split_whitespace().collect::<Vec<_>>();
+            if tokens.len() == 1 {
+                tokens = alias_tokens;
+            } else if tokens.len() == 2 && tokens[1].contains(':') {
+                if let Some(pos) = alias_tokens.iter().position(|tok| tok.contains(':')) {
+                    alias_tokens[pos] = tokens[1];
+                    tokens = alias_tokens;
+                } else {
+                    return Err(ApiError::bad_request("Invalid schedule time"));
+                }
+            } else if tokens.len() == 2 {
+                let mut new_tokens = alias_tokens;
+                new_tokens.push(tokens[1]);
+                tokens = new_tokens;
+            } else if tokens.len() == 3 && tokens[1].contains(':') {
+                let mut alias_tokens = alias_tokens.clone();
+                if let Some(pos) = alias_tokens.iter().position(|tok| tok.contains(':')) {
+                    alias_tokens[pos] = tokens[1];
+                }
+                alias_tokens.push(tokens[2]);
+                tokens = alias_tokens;
+            } else {
+                return Err(ApiError::bad_request("Invalid schedule"));
+            }
         }
-        [kind, time] if *kind == "daily" => {
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Daily { hour, minute })
-        }
-        [kind, time] if *kind == "weekly" => {
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Weekly {
-                days: vec![Weekday::Mon],
-                hour,
-                minute,
-            })
-        }
-        [kind, time] if *kind == "monthly" => {
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Monthly {
-                day: 1,
-                hour,
-                minute,
-            })
-        }
-        [kind, time] if *kind == "yearly" || *kind == "annually" => {
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Yearly {
-                month: 1,
-                day: 1,
-                hour,
-                minute,
-            })
-        }
-        [days, time] => {
-            let days = parse_weekday_list(days)?;
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Weekly { days, hour, minute })
-        }
-        [kind, days, time] if *kind == "weekly" => {
-            let days = parse_weekday_list(days)?;
-            let (hour, minute) = parse_schedule_time(time)?;
-            Ok(ScheduleSpec::Weekly { days, hour, minute })
-        }
-        _ => Err(ApiError::bad_request("Invalid schedule")),
     }
+
+    let mut timezone = None;
+    if let Some(token) = tokens.last().copied() {
+        if let Some(parsed) = parse_timezone_token(token)? {
+            timezone = Some(parsed);
+            tokens.pop();
+        }
+    }
+    for token in tokens.clone() {
+        if let Some(parsed) = parse_timezone_token(token)? {
+            timezone = Some(parsed);
+            tokens.retain(|t| *t != token);
+            break;
+        }
+    }
+
+    let mut weekday = None;
+    let mut date = None;
+    let mut time = None;
+
+    for token in tokens {
+        if token.contains(':') {
+            if time.is_some() {
+                return Err(ApiError::bad_request("Invalid schedule time"));
+            }
+            time = Some(token);
+        } else if token.chars().any(|c| c.is_ascii_alphabetic()) {
+            if weekday.is_some() {
+                return Err(ApiError::bad_request("Invalid schedule weekday"));
+            }
+            weekday = Some(token);
+        } else if token.contains('-') || token.contains('*') || token.contains('.') {
+            if date.is_some() {
+                return Err(ApiError::bad_request("Invalid schedule date"));
+            }
+            date = Some(token);
+        } else {
+            return Err(ApiError::bad_request("Invalid schedule"));
+        }
+    }
+
+    let (years, months, days) = if let Some(date) = date {
+        parse_date_field(date)?
+    } else {
+        (FieldMatch::Any, FieldMatch::Any, FieldMatch::Any)
+    };
+    let weekdays = if let Some(weekday) = weekday {
+        parse_weekday_field(weekday)?
+    } else {
+        FieldMatch::Any
+    };
+    let (hours, minutes, seconds) = if let Some(time) = time {
+        parse_time_field(time)?
+    } else {
+        (
+            FieldMatch::Items(vec![FieldItem::Single(0)]),
+            FieldMatch::Items(vec![FieldItem::Single(0)]),
+            FieldMatch::Items(vec![FieldItem::Single(0)]),
+        )
+    };
+
+    Ok(CalendarSpec {
+        tz: timezone.unwrap_or(CalendarTimezone::Local),
+        years,
+        months,
+        days,
+        weekdays,
+        hours,
+        minutes,
+        seconds,
+    })
 }
 
-fn next_run_after(spec: &ScheduleSpec, after: chrono::DateTime<chrono::Utc>) -> Option<i64> {
-    match spec {
-        ScheduleSpec::Hourly => {
-            let base = after
-                .with_minute(0)
-                .and_then(|dt| dt.with_second(0))
-                .and_then(|dt| dt.with_nanosecond(0))?;
-            let next = base + Duration::hours(1);
-            Some(next.timestamp())
+fn next_calendar_run(
+    spec: &CalendarSpec,
+    base: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let start = base + Duration::seconds(1);
+    let max_days = 366 * 200;
+
+    let hours = expand_field(&spec.hours, 0, 23);
+    let minutes = expand_field(&spec.minutes, 0, 59);
+    let seconds = expand_field(&spec.seconds, 0, 59);
+
+    let (start_naive, to_utc) = match spec.tz {
+        CalendarTimezone::Local => {
+            let local = chrono::DateTime::<chrono::Local>::from(start);
+            (
+                local.naive_local(),
+                Box::new(|naive: chrono::NaiveDateTime| {
+                    match chrono::Local.from_local_datetime(&naive) {
+                        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                        chrono::LocalResult::Ambiguous(a, b) => {
+                            Some(if a <= b { a } else { b }.with_timezone(&chrono::Utc))
+                        }
+                        chrono::LocalResult::None => None,
+                    }
+                })
+                    as Box<dyn Fn(chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>>>,
+            )
         }
-        ScheduleSpec::Daily { hour, minute } => {
-            for offset in 0..=1 {
-                let date = after.date_naive() + chrono::Duration::days(offset);
-                let candidate = chrono::Utc
-                    .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
-                    .single()?;
-                if candidate > after {
-                    return Some(candidate.timestamp());
-                }
-            }
-            None
-        }
-        ScheduleSpec::Weekly { days, hour, minute } => {
-            for offset in 0..=7 {
-                let date = after.date_naive() + chrono::Duration::days(offset);
-                let day = date.weekday();
-                if !days.contains(&day) {
-                    continue;
-                }
-                let candidate = chrono::Utc
-                    .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
-                    .single()?;
-                if candidate > after {
-                    return Some(candidate.timestamp());
-                }
-            }
-            None
-        }
-        ScheduleSpec::Monthly { day, hour, minute } => {
-            let mut year = after.year();
-            let mut month = after.month();
-            for _ in 0..=12 {
-                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, *day) {
-                    if let Some(candidate) = chrono::Utc
-                        .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
+        CalendarTimezone::Fixed(offset) => {
+            let local = start.with_timezone(&offset);
+            (
+                local.naive_local(),
+                Box::new(move |naive: chrono::NaiveDateTime| {
+                    offset
+                        .from_local_datetime(&naive)
                         .single()
-                    {
-                        if candidate > after {
-                            return Some(candidate.timestamp());
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                })
+                    as Box<dyn Fn(chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>>>,
+            )
+        }
+    };
+
+    for day_offset in 0..=max_days {
+        let date = start_naive.date() + chrono::Duration::days(day_offset);
+        let year = date.year() as u32;
+        let month = date.month();
+        let day = date.day();
+        let weekday = weekday_index(date.weekday());
+
+        if !field_matches(&spec.years, year)
+            || !field_matches(&spec.months, month)
+            || !field_matches(&spec.days, day)
+            || !field_matches(&spec.weekdays, weekday)
+        {
+            continue;
+        }
+
+        let min_time = if day_offset == 0 {
+            Some(start_naive.time())
+        } else {
+            None
+        };
+
+        for hour in &hours {
+            for minute in &minutes {
+                for second in &seconds {
+                    if let Some(min_time) = min_time {
+                        if (*hour, *minute, *second)
+                            < (min_time.hour(), min_time.minute(), min_time.second())
+                        {
+                            continue;
+                        }
+                    }
+                    let Some(naive) = date.and_hms_opt(*hour, *minute, *second) else {
+                        continue;
+                    };
+                    if let Some(dt) = to_utc(naive) {
+                        if dt > base {
+                            return Some(dt);
                         }
                     }
                 }
-                month += 1;
-                if month > 12 {
-                    month = 1;
-                    year += 1;
-                }
             }
-            None
-        }
-        ScheduleSpec::Yearly {
-            month,
-            day,
-            hour,
-            minute,
-        } => {
-            let mut year = after.year();
-            for _ in 0..=1 {
-                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, *month, *day) {
-                    if let Some(candidate) = chrono::Utc
-                        .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
-                        .single()
-                    {
-                        if candidate > after {
-                            return Some(candidate.timestamp());
-                        }
-                    }
-                }
-                year += 1;
-            }
-            None
         }
     }
+    None
 }
 
 fn job_last_run_time(state: Option<&VerificationJobState>) -> Option<i64> {
@@ -1860,16 +2099,64 @@ fn compute_next_run(
     interval: Option<i64>,
 ) -> Option<i64> {
     if let Some(schedule) = schedule {
-        let spec = parse_schedule_spec(schedule).ok()?;
         let base = last_run.unwrap_or(now);
         let base_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0)?;
-        return next_run_after(&spec, base_dt);
+        let spec = parse_calendar_event(schedule).ok()?;
+        return next_calendar_run(&spec, base_dt).map(|dt| dt.timestamp());
     }
 
     interval.map(|interval| {
         let base = last_run.unwrap_or(now);
         base + interval
     })
+}
+
+fn compute_verify_job_status(
+    job: &VerificationJobConfig,
+    job_states: &HashMap<String, VerificationJobState>,
+    snapshots: &[TaskSnapshot],
+    now: i64,
+    interval: Option<i64>,
+    enabled: bool,
+) -> (Option<i64>, Option<String>, Option<String>, Option<i64>) {
+    let worker_id = format!("{}:{}", job.store, job.id);
+    let mut last_task: Option<TaskSnapshot> = None;
+    for task in snapshots.iter().filter(|t| {
+        t.worker_type == "verificationjob" && t.worker_id.as_deref() == Some(worker_id.as_str())
+    }) {
+        if last_task
+            .as_ref()
+            .map(|prev| task.starttime > prev.starttime)
+            .unwrap_or(true)
+        {
+            last_task = Some(task.clone());
+        }
+    }
+
+    let state_entry = job_states.get(&job.id);
+    let last_run_upid = state_entry
+        .and_then(|entry| entry.last_run_upid.clone())
+        .or_else(|| last_task.as_ref().map(|task| task.upid.clone()));
+    let last_run_state = state_entry
+        .and_then(|entry| entry.last_run_state.clone())
+        .or_else(|| {
+            last_task
+                .as_ref()
+                .and_then(|task| task.exitstatus.clone().or_else(|| task.status.clone()))
+        });
+    let last_run_endtime = state_entry
+        .and_then(|entry| entry.last_run_endtime)
+        .or_else(|| last_task.as_ref().and_then(|task| task.endtime));
+    let last_run_time =
+        last_run_endtime.or_else(|| last_run_upid.as_deref().and_then(parse_upid_starttime));
+
+    let next_run = if enabled {
+        compute_next_run(job.schedule.as_deref(), last_run_time, now, interval)
+    } else {
+        None
+    };
+
+    (next_run, last_run_state, last_run_upid, last_run_endtime)
 }
 
 enum H2Context {
@@ -5681,7 +5968,7 @@ fn validate_verify_job_config(
         }
     }
     if let Some(schedule) = config.schedule.as_ref() {
-        let _ = parse_schedule_spec(schedule)?;
+        let _ = parse_calendar_event(schedule)?;
     }
     Ok(())
 }
@@ -5973,48 +6260,15 @@ async fn handle_verify_api(
                         continue;
                     }
                 }
-                let worker_id = format!("{}:{}", job.store, job.id);
-                let mut last_task: Option<TaskSnapshot> = None;
-                for task in snapshots.iter().filter(|t| {
-                    t.worker_type == "verificationjob"
-                        && t.worker_id.as_deref() == Some(worker_id.as_str())
-                }) {
-                    if last_task
-                        .as_ref()
-                        .map(|prev| task.starttime > prev.starttime)
-                        .unwrap_or(true)
-                    {
-                        last_task = Some(task.clone());
-                    }
-                }
-
-                let state_entry = job_states.get(&job.id);
-                let last_run_upid = state_entry
-                    .and_then(|entry| entry.last_run_upid.clone())
-                    .or_else(|| last_task.as_ref().map(|task| task.upid.clone()));
-                let last_run_state = state_entry
-                    .and_then(|entry| entry.last_run_state.clone())
-                    .or_else(|| {
-                        last_task.as_ref().and_then(|task| {
-                            task.exitstatus.clone().or_else(|| task.status.clone())
-                        })
-                    });
-                let last_run_endtime = state_entry
-                    .and_then(|entry| entry.last_run_endtime)
-                    .or_else(|| last_task.as_ref().and_then(|task| task.endtime));
-
-                let last_run_time = last_run_endtime
-                    .or_else(|| last_run_upid.as_deref().and_then(parse_upid_starttime));
-                let next_run = if state.config.verify.enabled {
-                    compute_next_run(
-                        job.schedule.as_deref(),
-                        last_run_time,
+                let (next_run, last_run_state, last_run_upid, last_run_endtime) =
+                    compute_verify_job_status(
+                        &job,
+                        &job_states,
+                        &snapshots,
                         now,
                         if interval > 0 { Some(interval) } else { None },
-                    )
-                } else {
-                    None
-                };
+                        state.config.verify.enabled,
+                    );
 
                 items.push(serde_json::json!({
                     "id": job.id,
@@ -6037,63 +6291,101 @@ async fn handle_verify_api(
     }
 
     let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() < 2 || parts[1] != "run" || req.method() != Method::POST {
-        return not_found();
-    }
-    let target = parts[0];
+    match (req.method(), parts.as_slice()) {
+        (&Method::GET, [job_id, "status"]) => {
+            let job = {
+                let guard = state.verify_jobs.read().await;
+                guard.get(*job_id).cloned()
+            };
+            let Some(job) = job else {
+                return not_found();
+            };
 
-    let job = {
-        let guard = state.verify_jobs.read().await;
-        guard.get(target).cloned()
-    };
+            let snapshots = state.tasks.snapshot().await;
+            let job_states = {
+                let guard = state.verify_job_state.read().await;
+                guard.clone()
+            };
+            let now = chrono::Utc::now().timestamp();
+            let interval = state.config.verify.interval_hours as i64 * 3600;
+            let (next_run, last_run_state, last_run_upid, last_run_endtime) =
+                compute_verify_job_status(
+                    &job,
+                    &job_states,
+                    &snapshots,
+                    now,
+                    if interval > 0 { Some(interval) } else { None },
+                    state.config.verify.enabled,
+                );
 
-    let auth_id = task_auth_id(ctx);
-    let upid = if let Some(job) = job {
-        let datastore = match state.get_datastore(&job.store) {
-            Some(ds) => ds,
-            None => return not_found(),
-        };
-        spawn_verify_task(
-            state.clone(),
-            datastore,
-            auth_id,
-            job.store.clone(),
-            VerifyTaskOptions {
-                job_id: Some(job.id.clone()),
-                namespace: job.ns.clone(),
-                max_depth: job.max_depth,
-                ignore_verified: job.ignore_verified.unwrap_or(true),
-                outdated_after: job.outdated_after,
-                trigger: "manual".to_string(),
-            },
-        )
-        .await
-    } else {
-        if let Err(e) = validate_datastore_name(target) {
-            return error_response(e);
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "data": {
+                        "next-run": next_run,
+                        "last-run-state": last_run_state,
+                        "last-run-upid": last_run_upid,
+                        "last-run-endtime": last_run_endtime,
+                    }
+                }),
+            )
         }
-        let datastore = match state.get_datastore(target) {
-            Some(ds) => ds,
-            None => return not_found(),
-        };
-        spawn_verify_task(
-            state.clone(),
-            datastore,
-            auth_id,
-            target.to_string(),
-            VerifyTaskOptions {
-                job_id: None,
-                namespace: None,
-                max_depth: None,
-                ignore_verified: false,
-                outdated_after: None,
-                trigger: "manual".to_string(),
-            },
-        )
-        .await
-    };
+        (&Method::POST, [target, "run"]) => {
+            let job = {
+                let guard = state.verify_jobs.read().await;
+                guard.get(*target).cloned()
+            };
 
-    json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
+            let auth_id = task_auth_id(ctx);
+            let upid = if let Some(job) = job {
+                let datastore = match state.get_datastore(&job.store) {
+                    Some(ds) => ds,
+                    None => return not_found(),
+                };
+                spawn_verify_task(
+                    state.clone(),
+                    datastore,
+                    auth_id,
+                    job.store.clone(),
+                    VerifyTaskOptions {
+                        job_id: Some(job.id.clone()),
+                        namespace: job.ns.clone(),
+                        max_depth: job.max_depth,
+                        ignore_verified: job.ignore_verified.unwrap_or(true),
+                        outdated_after: job.outdated_after,
+                        trigger: "manual".to_string(),
+                    },
+                )
+                .await
+            } else {
+                if let Err(e) = validate_datastore_name(target) {
+                    return error_response(e);
+                }
+                let datastore = match state.get_datastore(target) {
+                    Some(ds) => ds,
+                    None => return not_found(),
+                };
+                spawn_verify_task(
+                    state.clone(),
+                    datastore,
+                    auth_id,
+                    target.to_string(),
+                    VerifyTaskOptions {
+                        job_id: None,
+                        namespace: None,
+                        max_depth: None,
+                        ignore_verified: false,
+                        outdated_after: None,
+                        trigger: "manual".to_string(),
+                    },
+                )
+                .await
+            };
+
+            json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
+        }
+        _ => not_found(),
+    }
 }
 
 // === Response helpers ===
@@ -6149,6 +6441,7 @@ fn bad_request(message: &str) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
     use pbs_core::EncryptionKey;
 
     #[test]
@@ -6167,5 +6460,29 @@ mod tests {
             .expect("decode")
             .expect("chunk");
         assert_eq!(decoded.digest(), chunk.digest());
+    }
+
+    #[test]
+    fn test_calendar_next_run_daily_utc() {
+        let spec = parse_calendar_event("daily 12:05 UTC").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 12, 5, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_next_run_weekday_range() {
+        let spec = parse_calendar_event("mon..fri 8..17,22:0/15 UTC").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 8, 7, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 8, 15, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_timezone_offset() {
+        let spec = parse_calendar_event("daily 12:00 +02:00").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap());
     }
 }
