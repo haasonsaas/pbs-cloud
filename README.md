@@ -470,7 +470,7 @@ cargo test test_path_traversal
 
 ## License
 
-MIT OR Apache-2.0
+MIT
 
 ## Disclaimer
 
