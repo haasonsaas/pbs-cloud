@@ -1177,14 +1177,18 @@ async fn handle_finish_backup(
 
 async fn handle_known_chunks(
     state: Arc<ServerState>,
-    _ctx: &AuthContext,
+    ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
-    // TODO: verify ctx.user.tenant_id owns this session
     let session_id = match get_query_param(req.uri(), "session_id") {
         Some(id) => id,
         None => return bad_request("Missing session_id"),
     };
+
+    // Verify session ownership - prevent cross-tenant chunk enumeration
+    if let Err(e) = state.sessions.verify_session_ownership(&session_id, &ctx.user.tenant_id).await {
+        return error_response(e);
+    }
 
     let body = match req.collect().await {
         Ok(collected) => collected.to_bytes(),

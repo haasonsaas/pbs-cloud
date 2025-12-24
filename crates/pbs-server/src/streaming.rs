@@ -277,12 +277,12 @@ impl BackupProtocolHandler {
     }
 
     /// Check known chunks (for deduplication)
+    /// Note: Session ownership is verified at the server handler level
     pub async fn check_known_chunks(
         &self,
         _session_id: &str,
         digests: &[ChunkDigest],
     ) -> Result<Vec<bool>, ApiError> {
-        // TODO: verify session ownership
         let datastore = self.state.default_datastore();
         let mut results = Vec::with_capacity(digests.len());
 
