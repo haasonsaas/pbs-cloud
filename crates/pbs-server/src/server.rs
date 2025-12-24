@@ -1026,6 +1026,14 @@ fn manifest_notes(manifest: &BackupManifest) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn manifest_verification(manifest: &BackupManifest) -> Option<serde_json::Value> {
+    manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("verify_state"))
+        .cloned()
+}
+
 fn manifest_protected(manifest: &BackupManifest) -> bool {
     let protected = manifest
         .unprotected
@@ -1700,6 +1708,7 @@ async fn handle_datastore_api(
                     let mut size: Option<u64> = None;
                     let mut comment = None;
                     let mut protected = false;
+                    let mut verification = None;
                     if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
                         files = manifest
                             .files
@@ -1714,9 +1723,10 @@ async fn handle_datastore_api(
                         size = Some(manifest.files.iter().map(|f| f.size).sum());
                         comment = manifest_note_line(&manifest);
                         protected = manifest_protected(&manifest);
+                        verification = manifest_verification(&manifest);
                     }
 
-                    snapshots.push(serde_json::json!({
+                    let mut snapshot = serde_json::json!({
                         "backup-type": group.backup_type,
                         "backup-id": group.backup_id,
                         "backup-time": backup_time,
@@ -1725,7 +1735,13 @@ async fn handle_datastore_api(
                         "comment": comment,
                         "protected": protected,
                         "owner": owner,
-                    }));
+                    });
+                    if let Some(value) = verification {
+                        if let Some(obj) = snapshot.as_object_mut() {
+                            obj.insert("verification".to_string(), value);
+                        }
+                    }
+                    snapshots.push(snapshot);
                 }
             }
 
@@ -2296,6 +2312,16 @@ async fn handle_datastore_api(
                     .tasks
                     .log(&upid_clone, "Starting garbage collection")
                     .await;
+                state
+                    .tasks
+                    .log(
+                        &upid_clone,
+                        &format!(
+                            "GC options: dry_run={}, max_delete={:?}",
+                            options.dry_run, options.max_delete
+                        ),
+                    )
+                    .await;
                 let backend = datastore.backend();
                 let gc = GarbageCollector::new(datastore.clone(), backend);
                 match gc.run(options).await {
@@ -2310,6 +2336,29 @@ async fn handle_datastore_api(
                                 ),
                             )
                             .await;
+                        state
+                            .tasks
+                            .log(
+                                &upid_clone,
+                                &format!(
+                                    "GC stats: scanned={}, referenced={}, orphaned={}, deleted={}, errors={}",
+                                    result.chunks_scanned,
+                                    result.chunks_referenced,
+                                    result.chunks_orphaned,
+                                    result.chunks_deleted,
+                                    result.errors.len()
+                                ),
+                            )
+                            .await;
+                        if !result.errors.is_empty() {
+                            state
+                                .tasks
+                                .log(
+                                    &upid_clone,
+                                    "GC errors present; see server logs for details",
+                                )
+                                .await;
+                        }
                         state.tasks.finish(&upid_clone, "OK").await;
                         let stats = datastore.backend().stats().await.unwrap_or_default();
                         let used = stats.chunk_bytes + stats.file_bytes;
@@ -3510,7 +3559,16 @@ async fn handle_finish_backup(
             let response: FinishBackupResponse = result.into();
             json_response(StatusCode::OK, &serde_json::json!({"data": response}))
         }
-        Err(e) => error_response(e),
+        Err(e) => {
+            if let Some(upid) = take_session_task(&state.backup_tasks, &session_id).await {
+                state
+                    .tasks
+                    .log(&upid, &format!("Backup failed: {}", e))
+                    .await;
+                state.tasks.finish(&upid, "ERROR").await;
+            }
+            error_response(e)
+        }
     }
 }
 
