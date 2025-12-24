@@ -1,0 +1,23 @@
+[package]
+name = "pbs-storage"
+description = "Storage backends for PBS-compatible backup server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+pbs-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

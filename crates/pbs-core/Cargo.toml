@@ -1,0 +1,25 @@
+[package]
+name = "pbs-core"
+description = "Core data structures for PBS-compatible backup server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aes-gcm = { workspace = true }
+zstd = { workspace = true }
+sha2 = { workspace = true }
+crc32fast = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

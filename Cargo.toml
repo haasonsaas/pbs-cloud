@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pbs-core",
+    "crates/pbs-storage",
+    "crates/pbs-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["haasonsaas"]
+repository = "https://github.com/haasonsaas/pbs-cloud"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# HTTP/2 server
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+h2 = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Crypto - matching PBS specs
+aes-gcm = "0.10"
+zstd = "0.13"
+sha2 = "0.10"
+crc32fast = "1.4"
+rand = "0.8"
+
+# Storage backends
+aws-sdk-s3 = "1.61"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+
+# Utilities
+thiserror = "2.0"
+anyhow = "1.0"
+bytes = "1.9"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+async-trait = "0.1"
+
+# Internal crates
+pbs-core = { path = "crates/pbs-core" }
+pbs-storage = { path = "crates/pbs-storage" }
