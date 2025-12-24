@@ -40,10 +40,10 @@ PBS Cloud is a clean-room implementation of a backup server compatible with [Pro
 
 ### Roadmap
 
-- [ ] Encryption key management
-- [ ] WORM/immutable backups
-- [ ] Compliance reporting
-- [ ] Webhook signature verification
+- [x] Encryption key management (env-configured)
+- [x] WORM/immutable backups
+- [x] Compliance reporting
+- [x] Webhook signature verification
 
 ## Architecture
 
@@ -145,7 +145,7 @@ sequenceDiagram
     S->>C: { ticket, CSRFPreventionToken }
 
     Note over C,S: Start Backup Session
-    C->>S: GET /api2/json/admin/datastore/{store}/backup
+    C->>S: GET /api2/json/backup
     S->>C: HTTP 101 Upgrade (h2)
 
     Note over C,S: HTTP/2 Streaming Protocol
@@ -272,6 +272,15 @@ proxmox-backup-client restore host/hostname/2024-01-01T00:00:00Z root.pxar /rest
 | **Garbage Collection** | | |
 | `PBS_GC_DISABLED` | Disable automatic GC (set to any value) | - |
 | `PBS_GC_INTERVAL_HOURS` | Hours between GC runs | `24` |
+| **WORM / Immutability** | | |
+| `PBS_WORM_ENABLED` | Enable WORM retention enforcement (`true`/`1`) | `false` |
+| `PBS_WORM_RETENTION_DAYS` | Default retention period in days | - |
+| `PBS_WORM_ALLOW_OVERRIDE` | Allow per-backup retention override | `false` |
+| **Webhook Verification** | | |
+| `PBS_WEBHOOK_RECEIVER_SECRET` | HMAC secret for inbound webhook verification | - |
+| **Encryption** | | |
+| `PBS_ENCRYPTION_KEY` | Hex-encoded 32-byte key for server-managed encryption | - |
+| `PBS_ENCRYPTION_KEY_FILE` | Path to a file containing the hex key | - |
 
 ### TLS Configuration
 
@@ -376,6 +385,14 @@ curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
   https://localhost:8007/api2/json/billing/usage
 ```
 
+### Compliance Report (Admin only)
+
+```bash
+# Get compliance report (snapshot retention summary)
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/compliance/report
+```
+
 ### Prometheus Metrics
 
 ```bash
@@ -408,6 +425,16 @@ Events include:
 - `data_restored` - Data downloaded
 - `storage_updated` - Storage usage changed
 - `api_request` - API call made
+
+### Webhook Signature Verification
+
+Inbound webhook verification is available at:
+
+```bash
+curl -X POST https://localhost:8007/api2/json/billing/webhook \
+  -H "X-Signature-256: sha256=<hex-hmac>" \
+  -d '{"event":"test"}'
+```
 
 ## Permissions
 

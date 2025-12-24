@@ -25,6 +25,13 @@ pub struct ServerConfig {
     /// Garbage collection configuration
     #[serde(default)]
     pub gc: GcConfig,
+    /// WORM/immutability configuration
+    #[serde(default)]
+    pub worm: WormConfig,
+    /// Shared secret for inbound webhook verification
+    pub webhook_receiver_secret: Option<String>,
+    /// Optional encryption key (hex, 32 bytes)
+    pub encryption_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +44,9 @@ impl Default for ServerConfig {
             storage: StorageConfig::default(),
             tenants: TenantsConfig::default(),
             gc: GcConfig::default(),
+            worm: WormConfig::default(),
+            webhook_receiver_secret: None,
+            encryption_key: None,
         }
     }
 }
@@ -147,6 +157,27 @@ impl Default for GcConfig {
         Self {
             enabled: true,
             interval_hours: 24, // Run GC once per day by default
+        }
+    }
+}
+
+/// WORM/immutability configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WormConfig {
+    /// Enable WORM protection
+    pub enabled: bool,
+    /// Default retention days (if enabled)
+    pub default_retention_days: Option<u64>,
+    /// Allow per-backup override
+    pub allow_override: bool,
+}
+
+impl Default for WormConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_retention_days: None,
+            allow_override: false,
         }
     }
 }

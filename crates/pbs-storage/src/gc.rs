@@ -140,7 +140,7 @@ impl GarbageCollector {
             for timestamp in snapshots {
                 // Read the manifest
                 let manifest_path = format!(
-                    "{}/{}/{}/index.json",
+                    "{}/{}/{}/index.json.blob",
                     group.backup_type, group.backup_id, timestamp
                 );
 

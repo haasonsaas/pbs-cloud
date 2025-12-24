@@ -5,8 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Protocol upgrade header value
-pub const PROTOCOL_HEADER: &str = "proxmox-backup-protocol-v1";
+/// Protocol upgrade header value for backup
+pub const BACKUP_PROTOCOL_HEADER: &str = "proxmox-backup-protocol-v1";
+
+/// Protocol upgrade header value for reader
+pub const READER_PROTOCOL_HEADER: &str = "proxmox-backup-reader-protocol-v1";
 
 /// Backup request parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +22,12 @@ pub struct BackupParams {
     pub backup_time: String,
     /// Whether to use encrypted chunks
     pub encrypt: bool,
+    /// Optional retention override (RFC3339)
+    #[serde(default)]
+    pub retain_until: Option<String>,
+    /// Optional retention override in days
+    #[serde(default)]
+    pub retention_days: Option<u64>,
 }
 
 /// Backup session state

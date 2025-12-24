@@ -47,8 +47,14 @@ pub struct BackupSession {
     pub fixed_indexes: HashMap<String, FixedIndexBuilder>,
     /// Dynamic indexes being built
     pub dynamic_indexes: HashMap<String, DynamicIndexBuilder>,
+    /// Index writers by ID (H2 protocol)
+    pub writers: HashMap<u64, IndexWriter>,
+    /// Next writer ID
+    pub next_writer_id: u64,
     /// Uploaded blobs
     pub blobs: HashMap<String, Vec<u8>>,
+    /// Retention timestamp (RFC3339)
+    pub retain_until: Option<String>,
     /// Reference to datastore
     datastore: Arc<Datastore>,
 }
@@ -74,15 +80,27 @@ impl BackupSession {
             fixed_indexes: HashMap::new(),
             dynamic_indexes: HashMap::new(),
             blobs: HashMap::new(),
+            writers: HashMap::new(),
+            next_writer_id: 1,
+            retain_until: None,
             datastore,
         }
     }
 
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
+        let time = if self.params.backup_time.chars().all(|c| c.is_ascii_digit()) {
+            self.params.backup_time.parse::<i64>()
+                .ok()
+                .and_then(|epoch| chrono::DateTime::<Utc>::from_timestamp(epoch, 0))
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| self.params.backup_time.clone())
+        } else {
+            self.params.backup_time.clone()
+        };
         format!(
             "{}/{}/{}",
-            self.params.backup_type, self.params.backup_id, self.params.backup_time
+            self.params.backup_type, self.params.backup_id, time
         )
     }
 
@@ -110,6 +128,20 @@ impl BackupSession {
         self.touch();
     }
 
+    pub fn create_fixed_index_with_id(&mut self, name: &str, chunk_size: u64) -> u64 {
+        self.create_fixed_index(name, chunk_size);
+        let wid = self.next_writer_id;
+        self.next_writer_id = self.next_writer_id.saturating_add(1);
+        self.writers.insert(
+            wid,
+            IndexWriter {
+                name: name.to_string(),
+                kind: IndexKind::Fixed,
+            },
+        );
+        wid
+    }
+
     /// Append to a fixed index
     pub fn append_fixed_index(
         &mut self,
@@ -121,7 +153,7 @@ impl BackupSession {
             .fixed_indexes
             .get_mut(name)
             .ok_or_else(|| ApiError::not_found(&format!("Fixed index '{}' not found", name)))?;
-        builder.push(digest, size);
+        builder.push(digest, Some(size));
         self.touch();
         Ok(())
     }
@@ -130,7 +162,8 @@ impl BackupSession {
     pub fn close_fixed_index(&mut self, name: &str) -> Result<FixedIndex, ApiError> {
         let builder = self
             .fixed_indexes
-            .remove(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| ApiError::not_found(&format!("Fixed index '{}' not found", name)))?;
         self.touch();
         Ok(builder.build())
@@ -141,6 +174,20 @@ impl BackupSession {
         self.dynamic_indexes
             .insert(name.to_string(), DynamicIndexBuilder::new());
         self.touch();
+    }
+
+    pub fn create_dynamic_index_with_id(&mut self, name: &str) -> u64 {
+        self.create_dynamic_index(name);
+        let wid = self.next_writer_id;
+        self.next_writer_id = self.next_writer_id.saturating_add(1);
+        self.writers.insert(
+            wid,
+            IndexWriter {
+                name: name.to_string(),
+                kind: IndexKind::Dynamic,
+            },
+        );
+        wid
     }
 
     /// Append to a dynamic index
@@ -155,7 +202,7 @@ impl BackupSession {
             .dynamic_indexes
             .get_mut(name)
             .ok_or_else(|| ApiError::not_found(&format!("Dynamic index '{}' not found", name)))?;
-        builder.push(digest, offset, size);
+        builder.push(digest, offset, Some(size));
         self.touch();
         Ok(())
     }
@@ -164,15 +211,83 @@ impl BackupSession {
     pub fn close_dynamic_index(&mut self, name: &str) -> Result<DynamicIndex, ApiError> {
         let builder = self
             .dynamic_indexes
-            .remove(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| ApiError::not_found(&format!("Dynamic index '{}' not found", name)))?;
         self.touch();
-        Ok(builder.build())
+        builder.build()
+    }
+
+    pub fn append_fixed_index_by_id(
+        &mut self,
+        wid: u64,
+        digest: ChunkDigest,
+        size: Option<u64>,
+    ) -> Result<(), ApiError> {
+        let writer = self.writers.get(&wid)
+            .ok_or_else(|| ApiError::not_found("Writer not found"))?;
+        if writer.kind != IndexKind::Fixed {
+            return Err(ApiError::bad_request("Writer is not fixed index"));
+        }
+        let builder = self.fixed_indexes.get_mut(&writer.name)
+            .ok_or_else(|| ApiError::not_found("Fixed index not found"))?;
+        builder.push(digest, size);
+        self.touch();
+        Ok(())
+    }
+
+    pub fn append_dynamic_index_by_id(
+        &mut self,
+        wid: u64,
+        digest: ChunkDigest,
+        offset: u64,
+        size: Option<u64>,
+    ) -> Result<(), ApiError> {
+        let writer = self.writers.get(&wid)
+            .ok_or_else(|| ApiError::not_found("Writer not found"))?;
+        if writer.kind != IndexKind::Dynamic {
+            return Err(ApiError::bad_request("Writer is not dynamic index"));
+        }
+        let builder = self.dynamic_indexes.get_mut(&writer.name)
+            .ok_or_else(|| ApiError::not_found("Dynamic index not found"))?;
+        builder.push(digest, offset, size);
+        self.touch();
+        Ok(())
+    }
+
+    pub fn set_index_total_size(&mut self, wid: u64, size: u64) -> Result<(), ApiError> {
+        let writer = self.writers.get(&wid)
+            .ok_or_else(|| ApiError::not_found("Writer not found"))?;
+        match writer.kind {
+            IndexKind::Fixed => {
+                let builder = self.fixed_indexes.get_mut(&writer.name)
+                    .ok_or_else(|| ApiError::not_found("Fixed index not found"))?;
+                builder.set_total_size(size);
+            }
+            IndexKind::Dynamic => {
+                let builder = self.dynamic_indexes.get_mut(&writer.name)
+                    .ok_or_else(|| ApiError::not_found("Dynamic index not found"))?;
+                builder.set_total_size(size);
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
+    pub fn close_index_by_id(&mut self, wid: u64) -> Result<(String, IndexKind), ApiError> {
+        let writer = self.writers.remove(&wid)
+            .ok_or_else(|| ApiError::not_found("Writer not found"))?;
+        Ok((writer.name, writer.kind))
     }
 
     /// Store a blob
     pub fn store_blob(&mut self, name: &str, data: Vec<u8>) {
         self.blobs.insert(name.to_string(), data);
+        self.touch();
+    }
+
+    pub fn set_retain_until(&mut self, until: String) {
+        self.retain_until = Some(until);
         self.touch();
     }
 
@@ -185,7 +300,17 @@ impl BackupSession {
         self.state = SessionState::Finishing;
 
         // Create manifest
-        let mut manifest = BackupManifest::new(&self.params.backup_type, &self.params.backup_id);
+        let mut manifest = BackupManifest::new(
+            &self.params.backup_type,
+            &self.params.backup_id,
+        );
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&self.params.backup_time) {
+            manifest.backup_time = dt.with_timezone(&Utc);
+        } else if let Ok(epoch) = self.params.backup_time.parse::<i64>() {
+            if let Some(dt) = chrono::DateTime::<Utc>::from_timestamp(epoch, 0) {
+                manifest.backup_time = dt;
+            }
+        }
 
         // Store remaining fixed indexes
         for (name, builder) in std::mem::take(&mut self.fixed_indexes) {
@@ -203,7 +328,7 @@ impl BackupSession {
 
         // Store remaining dynamic indexes
         for (name, builder) in std::mem::take(&mut self.dynamic_indexes) {
-            let index = builder.build();
+            let index = builder.build()?;
             let path = format!("{}/{}", self.snapshot_path(), name);
             let data = index.to_bytes();
 
@@ -228,6 +353,21 @@ impl BackupSession {
         }
 
         // Store manifest
+        if let Some(until) = &self.retain_until {
+            let mut value = manifest
+                .unprotected
+                .take()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "worm_retain_until".to_string(),
+                    serde_json::Value::String(until.clone()),
+                );
+            } else {
+                value = serde_json::json!({ "worm_retain_until": until });
+            }
+            manifest.unprotected = Some(value);
+        }
         self.datastore
             .store_manifest(&manifest)
             .await
@@ -243,47 +383,106 @@ impl BackupSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    Fixed,
+    Dynamic,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexWriter {
+    pub name: String,
+    pub kind: IndexKind,
+}
+
 /// Builder for fixed indexes
 #[derive(Clone)]
 pub struct FixedIndexBuilder {
-    index: FixedIndex,
+    chunk_size: u64,
+    digests: Vec<ChunkDigest>,
+    size_accum: u64,
+    total_size: Option<u64>,
 }
 
 impl FixedIndexBuilder {
     pub fn new(chunk_size: u64) -> Self {
         Self {
-            index: FixedIndex::new(chunk_size),
+            chunk_size,
+            digests: Vec::new(),
+            size_accum: 0,
+            total_size: None,
         }
     }
 
-    pub fn push(&mut self, digest: ChunkDigest, size: u64) {
-        self.index.push(digest, size);
+    pub fn push(&mut self, digest: ChunkDigest, size: Option<u64>) {
+        self.digests.push(digest);
+        if let Some(size) = size {
+            self.size_accum = self.size_accum.saturating_add(size);
+        }
+    }
+
+    pub fn set_total_size(&mut self, size: u64) {
+        self.total_size = Some(size);
     }
 
     pub fn build(self) -> FixedIndex {
-        self.index
+        let mut index = FixedIndex::new(self.chunk_size);
+        for digest in self.digests {
+            index.digests.push(digest);
+        }
+        index.size = self.total_size.unwrap_or(self.size_accum);
+        index
     }
 }
 
 /// Builder for dynamic indexes
 #[derive(Clone)]
 pub struct DynamicIndexBuilder {
-    index: DynamicIndex,
+    entries: Vec<(u64, ChunkDigest, Option<u64>)>,
+    total_size: Option<u64>,
 }
 
 impl DynamicIndexBuilder {
     pub fn new() -> Self {
         Self {
-            index: DynamicIndex::new(),
+            entries: Vec::new(),
+            total_size: None,
         }
     }
 
-    pub fn push(&mut self, digest: ChunkDigest, offset: u64, size: u64) {
-        self.index.push(digest, offset, size);
+    pub fn push(&mut self, digest: ChunkDigest, offset: u64, size: Option<u64>) {
+        self.entries.push((offset, digest, size));
     }
 
-    pub fn build(self) -> DynamicIndex {
-        self.index
+    pub fn set_total_size(&mut self, size: u64) {
+        self.total_size = Some(size);
+    }
+
+    pub fn build(self) -> Result<DynamicIndex, ApiError> {
+        let mut index = DynamicIndex::new();
+        let mut entries = self.entries;
+        entries.sort_by_key(|(offset, _, _)| *offset);
+
+        for i in 0..entries.len() {
+            let (offset, digest, size_opt) = entries[i];
+            let size = if let Some(size) = size_opt {
+                size
+            } else {
+                let next_offset = entries.get(i + 1).map(|e| e.0);
+                match (next_offset, self.total_size) {
+                    (Some(next), _) => next.saturating_sub(offset),
+                    (None, Some(total)) => total.saturating_sub(offset),
+                    _ => {
+                        return Err(ApiError::bad_request(
+                            "Dynamic index size missing and total size not provided",
+                        ));
+                    }
+                }
+            };
+            index.push(digest, offset, size);
+        }
+
+        Ok(index)
     }
 }
 
@@ -359,7 +558,7 @@ impl ReaderSession {
     /// Load the manifest
     pub async fn load_manifest(&mut self) -> Result<&BackupManifest, ApiError> {
         if self.manifest.is_none() {
-            let path = format!("{}/index.json", self.snapshot_path());
+            let path = format!("{}/index.json.blob", self.snapshot_path());
             let manifest = self
                 .datastore
                 .read_manifest(&path)
@@ -738,7 +937,7 @@ impl SessionManager {
             (session.snapshot_path(), session.datastore.clone())
         };
 
-        let path = format!("{}/index.json", snapshot_path);
+        let path = format!("{}/index.json.blob", snapshot_path);
         let manifest = datastore
             .read_manifest(&path)
             .await
@@ -809,6 +1008,8 @@ mod tests {
             backup_id: "100".to_string(),
             backup_time: "2024-01-01T00:00:00Z".to_string(),
             encrypt: false,
+            retain_until: None,
+            retention_days: None,
         }
     }
 

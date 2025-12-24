@@ -131,5 +131,41 @@ fn load_config() -> Result<ServerConfig> {
         }
     }
 
+    // WORM configuration
+    if let Ok(enabled) = std::env::var("PBS_WORM_ENABLED") {
+        config.worm.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
+    }
+
+    if let Ok(days) = std::env::var("PBS_WORM_RETENTION_DAYS") {
+        config.worm.enabled = true;
+        config.worm.default_retention_days = Some(days.parse()?);
+    }
+
+    if let Ok(allow) = std::env::var("PBS_WORM_ALLOW_OVERRIDE") {
+        config.worm.allow_override = allow == "1" || allow.eq_ignore_ascii_case("true");
+    }
+
+    if let Ok(secret) = std::env::var("PBS_WEBHOOK_RECEIVER_SECRET") {
+        if !secret.is_empty() {
+            config.webhook_receiver_secret = Some(secret);
+        }
+    }
+
+    if let Ok(key) = std::env::var("PBS_ENCRYPTION_KEY") {
+        if !key.is_empty() {
+            config.encryption_key = Some(key);
+        }
+    }
+
+    if let Ok(path) = std::env::var("PBS_ENCRYPTION_KEY_FILE") {
+        if !path.is_empty() {
+            let key = std::fs::read_to_string(&path)?;
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                config.encryption_key = Some(key);
+            }
+        }
+    }
+
     Ok(config)
 }

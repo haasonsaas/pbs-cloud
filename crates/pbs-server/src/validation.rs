@@ -99,6 +99,12 @@ pub fn validate_backup_time(backup_time: &str) -> Result<(), ApiError> {
     if backup_time.is_empty() {
         return Err(ApiError::bad_request("Backup time cannot be empty"));
     }
+    if backup_time.chars().all(|c| c.is_ascii_digit()) {
+        if backup_time.parse::<i64>().is_err() {
+            return Err(ApiError::bad_request("Invalid backup time: not a valid epoch"));
+        }
+        return Ok(());
+    }
     if !BACKUP_TIME_RE.is_match(backup_time) {
         return Err(ApiError::bad_request(
             "Invalid backup time: must be ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)",

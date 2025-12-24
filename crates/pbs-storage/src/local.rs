@@ -371,7 +371,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new_lazy(temp_dir.path()).await.unwrap();
 
-        let path = "vm/100/2024-01-01/index.json";
+        let path = "vm/100/2024-01-01/index.json.blob";
         let data = Bytes::from(r#"{"test": true}"#);
 
         // Write
@@ -386,7 +386,7 @@ mod tests {
 
         // List
         let files = backend.list_files("vm/100").await.unwrap();
-        assert!(files.iter().any(|f| f.contains("index.json")));
+        assert!(files.iter().any(|f| f.contains("index.json.blob")));
 
         // Delete
         backend.delete_file(path).await.unwrap();

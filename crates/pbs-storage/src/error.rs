@@ -20,6 +20,9 @@ pub enum StorageError {
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
 
+    #[error("Snapshot is protected until {0}")]
+    SnapshotProtected(String),
+
     #[error("Storage backend error: {0}")]
     Backend(String),
 

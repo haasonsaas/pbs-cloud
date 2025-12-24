@@ -10,6 +10,7 @@ use crate::auth::AuthContext;
 use crate::billing::{UsageEvent, UsageEventType};
 use crate::protocol::{ApiError, BackupParams};
 use crate::server::ServerState;
+use crate::config::WormConfig;
 
 /// Handle backup protocol requests within a session
 pub struct BackupProtocolHandler {
@@ -63,6 +64,17 @@ impl BackupProtocolHandler {
             .sessions
             .create_backup_session(&ctx.user.tenant_id, params.clone(), datastore)
             .await;
+
+        if let Some(retain_until) = compute_retain_until(&self.state.config.worm, &params) {
+            let _ = self.state.sessions.with_backup_session_verified(
+                &session_id,
+                &ctx.user.tenant_id,
+                |session| {
+                    session.set_retain_until(retain_until);
+                    Ok(())
+                },
+            ).await;
+        }
 
         // Record backup event
         self.state
@@ -127,6 +139,31 @@ impl BackupProtocolHandler {
                 Ok(())
             })
             .await?;
+
+        Ok(stored)
+    }
+
+    /// Upload a raw chunk blob (already encoded as DataBlob)
+    #[instrument(skip(self, data), fields(session_id = %session_id, digest = %digest, size = data.len()))]
+    pub async fn upload_chunk_blob(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+        digest: ChunkDigest,
+        data: bytes::Bytes,
+    ) -> Result<bool, ApiError> {
+        self.state.sessions.verify_session_ownership(session_id, tenant_id).await?;
+
+        let datastore = self.state.default_datastore();
+        let stored = datastore
+            .store_chunk_blob(&digest, data)
+            .await
+            .map_err(|e| ApiError::internal(&e.to_string()))?;
+
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
+            session.mark_chunk_uploaded(digest);
+            Ok(())
+        }).await?;
 
         Ok(stored)
     }
@@ -354,6 +391,37 @@ impl BackupProtocolHandler {
 
         Ok(results)
     }
+}
+
+fn compute_retain_until(config: &WormConfig, params: &BackupParams) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+
+    if config.allow_override {
+        if let Some(retain_until) = &params.retain_until {
+            if chrono::DateTime::parse_from_rfc3339(retain_until).is_ok() {
+                return Some(retain_until.clone());
+            }
+            if let Ok(epoch) = retain_until.parse::<i64>() {
+                if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0) {
+                    return Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                }
+            }
+        }
+
+        if let Some(days) = params.retention_days {
+            let until = chrono::Utc::now() + chrono::Duration::days(days as i64);
+            return Some(until.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+    }
+
+    if let Some(days) = config.default_retention_days {
+        let until = chrono::Utc::now() + chrono::Duration::days(days as i64);
+        return Some(until.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    }
+
+    None
 }
 
 /// Result of finishing a backup

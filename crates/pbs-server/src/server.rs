@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::server::conn::http2;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -28,7 +28,7 @@ use crate::billing::{BillingManager, UsageEvent, UsageEventType};
 use crate::config::{ServerConfig, StorageConfig};
 use crate::metrics::{Metrics, MetricsConfig};
 use crate::persistence::{PersistenceConfig, PersistenceManager};
-use crate::protocol::{ApiError, BackupParams, PROTOCOL_HEADER};
+use crate::protocol::{ApiError, BackupParams, BACKUP_PROTOCOL_HEADER, READER_PROTOCOL_HEADER};
 use crate::rate_limit::{RateLimitResult, RateLimiter_};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtocolHandler};
@@ -36,7 +36,7 @@ use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
     validate_backup_params, validate_digest, validate_filename, validate_tenant_name,
-    validate_username,
+    validate_username, validate_backup_type, validate_backup_id,
 };
 
 /// Server state
@@ -93,7 +93,18 @@ impl ServerState {
         };
 
         // Create default datastore
-        let crypto = CryptoConfig::default();
+        let crypto = if let Some(key_hex) = &config.encryption_key {
+            let bytes = hex::decode(key_hex)
+                .map_err(|e| anyhow::anyhow!("Invalid PBS_ENCRYPTION_KEY: {}", e))?;
+            if bytes.len() != 32 {
+                return Err(anyhow::anyhow!("Encryption key must be 32 bytes (64 hex chars)"));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            CryptoConfig::with_encryption(pbs_core::EncryptionKey::from_bytes(key))
+        } else {
+            CryptoConfig::default()
+        };
         let default_ds = Arc::new(Datastore::new("default", backend.clone(), crypto));
 
         let mut datastores = HashMap::new();
@@ -320,7 +331,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         let io = TokioIo::new(tls_stream);
-                        http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        http1::Builder::new()
                             .serve_connection(
                                 io,
                                 service_fn(move |req| {
@@ -328,6 +339,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                                     handle_request(state, peer_addr, req)
                                 }),
                             )
+                            .with_upgrades()
                             .await
                     }
                     Err(e) => {
@@ -337,7 +349,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 }
             } else {
                 let io = TokioIo::new(stream);
-                http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                http1::Builder::new()
                     .serve_connection(
                         io,
                         service_fn(move |req| {
@@ -345,6 +357,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                             handle_request(state, peer_addr, req)
                         }),
                     )
+                    .with_upgrades()
                     .await
             };
 
@@ -381,9 +394,14 @@ async fn handle_request(
     }
 
     // Check for protocol upgrade (backup/restore sessions)
-    if let Some(upgrade) = req.headers().get("upgrade") {
-        if upgrade.to_str().unwrap_or("") == PROTOCOL_HEADER {
-            return Ok(handle_protocol_upgrade(state.clone(), &req).await);
+    let upgrade_proto = req
+        .headers()
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    if let Some(proto) = upgrade_proto.as_deref() {
+        if proto == BACKUP_PROTOCOL_HEADER || proto == READER_PROTOCOL_HEADER {
+            return Ok(handle_protocol_upgrade(state.clone(), peer_addr, req, proto).await);
         }
     }
 
@@ -450,6 +468,9 @@ async fn handle_request(
 
         // Metrics endpoint
         (Method::GET, "/metrics") => handle_metrics(state.clone()).await,
+        (Method::POST, "/api2/json/billing/webhook") => {
+            handle_webhook_receive(state.clone(), req).await
+        }
 
         // Auth endpoints
         (Method::POST, "/api2/json/access/ticket") => handle_login(state.clone(), req).await,
@@ -703,6 +724,12 @@ async fn handle_request(
             })
             .await
         }
+        (Method::GET, "/api2/json/compliance/report") => {
+            with_auth(auth_ctx, Permission::Admin, |_| {
+                let state = state.clone();
+                async move { handle_compliance_report(state).await }
+            }).await
+        }
 
         // Rate limit info
         (Method::GET, "/api2/json/rate_limit") => {
@@ -759,6 +786,7 @@ fn is_public_endpoint(path: &str) -> bool {
         "/api2/json/version"
             | "/api2/json/access/ticket"
             | "/metrics"
+            | "/api2/json/billing/webhook"
             | "/health"
             | "/healthz"
             | "/ready"
@@ -832,6 +860,52 @@ fn get_query_param(uri: &hyper::Uri, name: &str) -> Option<String> {
     })
 }
 
+fn epoch_to_rfc3339(epoch: i64) -> Result<String, ApiError> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
+        .ok_or_else(|| ApiError::bad_request("Invalid backup-time"))?;
+    Ok(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn snapshot_to_epoch(snapshot: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(snapshot)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+enum H2Context {
+    Backup(H2BackupContext),
+    Reader(H2ReaderContext),
+}
+
+struct H2BackupContext {
+    state: Arc<ServerState>,
+    tenant_id: String,
+    session_id: String,
+    backup_type: String,
+    backup_id: String,
+    backup_time_epoch: i64,
+}
+
+struct H2ReaderContext {
+    state: Arc<ServerState>,
+    tenant_id: String,
+    session_id: String,
+    backup_type: String,
+    backup_id: String,
+    backup_time: String,
+}
+
+async fn handle_h2_request(
+    ctx: Arc<H2Context>,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let response = match &*ctx {
+        H2Context::Backup(backup) => handle_h2_backup(backup, req).await,
+        H2Context::Reader(reader) => handle_h2_reader(reader, req).await,
+    };
+    Ok(response)
+}
+
 // === Handler implementations ===
 
 /// Health check endpoint - returns 200 if server is running
@@ -895,6 +969,109 @@ async fn handle_metrics(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         .header("content-type", "text/plain; version=0.0.4")
         .body(Full::new(Bytes::from(output)))
         .expect("valid response")
+}
+
+async fn handle_webhook_receive(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let secret = match &state.config.webhook_receiver_secret {
+        Some(secret) => secret.clone(),
+        None => return bad_request("Webhook receiver not configured"),
+    };
+
+    let signature = match req.headers().get("X-Signature-256") {
+        Some(sig) => match sig.to_str() {
+            Ok(v) => v.to_string(),
+            Err(_) => return bad_request("Invalid signature header"),
+        },
+        None => return error_response(ApiError::unauthorized("Missing signature")),
+    };
+
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    if !verify_webhook_signature(&secret, &body, &signature) {
+        return error_response(ApiError::unauthorized("Invalid signature"));
+    }
+
+    json_response(StatusCode::OK, &serde_json::json!({"data": {"verified": true}}))
+}
+
+fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    let signature = header.strip_prefix("sha256=").unwrap_or(header);
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let sig_bytes = match hex::decode(signature) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+async fn handle_compliance_report(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let datastore = state.default_datastore();
+    let groups = datastore.list_backup_groups().await.unwrap_or_default();
+    let mut snapshots = Vec::new();
+    let mut total_bytes: u64 = 0;
+
+    for group in groups {
+        let times = datastore
+            .list_snapshots(&group.backup_type, &group.backup_id)
+            .await
+            .unwrap_or_default();
+
+        for time in times {
+            let manifest_path = format!(
+                "{}/{}/{}/index.json.blob",
+                group.backup_type, group.backup_id, time
+            );
+            if let Ok(manifest) = datastore.read_manifest(&manifest_path).await {
+                let size: u64 = manifest.files.iter().map(|f| f.size).sum();
+                total_bytes = total_bytes.saturating_add(size);
+                let retain_until = manifest
+                    .unprotected
+                    .as_ref()
+                    .and_then(|v| v.get("worm_retain_until"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let protected = retain_until
+                    .as_ref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt > chrono::Utc::now())
+                    .unwrap_or(false);
+
+                snapshots.push(serde_json::json!({
+                    "backup-type": group.backup_type,
+                    "backup-id": group.backup_id,
+                    "backup-time": time,
+                    "size": size,
+                    "retain-until": retain_until,
+                    "protected": protected
+                }));
+            }
+        }
+    }
+
+    let report = serde_json::json!({
+        "data": {
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "snapshot_count": snapshots.len(),
+            "total_bytes": total_bytes,
+            "snapshots": snapshots
+        }
+    });
+
+    json_response(StatusCode::OK, &report)
 }
 
 async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Response<Full<Bytes>> {
@@ -1015,21 +1192,30 @@ async fn handle_datastore_api(
 
                 for time in times {
                     let manifest_path = format!(
-                        "{}/{}/{}/index.json",
+                        "{}/{}/{}/index.json.blob",
                         group.backup_type, group.backup_id, time
                     );
-                    let size = datastore
+                    let (size, protected) = datastore
                         .read_manifest(&manifest_path)
                         .await
-                        .map(|m| m.files.iter().map(|f| f.size).sum())
-                        .unwrap_or(0);
+                        .map(|m| {
+                            let size = m.files.iter().map(|f| f.size).sum();
+                            let protected = m.unprotected.as_ref().and_then(|v| {
+                                v.get("worm_retain_until")
+                                    .and_then(|s| s.as_str())
+                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                    .map(|dt| dt > chrono::Utc::now())
+                            }).unwrap_or(false);
+                            (size, protected)
+                        })
+                        .unwrap_or((0, false));
 
                     snapshots.push(serde_json::json!({
                         "backup-type": group.backup_type,
                         "backup-id": group.backup_id,
                         "backup-time": time,
                         "size": size,
-                        "protected": false,
+                        "protected": protected,
                         "comment": null
                     }));
                 }
@@ -1060,15 +1246,466 @@ async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
 }
 
 async fn handle_protocol_upgrade(
-    _state: Arc<ServerState>,
-    _req: &Request<Incoming>,
+    state: Arc<ServerState>,
+    _peer_addr: SocketAddr,
+    req: Request<Incoming>,
+    protocol: &str,
 ) -> Response<Full<Bytes>> {
-    // Protocol upgrade for streaming - this is handled via HTTP/2 streams
+    let auth_ctx = match authenticate(state.clone(), &req).await {
+        Ok(ctx) => ctx,
+        Err(e) => return error_response(e),
+    };
+
+    let (mode, required) = if protocol == BACKUP_PROTOCOL_HEADER {
+        ("backup", Permission::Backup)
+    } else {
+        ("reader", Permission::Read)
+    };
+
+    if !auth_ctx.allows(required) {
+        return error_response(ApiError::unauthorized("Insufficient permissions"));
+    }
+
+    let state_for_upgrade = state.clone();
+    let tenant_id = auth_ctx.user.tenant_id.clone();
+    let uri = req.uri().clone();
+    let path = uri.path();
+    if mode == "backup" && path != "/api2/json/backup" {
+        return bad_request("Invalid backup upgrade path");
+    }
+    if mode == "reader" && path != "/api2/json/reader" {
+        return bad_request("Invalid reader upgrade path");
+    }
+
+    // Parse common query parameters
+    let backup_type = match get_query_param(&uri, "backup-type") {
+        Some(v) => v,
+        None => return bad_request("Missing backup-type"),
+    };
+    let backup_id = match get_query_param(&uri, "backup-id") {
+        Some(v) => v,
+        None => return bad_request("Missing backup-id"),
+    };
+    let backup_time_epoch: i64 = match get_query_param(&uri, "backup-time")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(v) => v,
+        None => return bad_request("Invalid backup-time"),
+    };
+
+    let backup_time = match epoch_to_rfc3339(backup_time_epoch) {
+        Ok(v) => v,
+        Err(e) => return error_response(e),
+    };
+
+    if let Err(e) = validate_backup_type(&backup_type) {
+        return error_response(e);
+    }
+    if let Err(e) = validate_backup_id(&backup_id) {
+        return error_response(e);
+    }
+
+    if let Some(store) = get_query_param(&uri, "store") {
+        if store != "default" {
+            return bad_request("Only default datastore is supported");
+        }
+    }
+
+    if mode == "backup" {
+        let encrypt = get_query_param(&uri, "encrypt")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let retain_until = get_query_param(&uri, "retain-until");
+        let retention_days = get_query_param(&uri, "retention-days")
+            .and_then(|v| v.parse::<u64>().ok());
+        let params = BackupParams {
+            backup_type: backup_type.clone(),
+            backup_id: backup_id.clone(),
+            backup_time: backup_time.clone(),
+            encrypt,
+            retain_until,
+            retention_days,
+        };
+
+        let handler = BackupProtocolHandler::new(state.clone());
+        let session_id = match handler.start_backup(&auth_ctx, params).await {
+            Ok(id) => id,
+            Err(e) => return error_response(e),
+        };
+
+        let ctx = Arc::new(H2Context::Backup(H2BackupContext {
+            state: state_for_upgrade,
+            tenant_id,
+            session_id,
+            backup_type,
+            backup_id,
+            backup_time_epoch,
+        }));
+
+        let upgrade_fut = hyper::upgrade::on(req);
+        tokio::spawn(async move {
+            if let Ok(upgraded) = upgrade_fut.await {
+                let _ = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(
+                        upgraded,
+                        service_fn(move |req| handle_h2_request(ctx.clone(), req)),
+                    )
+                    .await;
+            }
+        });
+    } else {
+        let handler = ReaderProtocolHandler::new(state.clone());
+        let session_id = match handler
+            .start_reader(&auth_ctx, &backup_type, &backup_id, &backup_time)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => return error_response(e),
+        };
+
+        let ctx = Arc::new(H2Context::Reader(H2ReaderContext {
+            state: state_for_upgrade,
+            tenant_id,
+            session_id,
+            backup_type,
+            backup_id,
+            backup_time,
+        }));
+
+        let upgrade_fut = hyper::upgrade::on(req);
+        tokio::spawn(async move {
+            if let Ok(upgraded) = upgrade_fut.await {
+                let _ = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(
+                        upgraded,
+                        service_fn(move |req| handle_h2_request(ctx.clone(), req)),
+                    )
+                    .await;
+            }
+        });
+    }
+
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("upgrade", PROTOCOL_HEADER)
+        .header("connection", "upgrade")
+        .header("upgrade", protocol)
         .body(Full::new(Bytes::new()))
         .expect("valid response")
+}
+
+async fn handle_h2_backup(
+    ctx: &H2BackupContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let method = req.method().clone();
+    let path = req.uri().path().trim_start_matches('/').to_string();
+
+    match (method, path.as_str()) {
+        (Method::POST, "blob") => {
+            let name = match get_query_param(req.uri(), "file-name") {
+                Some(n) => n,
+                None => return bad_request("Missing file-name"),
+            };
+            if let Err(e) = validate_filename(&name) {
+                return error_response(e);
+            }
+
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(_) => return bad_request("Failed to read blob data"),
+            };
+
+            let handler = BackupProtocolHandler::new(ctx.state.clone());
+            match handler
+                .upload_blob(&ctx.session_id, &ctx.tenant_id, &name, body)
+                .await
+            {
+                Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::POST, "fixed_index") => {
+            let name = match get_query_param(req.uri(), "archive-name") {
+                Some(n) => n,
+                None => return bad_request("Missing archive-name"),
+            };
+            if let Err(e) = validate_filename(&name) {
+                return error_response(e);
+            }
+            let chunk_size = get_query_param(req.uri(), "size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(pbs_core::CHUNK_SIZE_DEFAULT as u64);
+
+            let result = ctx.state.sessions.with_backup_session_verified(
+                &ctx.session_id,
+                &ctx.tenant_id,
+                |session| Ok(session.create_fixed_index_with_id(&name, chunk_size)),
+            ).await;
+
+            match result {
+                Ok(wid) => json_response(StatusCode::OK, &serde_json::json!({"data": wid})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::POST, "dynamic_index") => {
+            let name = match get_query_param(req.uri(), "archive-name") {
+                Some(n) => n,
+                None => return bad_request("Missing archive-name"),
+            };
+            if let Err(e) = validate_filename(&name) {
+                return error_response(e);
+            }
+
+            let result = ctx.state.sessions.with_backup_session_verified(
+                &ctx.session_id,
+                &ctx.tenant_id,
+                |session| Ok(session.create_dynamic_index_with_id(&name)),
+            ).await;
+
+            match result {
+                Ok(wid) => json_response(StatusCode::OK, &serde_json::json!({"data": wid})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::PUT, "fixed_index") | (Method::PUT, "dynamic_index") => {
+            let is_fixed = path == "fixed_index";
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+
+            #[derive(serde::Deserialize)]
+            struct AppendIndexRequest {
+                wid: u64,
+                #[serde(rename = "digest-list")]
+                digest_list: Vec<String>,
+                #[serde(rename = "offset-list")]
+                offset_list: Vec<u64>,
+            }
+
+            let params: AppendIndexRequest = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(_) => return bad_request("Invalid JSON"),
+            };
+
+            if params.digest_list.len() != params.offset_list.len() {
+                return bad_request("digest-list and offset-list length mismatch");
+            }
+
+            let result = ctx.state.sessions.with_backup_session_verified(
+                &ctx.session_id,
+                &ctx.tenant_id,
+                |session| {
+                    for (digest_str, offset) in params.digest_list.iter().zip(params.offset_list.iter()) {
+                        let digest = ChunkDigest::from_hex(digest_str)
+                            .map_err(|_| ApiError::bad_request("Invalid digest format"))?;
+                        if is_fixed {
+                            session.append_fixed_index_by_id(params.wid, digest, None)?;
+                        } else {
+                            session.append_dynamic_index_by_id(params.wid, digest, *offset, None)?;
+                        }
+                    }
+                    Ok(())
+                },
+            ).await;
+
+            match result {
+                Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::POST, "fixed_chunk") | (Method::POST, "dynamic_chunk") => {
+            let digest_str = match get_query_param(req.uri(), "digest") {
+                Some(d) => d,
+                None => return bad_request("Missing digest"),
+            };
+            if let Err(e) = validate_digest(&digest_str) {
+                return error_response(e);
+            }
+            let digest = match ChunkDigest::from_hex(&digest_str) {
+                Ok(d) => d,
+                Err(_) => return bad_request("Invalid digest format"),
+            };
+
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read chunk data"),
+            };
+
+            let handler = BackupProtocolHandler::new(ctx.state.clone());
+            match handler
+                .upload_chunk_blob(&ctx.session_id, &ctx.tenant_id, digest, body)
+                .await
+            {
+                Ok(stored) => json_response(StatusCode::OK, &serde_json::json!({"data": {"stored": stored}})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::POST, "fixed_close") | (Method::POST, "dynamic_close") => {
+            let wid: u64 = match get_query_param(req.uri(), "wid").and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return bad_request("Missing wid"),
+            };
+            let size: u64 = match get_query_param(req.uri(), "size").and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return bad_request("Missing size"),
+            };
+
+            let result = ctx.state.sessions.with_backup_session_verified(
+                &ctx.session_id,
+                &ctx.tenant_id,
+                |session| {
+                    session.set_index_total_size(wid, size)?;
+                    let _ = session.close_index_by_id(wid)?;
+                    Ok(())
+                },
+            ).await;
+
+            match result {
+                Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::POST, "finish") => {
+            let handler = BackupProtocolHandler::new(ctx.state.clone());
+            match handler.finish_backup(&ctx.session_id, &ctx.tenant_id).await {
+                Ok(result) => {
+                    let response: FinishBackupResponse = result.into();
+                    json_response(StatusCode::OK, &serde_json::json!({"data": response}))
+                }
+                Err(e) => error_response(e),
+            }
+        }
+        (Method::GET, "previous_backup_time") => {
+            let datastore = ctx.state.default_datastore();
+            let snapshots = datastore
+                .list_snapshots(&ctx.backup_type, &ctx.backup_id)
+                .await
+                .unwrap_or_default();
+            let mut times: Vec<i64> = snapshots
+                .iter()
+                .filter_map(|s| snapshot_to_epoch(s))
+                .filter(|t| *t < ctx.backup_time_epoch)
+                .collect();
+            times.sort();
+            let previous = times.pop();
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": previous}))
+        }
+        (Method::GET, "previous") => {
+            let archive = match get_query_param(req.uri(), "archive-name") {
+                Some(n) => n,
+                None => return bad_request("Missing archive-name"),
+            };
+            if let Err(e) = validate_filename(&archive) {
+                return error_response(e);
+            }
+
+            let datastore = ctx.state.default_datastore();
+            let snapshots = datastore
+                .list_snapshots(&ctx.backup_type, &ctx.backup_id)
+                .await
+                .unwrap_or_default();
+            let mut times: Vec<i64> = snapshots
+                .iter()
+                .filter_map(|s| snapshot_to_epoch(s))
+                .filter(|t| *t < ctx.backup_time_epoch)
+                .collect();
+            times.sort();
+            let previous = match times.pop() {
+                Some(t) => t,
+                None => return not_found(),
+            };
+            let snapshot = match epoch_to_rfc3339(previous) {
+                Ok(s) => s,
+                Err(e) => return error_response(e),
+            };
+            let path = format!(
+                "{}/{}/{}/{}",
+                ctx.backup_type, ctx.backup_id, snapshot, archive
+            );
+            let data = match ctx.state.backend.read_file(&path).await {
+                Ok(d) => d,
+                Err(_) => return not_found(),
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(data)))
+                .expect("valid response")
+        }
+        _ => not_found(),
+    }
+}
+
+async fn handle_h2_reader(
+    ctx: &H2ReaderContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    if let Err(err) = ctx
+        .state
+        .sessions
+        .verify_reader_session_ownership(&ctx.session_id, &ctx.tenant_id)
+        .await
+    {
+        return error_response(err);
+    }
+
+    let method = req.method().clone();
+    let path = req.uri().path().trim_start_matches('/').to_string();
+
+    match (method, path.as_str()) {
+        (Method::GET, "download") => {
+            let name = match get_query_param(req.uri(), "file-name") {
+                Some(n) => n,
+                None => return bad_request("Missing file-name"),
+            };
+            if let Err(e) = validate_filename(&name) {
+                return error_response(e);
+            }
+            let file_path = format!(
+                "{}/{}/{}/{}",
+                ctx.backup_type, ctx.backup_id, ctx.backup_time, name
+            );
+            let data = match ctx.state.backend.read_file(&file_path).await {
+                Ok(d) => d,
+                Err(_) => return not_found(),
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(data)))
+                .expect("valid response")
+        }
+        (Method::GET, "chunk") => {
+            let digest_str = match get_query_param(req.uri(), "digest") {
+                Some(d) => d,
+                None => return bad_request("Missing digest"),
+            };
+            if let Err(e) = validate_digest(&digest_str) {
+                return error_response(e);
+            }
+            let digest = match ChunkDigest::from_hex(&digest_str) {
+                Ok(d) => d,
+                Err(_) => return bad_request("Invalid digest format"),
+            };
+            let datastore = ctx.state.default_datastore();
+            let data = match datastore.read_chunk_blob(&digest).await {
+                Ok(d) => d,
+                Err(_) => return not_found(),
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(data)))
+                .expect("valid response")
+        }
+        (Method::GET, "speedtest") => {
+            let data = vec![0u8; 10 * 1024 * 1024];
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(data)))
+                .expect("valid response")
+        }
+        _ => not_found(),
+    }
 }
 
 async fn handle_start_backup(
