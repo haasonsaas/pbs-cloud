@@ -36,6 +36,10 @@
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
 
+## Pre-commit (optional)
+- Install hooks: `pre-commit install`
+- Run manual hooks: `pre-commit run --all-files --hook-stage manual`
+
 ## Run
 - Local storage:
   - `export PBS_DATA_DIR=/var/lib/pbs-cloud`

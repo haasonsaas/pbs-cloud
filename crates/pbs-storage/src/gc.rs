@@ -134,7 +134,11 @@ impl GarbageCollector {
             // List snapshots in this group
             let snapshots = self
                 .datastore
-                .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                .list_snapshots(
+                    group.namespace.as_deref(),
+                    &group.backup_type,
+                    &group.backup_id,
+                )
                 .await?;
 
             for timestamp in snapshots {

@@ -8,9 +8,9 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::auth::AuthContext;
 use crate::billing::{UsageEvent, UsageEventType};
+use crate::config::WormConfig;
 use crate::protocol::{ApiError, BackupParams};
 use crate::server::ServerState;
-use crate::config::WormConfig;
 
 /// Handle backup protocol requests within a session
 pub struct BackupProtocolHandler {
@@ -70,14 +70,14 @@ impl BackupProtocolHandler {
             .await;
 
         if let Some(retain_until) = compute_retain_until(&self.state.config.worm, &params) {
-            let _ = self.state.sessions.with_backup_session_verified(
-                &session_id,
-                &ctx.user.tenant_id,
-                |session| {
+            let _ = self
+                .state
+                .sessions
+                .with_backup_session_verified(&session_id, &ctx.user.tenant_id, |session| {
                     session.set_retain_until(retain_until);
                     Ok(())
-                },
-            ).await;
+                })
+                .await;
         }
 
         // Record backup event
@@ -106,9 +106,7 @@ impl BackupProtocolHandler {
         let datastore = self
             .state
             .sessions
-            .with_backup_session_verified(session_id, tenant_id, |session| {
-                Ok(session.datastore())
-            })
+            .with_backup_session_verified(session_id, tenant_id, |session| Ok(session.datastore()))
             .await?;
 
         // Check if chunk already exists (deduplication)
@@ -159,19 +157,20 @@ impl BackupProtocolHandler {
         let datastore = self
             .state
             .sessions
-            .with_backup_session_verified(session_id, tenant_id, |session| {
-                Ok(session.datastore())
-            })
+            .with_backup_session_verified(session_id, tenant_id, |session| Ok(session.datastore()))
             .await?;
         let stored = datastore
             .store_chunk_blob(&digest, data)
             .await
             .map_err(|e| ApiError::internal(&e.to_string()))?;
 
-        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
-            session.mark_chunk_uploaded(digest);
-            Ok(())
-        }).await?;
+        self.state
+            .sessions
+            .with_backup_session_verified(session_id, tenant_id, |session| {
+                session.mark_chunk_uploaded(digest);
+                Ok(())
+            })
+            .await?;
 
         Ok(stored)
     }
@@ -404,9 +403,7 @@ impl BackupProtocolHandler {
         let datastore = self
             .state
             .sessions
-            .with_backup_session_verified(session_id, tenant_id, |session| {
-                Ok(session.datastore())
-            })
+            .with_backup_session_verified(session_id, tenant_id, |session| Ok(session.datastore()))
             .await?;
         let mut results = Vec::with_capacity(digests.len());
 

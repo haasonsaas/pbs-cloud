@@ -59,7 +59,8 @@ impl Datastore {
         let digest = chunk.digest();
 
         // Create data blob (compressed, optionally encrypted)
-        let blob = DataBlob::encode(chunk.data(), &self.crypto, true).map_err(StorageError::Core)?;
+        let blob =
+            DataBlob::encode(chunk.data(), &self.crypto, true).map_err(StorageError::Core)?;
 
         let data = Bytes::from(blob.to_bytes());
         self.backend.write_chunk(digest, data).await
@@ -107,11 +108,7 @@ impl Datastore {
 
     /// Store a dynamic index
     #[instrument(skip(self, index), fields(datastore = %self.name, path = %path))]
-    pub async fn store_dynamic_index(
-        &self,
-        path: &str,
-        index: &DynamicIndex,
-    ) -> StorageResult<()> {
+    pub async fn store_dynamic_index(&self, path: &str, index: &DynamicIndex) -> StorageResult<()> {
         let data = index.to_bytes();
         self.backend.write_file(path, Bytes::from(data)).await
     }
@@ -141,7 +138,8 @@ impl Datastore {
     /// Store a backup manifest
     #[instrument(skip(self, manifest), fields(datastore = %self.name))]
     pub async fn store_manifest(&self, manifest: &BackupManifest) -> StorageResult<()> {
-        self.store_manifest_at(&manifest.snapshot_path(), manifest).await
+        self.store_manifest_at(&manifest.snapshot_path(), manifest)
+            .await
     }
 
     /// Store a backup manifest at a specific snapshot path
@@ -166,8 +164,7 @@ impl Datastore {
         let data = self.backend.read_file(path).await?;
         if let Ok(blob) = DataBlob::from_bytes(&data) {
             let raw = blob.decode(&self.crypto).map_err(StorageError::Core)?;
-            let json =
-                String::from_utf8(raw).map_err(|e| StorageError::Backend(e.to_string()))?;
+            let json = String::from_utf8(raw).map_err(|e| StorageError::Backend(e.to_string()))?;
             return BackupManifest::from_json(&json).map_err(StorageError::Core);
         }
 
@@ -288,20 +285,22 @@ impl Datastore {
                     Ok(Some(owner))
                 }
             }
-            Err(StorageError::BlobNotFound(_)) => match self.backend.read_file(&legacy_path).await {
-                Ok(data) => {
-                    let text = String::from_utf8(data.to_vec())
-                        .map_err(|e| StorageError::Backend(e.to_string()))?;
-                    let owner = text.trim().to_string();
-                    if owner.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(owner))
+            Err(StorageError::BlobNotFound(_)) => {
+                match self.backend.read_file(&legacy_path).await {
+                    Ok(data) => {
+                        let text = String::from_utf8(data.to_vec())
+                            .map_err(|e| StorageError::Backend(e.to_string()))?;
+                        let owner = text.trim().to_string();
+                        if owner.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(owner))
+                        }
                     }
+                    Err(StorageError::BlobNotFound(_)) => Ok(None),
+                    Err(err) => Err(err),
                 }
-                Err(StorageError::BlobNotFound(_)) => Ok(None),
-                Err(err) => Err(err),
-            },
+            }
             Err(err) => Err(err),
         }
     }

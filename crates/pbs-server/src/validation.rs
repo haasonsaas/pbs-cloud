@@ -107,7 +107,9 @@ pub fn validate_backup_time(backup_time: &str) -> Result<(), ApiError> {
     }
     if backup_time.chars().all(|c| c.is_ascii_digit()) {
         if backup_time.parse::<i64>().is_err() {
-            return Err(ApiError::bad_request("Invalid backup time: not a valid epoch"));
+            return Err(ApiError::bad_request(
+                "Invalid backup time: not a valid epoch",
+            ));
         }
         return Ok(());
     }
@@ -205,7 +207,9 @@ pub fn validate_backup_namespace(namespace: &str) -> Result<(), ApiError> {
     }
     for part in parts {
         if part.is_empty() {
-            return Err(ApiError::bad_request("Namespace contains empty path segment"));
+            return Err(ApiError::bad_request(
+                "Namespace contains empty path segment",
+            ));
         }
         if !NAMESPACE_SEGMENT_RE.is_match(part) {
             return Err(ApiError::bad_request(

@@ -114,7 +114,9 @@ impl BackupSession {
     pub fn snapshot_path(&self) -> String {
         let ns_prefix = namespace_prefix(self.params.namespace.as_deref());
         let time = if self.params.backup_time.chars().all(|c| c.is_ascii_digit()) {
-            self.params.backup_time.parse::<i64>()
+            self.params
+                .backup_time
+                .parse::<i64>()
                 .ok()
                 .and_then(|epoch| chrono::DateTime::<Utc>::from_timestamp(epoch, 0))
                 .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -242,11 +244,10 @@ impl BackupSession {
 
     /// Close a dynamic index
     pub fn close_dynamic_index(&mut self, name: &str) -> Result<DynamicIndex, ApiError> {
-        let builder = self
-            .dynamic_indexes
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found(&format!("Dynamic index '{}' not found", name)))?;
+        let builder =
+            self.dynamic_indexes.get(name).cloned().ok_or_else(|| {
+                ApiError::not_found(&format!("Dynamic index '{}' not found", name))
+            })?;
         self.touch();
         builder.build()
     }
@@ -257,12 +258,16 @@ impl BackupSession {
         digest: ChunkDigest,
         size: Option<u64>,
     ) -> Result<(), ApiError> {
-        let writer = self.writers.get(&wid)
+        let writer = self
+            .writers
+            .get(&wid)
             .ok_or_else(|| ApiError::not_found("Writer not found"))?;
         if writer.kind != IndexKind::Fixed {
             return Err(ApiError::bad_request("Writer is not fixed index"));
         }
-        let builder = self.fixed_indexes.get_mut(&writer.name)
+        let builder = self
+            .fixed_indexes
+            .get_mut(&writer.name)
             .ok_or_else(|| ApiError::not_found("Fixed index not found"))?;
         builder.push(digest, size);
         self.touch();
@@ -276,12 +281,16 @@ impl BackupSession {
         offset: u64,
         size: Option<u64>,
     ) -> Result<(), ApiError> {
-        let writer = self.writers.get(&wid)
+        let writer = self
+            .writers
+            .get(&wid)
             .ok_or_else(|| ApiError::not_found("Writer not found"))?;
         if writer.kind != IndexKind::Dynamic {
             return Err(ApiError::bad_request("Writer is not dynamic index"));
         }
-        let builder = self.dynamic_indexes.get_mut(&writer.name)
+        let builder = self
+            .dynamic_indexes
+            .get_mut(&writer.name)
             .ok_or_else(|| ApiError::not_found("Dynamic index not found"))?;
         builder.push(digest, offset, size);
         self.touch();
@@ -289,16 +298,22 @@ impl BackupSession {
     }
 
     pub fn set_index_total_size(&mut self, wid: u64, size: u64) -> Result<(), ApiError> {
-        let writer = self.writers.get(&wid)
+        let writer = self
+            .writers
+            .get(&wid)
             .ok_or_else(|| ApiError::not_found("Writer not found"))?;
         match writer.kind {
             IndexKind::Fixed => {
-                let builder = self.fixed_indexes.get_mut(&writer.name)
+                let builder = self
+                    .fixed_indexes
+                    .get_mut(&writer.name)
                     .ok_or_else(|| ApiError::not_found("Fixed index not found"))?;
                 builder.set_total_size(size);
             }
             IndexKind::Dynamic => {
-                let builder = self.dynamic_indexes.get_mut(&writer.name)
+                let builder = self
+                    .dynamic_indexes
+                    .get_mut(&writer.name)
                     .ok_or_else(|| ApiError::not_found("Dynamic index not found"))?;
                 builder.set_total_size(size);
             }
@@ -308,7 +323,9 @@ impl BackupSession {
     }
 
     pub fn close_index_by_id(&mut self, wid: u64) -> Result<(String, IndexKind), ApiError> {
-        let writer = self.writers.remove(&wid)
+        let writer = self
+            .writers
+            .remove(&wid)
             .ok_or_else(|| ApiError::not_found("Writer not found"))?;
         Ok((writer.name, writer.kind))
     }
@@ -395,10 +412,7 @@ impl BackupSession {
         self.state = SessionState::Finishing;
 
         // Create manifest
-        let mut manifest = BackupManifest::new(
-            &self.params.backup_type,
-            &self.params.backup_id,
-        );
+        let mut manifest = BackupManifest::new(&self.params.backup_type, &self.params.backup_id);
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&self.params.backup_time) {
             manifest.backup_time = dt.with_timezone(&Utc);
         } else if let Ok(epoch) = self.params.backup_time.parse::<i64>() {
@@ -699,7 +713,10 @@ impl ReaderSession {
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
         let ns_prefix = namespace_prefix(self.namespace.as_deref());
-        let base = format!("{}/{}/{}", self.backup_type, self.backup_id, self.backup_time);
+        let base = format!(
+            "{}/{}/{}",
+            self.backup_type, self.backup_id, self.backup_time
+        );
         if ns_prefix.is_empty() {
             base
         } else {

@@ -15,11 +15,11 @@ use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use pbs_core::{BackupManifest, ChunkDigest, CryptoConfig};
+use pbs_storage::error::StorageError;
 use pbs_storage::{
     Datastore, GarbageCollector, GcOptions, LocalBackend, PruneOptions, Pruner, S3Backend,
     StorageBackend,
 };
-use pbs_storage::error::StorageError;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, instrument, warn};
@@ -37,8 +37,8 @@ use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtoc
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
-    validate_backup_params, validate_backup_params_with_ns, validate_backup_namespace,
-    validate_backup_type, validate_backup_id, validate_datastore_name, validate_digest,
+    validate_backup_id, validate_backup_namespace, validate_backup_params,
+    validate_backup_params_with_ns, validate_backup_type, validate_datastore_name, validate_digest,
     validate_filename, validate_tenant_name, validate_username,
 };
 
@@ -100,7 +100,9 @@ impl ServerState {
             let bytes = hex::decode(key_hex)
                 .map_err(|e| anyhow::anyhow!("Invalid PBS_ENCRYPTION_KEY: {}", e))?;
             if bytes.len() != 32 {
-                return Err(anyhow::anyhow!("Encryption key must be 32 bytes (64 hex chars)"));
+                return Err(anyhow::anyhow!(
+                    "Encryption key must be 32 bytes (64 hex chars)"
+                ));
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
@@ -360,11 +362,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                                 result.bytes_freed
                             );
                             if !result.errors.is_empty() {
-                                warn!(
-                                    "GC errors for {}: {:?}",
-                                    datastore.name(),
-                                    result.errors
-                                );
+                                warn!("GC errors for {}: {:?}", datastore.name(), result.errors);
                             }
                         }
                         Err(e) => {
@@ -789,7 +787,8 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
                 async move { handle_compliance_report(state, req).await }
-            }).await
+            })
+            .await
         }
 
         // Rate limit info
@@ -1007,11 +1006,7 @@ fn manifest_protected(manifest: &BackupManifest) -> bool {
         .unwrap_or(false)
 }
 
-fn update_manifest_unprotected(
-    manifest: &mut BackupManifest,
-    key: &str,
-    value: serde_json::Value,
-) {
+fn update_manifest_unprotected(manifest: &mut BackupManifest, key: &str, value: serde_json::Value) {
     let mut unprotected = manifest
         .unprotected
         .take()
@@ -1197,7 +1192,10 @@ async fn handle_webhook_receive(
         return error_response(ApiError::unauthorized("Invalid signature"));
     }
 
-    json_response(StatusCode::OK, &serde_json::json!({"data": {"verified": true}}))
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({"data": {"verified": true}}),
+    )
 }
 
 fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
@@ -1236,7 +1234,11 @@ async fn handle_compliance_report(
 
     for group in groups {
         let times = datastore
-            .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+            .list_snapshots(
+                group.namespace.as_deref(),
+                &group.backup_type,
+                &group.backup_id,
+            )
             .await
             .unwrap_or_default();
 
@@ -1456,7 +1458,11 @@ async fn handle_datastore_api(
                     continue;
                 }
                 let snapshots = datastore
-                    .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                    .list_snapshots(
+                        group.namespace.as_deref(),
+                        &group.backup_type,
+                        &group.backup_id,
+                    )
                     .await
                     .unwrap_or_default();
                 if snapshots.is_empty() {
@@ -1537,7 +1543,11 @@ async fn handle_datastore_api(
                 }
                 let owner = datastore.read_group_owner(&group).await.ok().flatten();
                 let times = datastore
-                    .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                    .list_snapshots(
+                        group.namespace.as_deref(),
+                        &group.backup_type,
+                        &group.backup_id,
+                    )
                     .await
                     .unwrap_or_default();
 
@@ -1652,12 +1662,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             let mut files = Vec::new();
 
             if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
@@ -1709,12 +1715,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             let log_path = format!("{}/client.log.blob", snapshot_path);
             if datastore.backend().read_file(&log_path).await.is_ok() {
                 return bad_request("Backup log already exists");
@@ -1760,12 +1762,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             match datastore.read_manifest_any(&snapshot_path).await {
                 Ok(manifest) => {
                     let notes = manifest_notes(&manifest).unwrap_or_default();
@@ -1808,12 +1806,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             match datastore.read_manifest_any(&snapshot_path).await {
                 Ok(mut manifest) => {
                     update_manifest_unprotected(&mut manifest, "notes", notes.into());
@@ -1852,12 +1846,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             match datastore.read_manifest_any(&snapshot_path).await {
                 Ok(manifest) => json_response(
                     StatusCode::OK,
@@ -1903,12 +1893,8 @@ async fn handle_datastore_api(
                 Ok(t) => t,
                 Err(e) => return error_response(e),
             };
-            let snapshot_path = build_snapshot_path(
-                namespace.as_deref(),
-                &backup_type,
-                &backup_id,
-                &backup_time,
-            );
+            let snapshot_path =
+                build_snapshot_path(namespace.as_deref(), &backup_type, &backup_id, &backup_time);
             match datastore.read_manifest_any(&snapshot_path).await {
                 Ok(mut manifest) => {
                     update_manifest_unprotected(
@@ -1931,8 +1917,8 @@ async fn handle_datastore_api(
                     return error_response(e);
                 }
             }
-            let max_depth = get_query_param(&uri, "max-depth")
-                .and_then(|v| v.parse::<usize>().ok());
+            let max_depth =
+                get_query_param(&uri, "max-depth").and_then(|v| v.parse::<usize>().ok());
             let parent_depth = namespace_depth(&parent);
 
             let namespaces = collect_namespaces(datastore.clone()).await;
@@ -2041,12 +2027,21 @@ async fn handle_datastore_api(
             if delete_groups {
                 for group in target_groups {
                     let snapshots = datastore
-                        .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                        .list_snapshots(
+                            group.namespace.as_deref(),
+                            &group.backup_type,
+                            &group.backup_id,
+                        )
                         .await
                         .unwrap_or_default();
                     for snapshot in snapshots {
                         if let Err(e) = datastore
-                            .delete_snapshot(group.namespace.as_deref(), &group.backup_type, &group.backup_id, &snapshot)
+                            .delete_snapshot(
+                                group.namespace.as_deref(),
+                                &group.backup_type,
+                                &group.backup_id,
+                                &snapshot,
+                            )
                             .await
                         {
                             return error_response(ApiError::internal(&e.to_string()));
@@ -2107,7 +2102,11 @@ async fn handle_datastore_api(
                 backup_id: params.backup_id.clone(),
             };
             let snapshots = datastore
-                .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                .list_snapshots(
+                    group.namespace.as_deref(),
+                    &group.backup_type,
+                    &group.backup_id,
+                )
                 .await
                 .unwrap_or_default();
             if snapshots.is_empty() {
@@ -2202,16 +2201,14 @@ async fn handle_tasks_api(
     let action = parts.next();
 
     match (req.method().clone(), action) {
-        (Method::GET, Some("log")) => {
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "data": [],
-                    "total": 0,
-                    "active": false,
-                }),
-            )
-        }
+        (Method::GET, Some("log")) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "data": [],
+                "total": 0,
+                "active": false,
+            }),
+        ),
         (Method::GET, Some("status")) => json_response(
             StatusCode::OK,
             &serde_json::json!({
@@ -2285,12 +2282,11 @@ async fn handle_protocol_upgrade(
         Some(v) => v,
         None => return bad_request("Missing backup-id"),
     };
-    let backup_time_epoch: i64 = match get_query_param(&uri, "backup-time")
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        Some(v) => v,
-        None => return bad_request("Invalid backup-time"),
-    };
+    let backup_time_epoch: i64 =
+        match get_query_param(&uri, "backup-time").and_then(|v| v.parse::<i64>().ok()) {
+            Some(v) => v,
+            None => return bad_request("Invalid backup-time"),
+        };
 
     let backup_time = match epoch_to_rfc3339(backup_time_epoch) {
         Ok(v) => v,
@@ -2323,8 +2319,8 @@ async fn handle_protocol_upgrade(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let retain_until = get_query_param(&uri, "retain-until");
-        let retention_days = get_query_param(&uri, "retention-days")
-            .and_then(|v| v.parse::<u64>().ok());
+        let retention_days =
+            get_query_param(&uri, "retention-days").and_then(|v| v.parse::<u64>().ok());
         let params = BackupParams {
             backup_type: backup_type.clone(),
             backup_id: backup_id.clone(),
@@ -2413,10 +2409,7 @@ async fn handle_protocol_upgrade(
         .expect("valid response")
 }
 
-async fn handle_h2_backup(
-    ctx: &H2BackupContext,
-    req: Request<Incoming>,
-) -> Response<Full<Bytes>> {
+async fn handle_h2_backup(ctx: &H2BackupContext, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().trim_start_matches('/').to_string();
 
@@ -2432,12 +2425,11 @@ async fn handle_h2_backup(
             if !name.ends_with(".blob") {
                 return bad_request("Blob filename must end with .blob");
             }
-            let encoded_size: usize = match get_query_param(req.uri(), "encoded-size")
-                .and_then(|v| v.parse().ok())
-            {
-                Some(v) => v,
-                None => return bad_request("Missing encoded-size"),
-            };
+            let encoded_size: usize =
+                match get_query_param(req.uri(), "encoded-size").and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return bad_request("Missing encoded-size"),
+                };
 
             let body = match req.collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
@@ -2474,11 +2466,13 @@ async fn handle_h2_backup(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(pbs_core::CHUNK_SIZE_DEFAULT as u64);
 
-            let result = ctx.state.sessions.with_backup_session_verified(
-                &ctx.session_id,
-                &ctx.tenant_id,
-                |session| Ok(session.create_fixed_index_with_id(&name, chunk_size)),
-            ).await;
+            let result = ctx
+                .state
+                .sessions
+                .with_backup_session_verified(&ctx.session_id, &ctx.tenant_id, |session| {
+                    Ok(session.create_fixed_index_with_id(&name, chunk_size))
+                })
+                .await;
 
             match result {
                 Ok(wid) => json_response(StatusCode::OK, &serde_json::json!({"data": wid})),
@@ -2497,11 +2491,13 @@ async fn handle_h2_backup(
                 return bad_request("Dynamic index filename must end with .didx");
             }
 
-            let result = ctx.state.sessions.with_backup_session_verified(
-                &ctx.session_id,
-                &ctx.tenant_id,
-                |session| Ok(session.create_dynamic_index_with_id(&name)),
-            ).await;
+            let result = ctx
+                .state
+                .sessions
+                .with_backup_session_verified(&ctx.session_id, &ctx.tenant_id, |session| {
+                    Ok(session.create_dynamic_index_with_id(&name))
+                })
+                .await;
 
             match result {
                 Ok(wid) => json_response(StatusCode::OK, &serde_json::json!({"data": wid})),
@@ -2533,22 +2529,25 @@ async fn handle_h2_backup(
                 return bad_request("digest-list and offset-list length mismatch");
             }
 
-            let result = ctx.state.sessions.with_backup_session_verified(
-                &ctx.session_id,
-                &ctx.tenant_id,
-                |session| {
-                    for (digest_str, offset) in params.digest_list.iter().zip(params.offset_list.iter()) {
+            let result = ctx
+                .state
+                .sessions
+                .with_backup_session_verified(&ctx.session_id, &ctx.tenant_id, |session| {
+                    for (digest_str, offset) in
+                        params.digest_list.iter().zip(params.offset_list.iter())
+                    {
                         let digest = ChunkDigest::from_hex(digest_str)
                             .map_err(|_| ApiError::bad_request("Invalid digest format"))?;
                         if is_fixed {
                             session.append_fixed_index_by_id(params.wid, digest, None)?;
                         } else {
-                            session.append_dynamic_index_by_id(params.wid, digest, *offset, None)?;
+                            session
+                                .append_dynamic_index_by_id(params.wid, digest, *offset, None)?;
                         }
                     }
                     Ok(())
-                },
-            ).await;
+                })
+                .await;
 
             match result {
                 Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
@@ -2571,16 +2570,16 @@ async fn handle_h2_backup(
                 Ok(d) => d,
                 Err(_) => return bad_request("Invalid digest format"),
             };
-            let raw_size: u64 = match get_query_param(req.uri(), "size").and_then(|v| v.parse().ok()) {
-                Some(v) => v,
-                None => return bad_request("Missing size"),
-            };
-            let encoded_size: usize = match get_query_param(req.uri(), "encoded-size")
-                .and_then(|v| v.parse().ok())
-            {
-                Some(v) => v,
-                None => return bad_request("Missing encoded-size"),
-            };
+            let raw_size: u64 =
+                match get_query_param(req.uri(), "size").and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return bad_request("Missing size"),
+                };
+            let encoded_size: usize =
+                match get_query_param(req.uri(), "encoded-size").and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return bad_request("Missing encoded-size"),
+                };
 
             let body = match req.collect().await {
                 Ok(collected) => collected.to_bytes(),
@@ -2636,7 +2635,10 @@ async fn handle_h2_backup(
                 .upload_chunk_blob(&ctx.session_id, &ctx.tenant_id, digest, body)
                 .await
             {
-                Ok(stored) => json_response(StatusCode::OK, &serde_json::json!({"data": {"stored": stored}})),
+                Ok(stored) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"data": {"stored": stored}}),
+                ),
                 Err(e) => error_response(e),
             }
         }
@@ -2649,12 +2651,11 @@ async fn handle_h2_backup(
                 Some(v) => v,
                 None => return bad_request("Missing size"),
             };
-            let chunk_count: usize = match get_query_param(req.uri(), "chunk-count")
-                .and_then(|v| v.parse().ok())
-            {
-                Some(v) => v,
-                None => return bad_request("Missing chunk-count"),
-            };
+            let chunk_count: usize =
+                match get_query_param(req.uri(), "chunk-count").and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return bad_request("Missing chunk-count"),
+                };
             let csum = match get_query_param(req.uri(), "csum") {
                 Some(v) => v,
                 None => return bad_request("Missing csum"),
@@ -2675,12 +2676,7 @@ async fn handle_h2_backup(
                 .state
                 .sessions
                 .with_backup_session_async(&ctx.session_id, |session| {
-                    Box::pin(session.finalize_index_by_id(
-                        wid,
-                        size,
-                        chunk_count,
-                        expected_csum,
-                    ))
+                    Box::pin(session.finalize_index_by_id(wid, size, chunk_count, expected_csum))
                 })
                 .await;
 
@@ -2770,10 +2766,7 @@ async fn handle_h2_backup(
     }
 }
 
-async fn handle_h2_reader(
-    ctx: &H2ReaderContext,
-    req: Request<Incoming>,
-) -> Response<Full<Bytes>> {
+async fn handle_h2_reader(ctx: &H2ReaderContext, req: Request<Incoming>) -> Response<Full<Bytes>> {
     if let Err(err) = ctx
         .state
         .sessions
@@ -3772,7 +3765,10 @@ async fn handle_run_gc(
         }
     };
 
-    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
+    let store = params
+        .store
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     if let Err(e) = validate_datastore_name(&store) {
         return error_response(e);
     }
@@ -3940,7 +3936,11 @@ async fn handle_prune_body(
             None => continue,
         };
         let snapshot_path = build_snapshot_path(
-            if ns.is_empty() { None } else { Some(ns.as_str()) },
+            if ns.is_empty() {
+                None
+            } else {
+                Some(ns.as_str())
+            },
             &backup_type,
             &backup_id,
             snapshot,
@@ -3982,7 +3982,10 @@ async fn handle_prune(
         Ok(p) => p,
         Err(_) => return bad_request("Invalid JSON"),
     };
-    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
+    let store = params
+        .store
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
     handle_prune_body(state, ctx, &store, body).await
 }
