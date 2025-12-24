@@ -5,11 +5,11 @@
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter};
-use tracing::{warn, debug};
+use tracing::{warn, debug, info};
 
 /// Rate limit configuration
 #[derive(Debug, Clone)]
@@ -22,6 +22,8 @@ pub struct RateLimitConfig {
     pub upload_bytes_per_hour: u64,
     /// Whether rate limiting is enabled
     pub enabled: bool,
+    /// TTL for inactive rate limiters (seconds)
+    pub limiter_ttl_secs: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -31,6 +33,7 @@ impl Default for RateLimitConfig {
             authenticated_rpm: 1000,      // ~17 requests per second for auth
             upload_bytes_per_hour: 10 * 1024 * 1024 * 1024, // 10 GB/hour
             enabled: true,
+            limiter_ttl_secs: 3600,      // 1 hour TTL for inactive limiters
         }
     }
 }
@@ -43,6 +46,7 @@ impl RateLimitConfig {
             authenticated_rpm: 100000,
             upload_bytes_per_hour: 0, // unlimited
             enabled: true,
+            limiter_ttl_secs: 3600,
         }
     }
 
@@ -53,6 +57,12 @@ impl RateLimitConfig {
             ..Default::default()
         }
     }
+}
+
+/// Rate limiter entry with last access time for TTL-based eviction
+struct LimiterEntry {
+    limiter: Arc<KeyedLimiter>,
+    last_access: Instant,
 }
 
 /// Per-key rate limiter using governor
@@ -66,13 +76,13 @@ type KeyedLimiter = governor::RateLimiter<
 pub struct RateLimiter_ {
     config: RateLimitConfig,
     /// Per-IP limiters for unauthenticated requests
-    ip_limiters: DashMap<IpAddr, Arc<KeyedLimiter>>,
+    ip_limiters: DashMap<IpAddr, LimiterEntry>,
     /// Per-tenant limiters for authenticated requests
-    tenant_limiters: DashMap<String, Arc<KeyedLimiter>>,
+    tenant_limiters: DashMap<String, LimiterEntry>,
     /// Per-tenant upload byte tracking
     tenant_upload_bytes: DashMap<String, u64>,
     /// Last reset time for upload tracking
-    last_upload_reset: parking_lot::RwLock<std::time::Instant>,
+    last_upload_reset: parking_lot::RwLock<Instant>,
 }
 
 impl RateLimiter_ {
@@ -83,7 +93,7 @@ impl RateLimiter_ {
             ip_limiters: DashMap::new(),
             tenant_limiters: DashMap::new(),
             tenant_upload_bytes: DashMap::new(),
-            last_upload_reset: parking_lot::RwLock::new(std::time::Instant::now()),
+            last_upload_reset: parking_lot::RwLock::new(Instant::now()),
         }
     }
 
@@ -98,14 +108,20 @@ impl RateLimiter_ {
             return RateLimitResult::Allowed;
         }
 
-        let limiter = self.ip_limiters.entry(ip).or_insert_with(|| {
+        let mut entry = self.ip_limiters.entry(ip).or_insert_with(|| {
             let quota = Quota::per_minute(
                 NonZeroU32::new(self.config.unauthenticated_rpm).unwrap_or(NonZeroU32::MIN)
             );
-            Arc::new(RateLimiter::direct(quota))
+            LimiterEntry {
+                limiter: Arc::new(RateLimiter::direct(quota)),
+                last_access: Instant::now(),
+            }
         });
 
-        match limiter.check() {
+        // Update last access time
+        entry.last_access = Instant::now();
+
+        match entry.limiter.check() {
             Ok(_) => RateLimitResult::Allowed,
             Err(_) => {
                 warn!("Rate limit exceeded for IP {}", ip);
@@ -124,14 +140,20 @@ impl RateLimiter_ {
             return RateLimitResult::Allowed;
         }
 
-        let limiter = self.tenant_limiters.entry(tenant_id.to_string()).or_insert_with(|| {
+        let mut entry = self.tenant_limiters.entry(tenant_id.to_string()).or_insert_with(|| {
             let quota = Quota::per_minute(
                 NonZeroU32::new(self.config.authenticated_rpm).unwrap_or(NonZeroU32::MIN)
             );
-            Arc::new(RateLimiter::direct(quota))
+            LimiterEntry {
+                limiter: Arc::new(RateLimiter::direct(quota)),
+                last_access: Instant::now(),
+            }
         });
 
-        match limiter.check() {
+        // Update last access time
+        entry.last_access = Instant::now();
+
+        match entry.limiter.check() {
             Ok(_) => RateLimitResult::Allowed,
             Err(_) => {
                 warn!("Rate limit exceeded for tenant {}", tenant_id);
@@ -196,18 +218,47 @@ impl RateLimiter_ {
     }
 
     /// Clean up stale limiters (call periodically)
+    /// Removes entries that haven't been accessed within the TTL period
     pub fn cleanup(&self) {
-        // Remove IP limiters that haven't been used recently
-        // In production, you'd track last access time
-        if self.ip_limiters.len() > 10000 {
-            // Simple cleanup: remove half randomly
-            let keys: Vec<_> = self.ip_limiters.iter().take(5000).map(|r| *r.key()).collect();
-            let count = keys.len();
-            for key in keys {
-                self.ip_limiters.remove(&key);
-            }
-            debug!("Cleaned up {} IP rate limiters", count);
+        let ttl = Duration::from_secs(self.config.limiter_ttl_secs);
+        let now = Instant::now();
+
+        // Clean up IP limiters
+        let ip_keys_to_remove: Vec<_> = self.ip_limiters
+            .iter()
+            .filter(|r| now.duration_since(r.last_access) > ttl)
+            .map(|r| *r.key())
+            .collect();
+
+        let ip_removed = ip_keys_to_remove.len();
+        for key in ip_keys_to_remove {
+            self.ip_limiters.remove(&key);
         }
+
+        // Clean up tenant limiters
+        let tenant_keys_to_remove: Vec<_> = self.tenant_limiters
+            .iter()
+            .filter(|r| now.duration_since(r.last_access) > ttl)
+            .map(|r| r.key().clone())
+            .collect();
+
+        let tenant_removed = tenant_keys_to_remove.len();
+        for key in tenant_keys_to_remove {
+            self.tenant_limiters.remove(&key);
+        }
+
+        if ip_removed > 0 || tenant_removed > 0 {
+            info!(
+                "Rate limiter cleanup: removed {} IP limiters, {} tenant limiters (remaining: {} IP, {} tenant)",
+                ip_removed, tenant_removed,
+                self.ip_limiters.len(), self.tenant_limiters.len()
+            );
+        }
+    }
+
+    /// Get current limiter counts for monitoring
+    pub fn get_limiter_counts(&self) -> (usize, usize) {
+        (self.ip_limiters.len(), self.tenant_limiters.len())
     }
 }
 

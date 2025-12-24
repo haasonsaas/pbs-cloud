@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, instrument, warn, debug};
 
+use crate::audit;
 use crate::auth::{AuthContext, AuthManager, Permission};
 use crate::billing::{BillingManager, UsageEvent, UsageEventType};
 use crate::config::{ServerConfig, StorageConfig};
@@ -562,9 +563,17 @@ async fn handle_request(
             }).await
         }
         (Method::POST, "/api2/json/tenants") => {
-            with_auth(auth_ctx, Permission::Admin, |_| {
+            with_auth(auth_ctx, Permission::Admin, |ctx| {
                 let state = state.clone();
-                async move { handle_create_tenant(state, req).await }
+                async move { handle_create_tenant(state, &ctx, req).await }
+            }).await
+        }
+        (Method::DELETE, path) if path.starts_with("/api2/json/tenants/") => {
+            let tenant_id = path.strip_prefix("/api2/json/tenants/").unwrap_or("");
+            let tenant_id = tenant_id.to_string();
+            with_auth(auth_ctx, Permission::Admin, |ctx| {
+                let state = state.clone();
+                async move { handle_delete_tenant(state, &ctx, &tenant_id).await }
             }).await
         }
 
@@ -576,9 +585,17 @@ async fn handle_request(
             }).await
         }
         (Method::POST, "/api2/json/access/users") => {
-            with_auth(auth_ctx, Permission::Admin, |_| {
+            with_auth(auth_ctx, Permission::Admin, |ctx| {
                 let state = state.clone();
-                async move { handle_create_user(state, req).await }
+                async move { handle_create_user(state, &ctx, req).await }
+            }).await
+        }
+        (Method::DELETE, path) if path.starts_with("/api2/json/access/users/") => {
+            let user_id = path.strip_prefix("/api2/json/access/users/").unwrap_or("");
+            let user_id = user_id.to_string();
+            with_auth(auth_ctx, Permission::Admin, |ctx| {
+                let state = state.clone();
+                async move { handle_delete_user(state, &ctx, &user_id).await }
             }).await
         }
         (Method::GET, "/api2/json/access/tokens") => {
@@ -591,6 +608,14 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Backup, |ctx| {
                 let state = state.clone();
                 async move { handle_create_token(state, &ctx, req).await }
+            }).await
+        }
+        (Method::DELETE, path) if path.starts_with("/api2/json/access/tokens/") => {
+            let token_id = path.strip_prefix("/api2/json/access/tokens/").unwrap_or("");
+            let token_id = token_id.to_string();
+            with_auth(auth_ctx, Permission::Backup, |ctx| {
+                let state = state.clone();
+                async move { handle_delete_token(state, &ctx, &token_id).await }
             }).await
         }
 
@@ -612,9 +637,9 @@ async fn handle_request(
 
         // GC/Admin API
         (Method::POST, "/api2/json/admin/gc") => {
-            with_auth(auth_ctx, Permission::Admin, |_| {
+            with_auth(auth_ctx, Permission::Admin, |ctx| {
                 let state = state.clone();
-                async move { handle_run_gc(state, req).await }
+                async move { handle_run_gc(state, &ctx, req).await }
             }).await
         }
         (Method::GET, "/api2/json/admin/gc/status") => {
@@ -624,9 +649,9 @@ async fn handle_request(
             }).await
         }
         (Method::POST, "/api2/json/admin/prune") => {
-            with_auth(auth_ctx, Permission::DatastoreAdmin, |_| {
+            with_auth(auth_ctx, Permission::DatastoreAdmin, |ctx| {
                 let state = state.clone();
-                async move { handle_prune(state, req).await }
+                async move { handle_prune(state, &ctx, req).await }
             }).await
         }
 
@@ -1416,6 +1441,7 @@ async fn handle_list_tenants(state: Arc<ServerState>) -> Response<Full<Bytes>> {
 
 async fn handle_create_tenant(
     state: Arc<ServerState>,
+    ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -1440,12 +1466,41 @@ async fn handle_create_tenant(
 
     let tenant = state.tenants.create_tenant(&params.name).await;
 
+    // Audit log
+    audit::log_tenant_created(&ctx.user.username, &ctx.user.tenant_id, &tenant.id, &tenant.name);
+
     // Save state
     if let Err(e) = state.save_state().await {
         warn!("Failed to save state after tenant creation: {}", e);
     }
 
     json_response(StatusCode::CREATED, &serde_json::json!({"data": tenant}))
+}
+
+async fn handle_delete_tenant(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    tenant_id: &str,
+) -> Response<Full<Bytes>> {
+    // Prevent deleting the default tenant
+    if tenant_id == "default" {
+        return error_response(ApiError::bad_request("Cannot delete the default tenant"));
+    }
+
+    match state.tenants.delete_tenant(tenant_id).await {
+        Some(tenant) => {
+            // Audit log
+            audit::log_tenant_deleted(&ctx.user.username, &ctx.user.tenant_id, &tenant.id, &tenant.name);
+
+            // Save state
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after tenant deletion: {}", e);
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": {"deleted": true, "tenant": tenant}}))
+        }
+        None => error_response(ApiError::not_found("Tenant not found")),
+    }
 }
 
 async fn handle_list_users(state: Arc<ServerState>, ctx: &AuthContext) -> Response<Full<Bytes>> {
@@ -1462,6 +1517,7 @@ async fn handle_list_users(state: Arc<ServerState>, ctx: &AuthContext) -> Respon
 
 async fn handle_create_user(
     state: Arc<ServerState>,
+    ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -1496,11 +1552,42 @@ async fn handle_create_user(
 
     match state.auth.create_user(&params.username, &params.tenant_id, permission).await {
         Ok(user) => {
+            // Audit log
+            audit::log_user_created(&ctx.user.username, &ctx.user.tenant_id, &user.id, &user.username);
+
             // Save state
             if let Err(e) = state.save_state().await {
                 warn!("Failed to save state after user creation: {}", e);
             }
             json_response(StatusCode::CREATED, &serde_json::json!({"data": user}))
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_delete_user(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    user_id: &str,
+) -> Response<Full<Bytes>> {
+    // Prevent deleting the root user
+    if let Some(user) = state.auth.get_user(user_id).await {
+        if user.username == "root@pam" {
+            return error_response(ApiError::bad_request("Cannot delete the root user"));
+        }
+    }
+
+    match state.auth.delete_user(user_id).await {
+        Ok(user) => {
+            // Audit log
+            audit::log_user_deleted(&ctx.user.username, &ctx.user.tenant_id, &user.id, &user.username);
+
+            // Save state
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after user deletion: {}", e);
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": {"deleted": true, "user": user}}))
         }
         Err(e) => error_response(e),
     }
@@ -1542,6 +1629,9 @@ async fn handle_create_token(
 
     match state.auth.create_token(&ctx.user.id, &params.name, permission, None).await {
         Ok((token, token_string)) => {
+            // Audit log
+            audit::log_token_created(&ctx.user.username, &ctx.user.tenant_id, &token.id, &token.name);
+
             // Save state
             if let Err(e) = state.save_state().await {
                 warn!("Failed to save state after token creation: {}", e);
@@ -1554,6 +1644,36 @@ async fn handle_create_token(
                 }
             });
             json_response(StatusCode::CREATED, &response)
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_delete_token(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    token_id: &str,
+) -> Response<Full<Bytes>> {
+    // Check that the token belongs to the current user (or user is admin)
+    if ctx.permission != Permission::Admin {
+        if let Some(token) = state.auth.get_token(token_id).await {
+            if token.user_id != ctx.user.id {
+                return error_response(ApiError::forbidden("Cannot delete another user's token"));
+            }
+        }
+    }
+
+    match state.auth.delete_token(token_id).await {
+        Ok(()) => {
+            // Audit log
+            audit::log_token_deleted(&ctx.user.username, &ctx.user.tenant_id, token_id);
+
+            // Save state
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after token deletion: {}", e);
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": {"deleted": true}}))
         }
         Err(e) => error_response(e),
     }
@@ -1579,6 +1699,7 @@ async fn handle_rate_limit_info(state: Arc<ServerState>, ctx: &AuthContext) -> R
 
 async fn handle_run_gc(
     state: Arc<ServerState>,
+    ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -1611,10 +1732,14 @@ async fn handle_run_gc(
         max_delete: params.max_delete,
     };
 
-    info!("Starting GC run (dry_run={})", params.dry_run);
+    // Audit log: GC started
+    audit::log_gc_started(&ctx.user.username, &ctx.user.tenant_id, params.dry_run);
 
     match gc.run(options).await {
         Ok(result) => {
+            // Audit log: GC completed
+            audit::log_gc_completed(&ctx.user.username, &ctx.user.tenant_id, result.chunks_deleted, result.bytes_freed);
+
             let response = serde_json::json!({
                 "data": {
                     "chunks_scanned": result.chunks_scanned,
@@ -1651,6 +1776,7 @@ async fn handle_gc_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
 
 async fn handle_prune(
     state: Arc<ServerState>,
+    ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let body = match req.collect().await {
@@ -1701,6 +1827,11 @@ async fn handle_prune(
 
     match pruner.prune(&params.backup_type, &params.backup_id, options).await {
         Ok(result) => {
+            // Audit log: prune completed
+            if !params.dry_run {
+                audit::log_prune_executed(&ctx.user.username, &ctx.user.tenant_id, result.pruned.len());
+            }
+
             json_response(StatusCode::OK, &serde_json::json!({
                 "data": {
                     "kept": result.kept,

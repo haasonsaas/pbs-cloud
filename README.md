@@ -403,21 +403,21 @@ PBS Cloud provides complete tenant isolation:
 
 ```mermaid
 graph TB
-    subgraph "Tenant A"
+    subgraph TenantA ["Tenant A"]
         UA[Users A1, A2]
         DA[Datastore A]
         QA[Quota: 100GB]
     end
 
-    subgraph "Tenant B"
+    subgraph TenantB ["Tenant B"]
         UB[Users B1, B2]
         DB[Datastore B]
         QB[Quota: 500GB]
     end
 
-    subgraph "Storage Backend"
-        SA[/tenant-a/*]
-        SB[/tenant-b/*]
+    subgraph Storage ["Storage Backend"]
+        SA["tenant-a/"]
+        SB["tenant-b/"]
     end
 
     UA --> DA

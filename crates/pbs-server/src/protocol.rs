@@ -142,6 +142,10 @@ impl ApiError {
         Self::new(401, message)
     }
 
+    pub fn forbidden(message: &str) -> Self {
+        Self::new(403, message)
+    }
+
     pub fn not_found(message: &str) -> Self {
         Self::new(404, message)
     }

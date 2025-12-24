@@ -136,6 +136,13 @@ impl TenantManager {
         }
         None
     }
+
+    /// Delete a tenant permanently
+    /// Returns the deleted tenant if found
+    pub async fn delete_tenant(&self, tenant_id: &str) -> Option<Tenant> {
+        let mut tenants = self.tenants.write().await;
+        tenants.remove(tenant_id)
+    }
 }
 
 impl Default for TenantManager {

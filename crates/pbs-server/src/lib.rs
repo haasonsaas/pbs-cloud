@@ -13,6 +13,7 @@
 //! - **Multi-tenancy**: Full tenant isolation with quota support
 
 pub mod api;
+pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod config;

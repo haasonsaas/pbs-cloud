@@ -249,6 +249,26 @@ impl AuthManager {
         Ok(user.clone())
     }
 
+    /// Delete a user permanently (also deletes all their tokens)
+    pub async fn delete_user(&self, user_id: &str) -> Result<User, ApiError> {
+        // First, delete all tokens belonging to this user
+        {
+            let mut tokens = self.tokens.write().await;
+            tokens.retain(|_, t| t.user_id != user_id);
+        }
+
+        // Then delete the user
+        let mut users = self.users.write().await;
+        let mut index = self.username_index.write().await;
+
+        let user = users.remove(user_id)
+            .ok_or_else(|| ApiError::not_found("User not found"))?;
+
+        index.remove(&user.username);
+
+        Ok(user)
+    }
+
     /// Create an API token
     pub async fn create_token(
         &self,
