@@ -41,6 +41,21 @@ pub struct ServerConfig {
     pub webhook_receiver_secret: Option<String>,
     /// Optional encryption key (hex, 32 bytes)
     pub encryption_key: Option<String>,
+    /// Expose Prometheus metrics without auth
+    #[serde(default)]
+    pub metrics_public: bool,
+    /// Serve the root status dashboard
+    #[serde(default)]
+    pub dashboard_enabled: bool,
+    /// Print the root token to logs on first boot
+    #[serde(default = "default_print_root_token")]
+    pub print_root_token: bool,
+    /// Optional file to write the initial root token to
+    pub root_token_file: Option<String>,
+}
+
+fn default_print_root_token() -> bool {
+    true
 }
 
 impl Default for ServerConfig {
@@ -59,6 +74,10 @@ impl Default for ServerConfig {
             tasks: TaskConfig::default(),
             webhook_receiver_secret: None,
             encryption_key: None,
+            metrics_public: false,
+            dashboard_enabled: false,
+            print_root_token: true,
+            root_token_file: None,
         }
     }
 }
@@ -227,6 +246,9 @@ mod tests {
         assert_eq!(config.listen_addr, "0.0.0.0:8007");
         assert!(config.tls.is_some());
         assert!(config.rate_limit.is_some());
+        assert!(!config.metrics_public);
+        assert!(!config.dashboard_enabled);
+        assert!(config.print_root_token);
     }
 
     #[test]

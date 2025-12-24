@@ -76,6 +76,7 @@ async fn shutdown_signal() {
 
 fn load_config() -> Result<ServerConfig> {
     let mut config = ServerConfig::default();
+    let parse_bool = |value: &str| value == "1" || value.eq_ignore_ascii_case("true");
 
     // Override from environment variables
     if let Ok(addr) = std::env::var("PBS_LISTEN_ADDR") {
@@ -198,6 +199,24 @@ fn load_config() -> Result<ServerConfig> {
             if !key.is_empty() {
                 config.encryption_key = Some(key);
             }
+        }
+    }
+
+    if let Ok(value) = std::env::var("PBS_METRICS_PUBLIC") {
+        config.metrics_public = parse_bool(&value);
+    }
+
+    if let Ok(value) = std::env::var("PBS_DASHBOARD_ENABLED") {
+        config.dashboard_enabled = parse_bool(&value);
+    }
+
+    if let Ok(value) = std::env::var("PBS_PRINT_ROOT_TOKEN") {
+        config.print_root_token = parse_bool(&value);
+    }
+
+    if let Ok(path) = std::env::var("PBS_ROOT_TOKEN_FILE") {
+        if !path.is_empty() {
+            config.root_token_file = Some(path);
         }
     }
 

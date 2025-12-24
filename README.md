@@ -47,6 +47,67 @@ PBS Cloud is a clean-room implementation of a backup server compatible with [Pro
 - [x] Compliance reporting
 - [x] Webhook signature verification
 
+## Compatibility & Limits (read this first)
+
+PBS Cloud targets **PBS protocol compatibility** and is focused on the APIs used by
+`proxmox-backup-client`. It is not a full PBS clone.
+
+**What’s verified today**
+- Unit and integration tests for protocol/data formats and server APIs (no automated
+  end-to-end `proxmox-backup-client` tests yet).
+- Manual sanity checks for backup/restore flow are recommended before production use.
+
+**Compatibility matrix**
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Backup protocol | ✅ | HTTP/2 upgrade + PBS data formats implemented |
+| Restore protocol | ✅ | Reader endpoints implemented |
+| Verification jobs | ✅ | Schedule + history endpoints implemented |
+| GC / Prune | ✅ | Core behavior present; see “GC safety” below |
+| Tape / Sync / Remote | ❌ | Not implemented |
+| PBS UI / Node admin | ❌ | Not implemented (API subset only) |
+
+**Known gaps / intentional differences**
+- Admin/REST surface is a focused subset of PBS APIs (verify jobs supported; other job types and UI endpoints are not).
+- Namespace comments are not persisted (`comment` always `null`).
+- Datastore `total`/`avail` are synthetic for backends without capacity reporting.
+- Server-managed encryption is global (env-only) with no rotation or per-tenant keys.
+
+If you need specific PBS endpoints, open an issue or PR with the upstream reference.
+
+## Security posture (defaults)
+
+PBS Cloud aims to be safe by default for multi-tenant use:
+
+- **Metrics** (`/metrics`) are **disabled by default**. Enable explicitly via `PBS_METRICS_PUBLIC=1`
+  or use the admin-protected `/api2/json/metrics`.
+- **Root dashboard** (`/`) is **disabled by default**. Enable with `PBS_DASHBOARD_ENABLED=1`.
+- Rate limiting is enabled by default (per-IP + per-tenant).
+
+## Encryption model
+
+PBS Cloud supports both:
+
+- **Client-side encryption** (PBS DataBlob encrypted before upload). The server stores encrypted
+  blobs as-is.
+- **Server-managed at-rest encryption** (via `PBS_ENCRYPTION_KEY`/`PBS_ENCRYPTION_KEY_FILE`).
+
+Important notes:
+- Server-managed encryption is **global**, not per-tenant.
+- If the server does not have the decryption key for a client-encrypted blob, it cannot verify
+  chunk contents (integrity checks are skipped for those blobs).
+- There is no key rotation support yet.
+
+## GC & prune safety
+
+GC builds a reachable chunk set by scanning manifests and then sweeps storage for orphans.
+This provides correctness for **completed** backups, but there is no lease/epoch protocol yet to
+prevent races with in-flight writes.
+
+Recommendation: schedule GC during low-traffic windows and avoid running it concurrently with
+large ingest jobs until an explicit lease mechanism is implemented.
+
 ## Architecture
 
 ```mermaid
@@ -214,7 +275,8 @@ export PBS_DATA_DIR=/var/lib/pbs-cloud
 ./target/release/pbs-cloud-server
 ```
 
-Open `http://localhost:8007/` for a lightweight status dashboard and quick API links.
+Open `http://localhost:8007/` for a lightweight status dashboard and quick API links
+(enable with `PBS_DASHBOARD_ENABLED=1`).
 
 ### Run with S3 Storage
 
@@ -235,6 +297,9 @@ INFO Created root user: root@pam
 INFO Root API token: pbs_abc123...
 INFO Save this token - it won't be shown again!
 ```
+
+For production (especially Kubernetes), consider setting `PBS_ROOT_TOKEN_FILE` to write the token
+to a file and/or `PBS_PRINT_ROOT_TOKEN=0` to avoid long-lived log exposure.
 
 ### Use with proxmox-backup-client
 
@@ -263,6 +328,10 @@ proxmox-backup-client restore host/hostname/2024-01-01T00:00:00Z root.pxar /rest
 |----------|-------------|---------|
 | **Server** | | |
 | `PBS_LISTEN_ADDR` | Server listen address | `0.0.0.0:8007` |
+| `PBS_METRICS_PUBLIC` | Expose `/metrics` without auth (`true`/`1`) | `false` |
+| `PBS_DASHBOARD_ENABLED` | Enable root status dashboard (`true`/`1`) | `false` |
+| `PBS_PRINT_ROOT_TOKEN` | Print root token on first boot (`true`/`1`) | `true` |
+| `PBS_ROOT_TOKEN_FILE` | Write root token to a file on first boot | - |
 | **Storage** | | |
 | `PBS_DATA_DIR` | Local storage path (also used for persistence if not set separately) | `/var/lib/pbs-cloud` |
 | `PBS_PERSISTENCE_DIR` | Directory for persisting users/tokens/tenants | Same as `PBS_DATA_DIR` |
@@ -428,9 +497,16 @@ curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
 
 ### Prometheus Metrics
 
+Metrics are **disabled by default** for unauthenticated access. Enable public metrics with
+`PBS_METRICS_PUBLIC=1` or use the admin-protected `/api2/json/metrics`.
+
 ```bash
-# Scrape metrics (no auth required)
+# Public metrics (when PBS_METRICS_PUBLIC=1)
 curl https://localhost:8007/metrics
+
+# Authenticated metrics
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/metrics
 ```
 
 Available metrics:

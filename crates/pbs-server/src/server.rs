@@ -3,6 +3,7 @@
 //! Handles both REST API and PBS backup protocol with TLS, rate limiting, and metrics.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -368,8 +369,34 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
         match state.auth.create_root_user(default_tenant).await {
             Ok((user, token)) => {
                 info!("Created root user: {}", user.username);
-                info!("Root API token: {}", token);
-                info!("Save this token - it won't be shown again!");
+                if let Some(path) = state.config.root_token_file.as_deref() {
+                    let write_result = (|| -> std::io::Result<()> {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(path)?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perms = std::fs::Permissions::from_mode(0o600);
+                            std::fs::set_permissions(path, perms)?;
+                        }
+                        writeln!(file, "{}", token)?;
+                        Ok(())
+                    })();
+                    match write_result {
+                        Ok(()) => info!("Root API token written to {}", path),
+                        Err(err) => warn!("Failed to write root token to {}: {}", path, err),
+                    }
+                }
+
+                if state.config.print_root_token {
+                    info!("Root API token: {}", token);
+                    info!("Save this token - it won't be shown again!");
+                } else {
+                    info!("Root API token printing disabled");
+                }
 
                 // Save immediately
                 if let Err(e) = state.save_state().await {
@@ -771,7 +798,13 @@ async fn handle_request(
         // Health check endpoints (for k8s/load balancers)
         (Method::GET, "/health") | (Method::GET, "/healthz") => handle_health(state.clone()).await,
         (Method::GET, "/ready") | (Method::GET, "/readyz") => handle_ready(state.clone()).await,
-        (Method::GET, "/") => handle_root_ui(state.clone()).await,
+        (Method::GET, "/") => {
+            if state.config.dashboard_enabled {
+                handle_root_ui(state.clone()).await
+            } else {
+                not_found()
+            }
+        }
 
         // Public endpoints
         (Method::GET, "/api2/json/version") => handle_version().await,
@@ -779,7 +812,13 @@ async fn handle_request(
         (Method::GET, "/api2/json/access/ticket") => handle_auth_info().await,
 
         // Metrics endpoint
-        (Method::GET, "/metrics") => handle_metrics(state.clone()).await,
+        (Method::GET, "/metrics") => {
+            if state.config.metrics_public {
+                handle_metrics(state.clone()).await
+            } else {
+                not_found()
+            }
+        }
         (Method::POST, "/api2/json/billing/webhook") => {
             handle_webhook_receive(state.clone(), req).await
         }
@@ -788,6 +827,13 @@ async fn handle_request(
         (Method::POST, "/api2/json/access/ticket") => handle_login(state.clone(), req).await,
 
         // API v2 routes (require auth)
+        (Method::GET, "/api2/json/metrics") => {
+            with_auth(auth_ctx, Permission::Admin, |_| {
+                let state = state.clone();
+                async move { handle_metrics(state).await }
+            })
+            .await
+        }
         (Method::GET, "/api2/json/nodes") => {
             with_auth(auth_ctx, Permission::Read, |_| {
                 let state = state.clone();

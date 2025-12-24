@@ -63,6 +63,7 @@
 
 ## Configuration (env vars)
 - Server: `PBS_LISTEN_ADDR`, `PBS_PERSISTENCE_DIR`
+- Observability: `PBS_METRICS_PUBLIC`, `PBS_DASHBOARD_ENABLED`
 - Storage: `PBS_DATA_DIR`, `PBS_S3_BUCKET`, `PBS_S3_REGION`, `PBS_S3_ENDPOINT`, `PBS_S3_PREFIX`, `PBS_DATASTORES`
 - Tenancy: `PBS_DEFAULT_TENANT`
 - TLS: `PBS_TLS_DISABLED`, `PBS_TLS_CERT`, `PBS_TLS_KEY`
@@ -72,6 +73,7 @@
 - WORM: `PBS_WORM_ENABLED`, `PBS_WORM_RETENTION_DAYS`, `PBS_WORM_ALLOW_OVERRIDE`
 - Webhook verification: `PBS_WEBHOOK_RECEIVER_SECRET`
 - Server-managed encryption: `PBS_ENCRYPTION_KEY` (hex, 32 bytes), `PBS_ENCRYPTION_KEY_FILE`
+- Bootstrap: `PBS_PRINT_ROOT_TOKEN`, `PBS_ROOT_TOKEN_FILE`
 
 ## Protocol compatibility
 - Upgrade headers: `proxmox-backup-protocol-v1` and `proxmox-backup-reader-protocol-v1`.
@@ -134,7 +136,7 @@
 - Root UI: `/` (lightweight HTML status dashboard).
 - Ping: `/api2/json/ping`.
 - Status: `/api2/json/status`, `/api2/json/status/datastore-usage`, `/api2/json/nodes/localhost/status`.
-- Metrics: `/metrics` (public).
+- Metrics: `/metrics` (public when enabled), `/api2/json/metrics` (admin).
 - Compliance report: `GET /api2/json/compliance/report` (Admin, optional `store`).
 - Webhook verification: `POST /api2/json/billing/webhook` with `X-Signature-256`.
 
