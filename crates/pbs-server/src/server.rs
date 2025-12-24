@@ -4509,6 +4509,7 @@ async fn handle_verify_api(
                     Ok(mut manifest) => {
                         let prefix = format!("{}/", snapshot_path);
                         let mut missing = Vec::new();
+                        let mut size_mismatch = Vec::new();
                         let existing = match datastore_clone.backend().list_files(&prefix).await {
                             Ok(files) => {
                                 let mut set = std::collections::HashSet::new();
@@ -4536,11 +4537,27 @@ async fn handle_verify_api(
                             for file in &manifest.files {
                                 if !existing.contains(&file.filename) {
                                     missing.push(file.filename.clone());
+                                    continue;
+                                }
+                                let path = format!("{}{}", prefix, file.filename);
+                                match datastore_clone.backend().file_size(&path).await {
+                                    Ok(size) => {
+                                        if size != file.size {
+                                            size_mismatch.push(format!(
+                                                "{} (expected {}, got {})",
+                                                file.filename, file.size, size
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        size_mismatch
+                                            .push(format!("{} (size error: {})", file.filename, e));
+                                    }
                                 }
                             }
                         }
 
-                        let verify_state = if missing.is_empty() {
+                        let verify_state = if missing.is_empty() && size_mismatch.is_empty() {
                             serde_json::json!({
                                 "upid": upid_clone.clone(),
                                 "state": "ok",
@@ -4564,7 +4581,7 @@ async fn handle_verify_api(
                                     &format!("Failed to store manifest {}: {}", snapshot_path, e),
                                 )
                                 .await;
-                        } else if missing.is_empty() {
+                        } else if missing.is_empty() && size_mismatch.is_empty() {
                             ok = ok.saturating_add(1);
                         } else {
                             failed = failed.saturating_add(1);
@@ -4579,6 +4596,19 @@ async fn handle_verify_api(
                                     ),
                                 )
                                 .await;
+                            if !size_mismatch.is_empty() {
+                                state_clone
+                                    .tasks
+                                    .log(
+                                        &upid_clone,
+                                        &format!(
+                                            "Size mismatches in {}: {}",
+                                            snapshot_path,
+                                            size_mismatch.join(", ")
+                                        ),
+                                    )
+                                    .await;
+                            }
                         }
                     }
                     Err(e) => {

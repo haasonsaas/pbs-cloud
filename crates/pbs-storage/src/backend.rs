@@ -46,6 +46,9 @@ pub trait StorageBackend: ChunkWriter {
     /// Read a file (blob, index, manifest)
     async fn read_file(&self, path: &str) -> StorageResult<Bytes>;
 
+    /// Get stored size for a file
+    async fn file_size(&self, path: &str) -> StorageResult<u64>;
+
     /// Write a file
     async fn write_file(&self, path: &str, data: Bytes) -> StorageResult<()>;
 

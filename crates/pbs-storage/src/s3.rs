@@ -374,6 +374,28 @@ impl StorageBackend for S3Backend {
         self.read_object(&key).await
     }
 
+    async fn file_size(&self, path: &str) -> StorageResult<u64> {
+        let key = self.file_key(path);
+        match self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.content_length.unwrap_or(0) as u64),
+            Err(e) => {
+                let service_error = e.into_service_error();
+                if service_error.is_not_found() {
+                    Err(StorageError::BlobNotFound(path.to_string()))
+                } else {
+                    Err(StorageError::S3(service_error.to_string()))
+                }
+            }
+        }
+    }
+
     #[instrument(skip(self, data), fields(path = %path, size = data.len()))]
     async fn write_file(&self, path: &str, data: Bytes) -> StorageResult<()> {
         let key = self.file_key(path);

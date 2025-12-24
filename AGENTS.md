@@ -103,7 +103,7 @@
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
-- Verification tasks check manifest presence and archive file existence (no deep data verification).
+- Verification tasks check manifest presence, archive file existence, and size consistency (no deep data verification).
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.

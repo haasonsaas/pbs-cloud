@@ -223,6 +223,17 @@ impl StorageBackend for LocalBackend {
         }
     }
 
+    async fn file_size(&self, path: &str) -> StorageResult<u64> {
+        let file_path = self.file_path(path);
+        match fs::metadata(&file_path).await {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::BlobNotFound(path.to_string()))
+            }
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
     #[instrument(skip(self, data), fields(path = %path, size = data.len()))]
     async fn write_file(&self, path: &str, data: Bytes) -> StorageResult<()> {
         let file_path = self.file_path(path);
