@@ -1961,7 +1961,9 @@ fn field_matches(field: &FieldMatch, value: u32) -> bool {
         FieldMatch::Items(items) => items.iter().any(|item| match item {
             FieldItem::Single(v) => *v == value,
             FieldItem::Range(start, end) => value >= *start && value <= *end,
-            FieldItem::Step { start, step } => value >= *start && (value - *start) % *step == 0,
+            FieldItem::Step { start, step } => {
+                value >= *start && (value - *start).is_multiple_of(*step)
+            }
             FieldItem::LastDay => false,
         }),
     }
@@ -1984,7 +1986,9 @@ fn day_matches(field: &FieldMatch, day: u32, year: i32, month: u32) -> bool {
         FieldMatch::Items(items) => items.iter().any(|item| match item {
             FieldItem::Single(value) => *value == day,
             FieldItem::Range(start, end) => day >= *start && day <= *end,
-            FieldItem::Step { start, step } => day >= *start && (day - *start) % *step == 0,
+            FieldItem::Step { start, step } => {
+                day >= *start && (day - *start).is_multiple_of(*step)
+            }
             FieldItem::LastDay => last_day_of_month(year, month) == Some(day),
         }),
     }
