@@ -496,7 +496,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (token, token_string) = auth
+        let (_token, token_string) = auth
             .create_token(&user.id, "test-token", Permission::Backup, None)
             .await
             .unwrap();

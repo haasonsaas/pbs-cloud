@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_chunk_key_generation() {
-        let config = S3Config::aws("test-bucket", "us-east-1");
+        let _config = S3Config::aws("test-bucket", "us-east-1");
         // Can't fully test without S3, but we can verify key format
         let digest = ChunkDigest::from_data(b"test");
         let prefix = digest.storage_prefix();
