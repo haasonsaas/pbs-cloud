@@ -771,6 +771,7 @@ async fn handle_request(
         // Health check endpoints (for k8s/load balancers)
         (Method::GET, "/health") | (Method::GET, "/healthz") => handle_health(state.clone()).await,
         (Method::GET, "/ready") | (Method::GET, "/readyz") => handle_ready(state.clone()).await,
+        (Method::GET, "/") => handle_root_ui(state.clone()).await,
 
         // Public endpoints
         (Method::GET, "/api2/json/version") => handle_version().await,
@@ -2422,6 +2423,202 @@ async fn handle_ready(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         "datastores": datastores_count
     });
     json_response(StatusCode::OK, &ready)
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+async fn handle_root_ui(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let uptime = state.start_time.elapsed().as_secs();
+    let uptime_text = format_uptime(uptime);
+    let datastores = state.datastores.len();
+    let running_tasks = state.tasks.running_count().await;
+    let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
+    let version = env!("CARGO_PKG_VERSION");
+
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PBS Cloud</title>
+    <style>
+      :root {{
+        --ink: #0b1020;
+        --card: rgba(255, 255, 255, 0.08);
+        --card-strong: rgba(255, 255, 255, 0.14);
+        --accent: #f97316;
+        --accent-2: #38bdf8;
+        --text: #f8fafc;
+        --muted: rgba(248, 250, 252, 0.65);
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 15% 20%, rgba(56, 189, 248, 0.25), transparent 45%),
+          radial-gradient(circle at 80% 0%, rgba(249, 115, 22, 0.35), transparent 40%),
+          linear-gradient(135deg, #0b1020 0%, #12244d 45%, #0f172a 100%);
+      }}
+      main {{
+        padding: 48px 24px 64px;
+        max-width: 1100px;
+        margin: 0 auto;
+      }}
+      header {{
+        display: grid;
+        gap: 12px;
+        margin-bottom: 32px;
+      }}
+      h1 {{
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        margin: 0;
+        letter-spacing: 0.02em;
+      }}
+      .subtitle {{
+        color: var(--muted);
+        font-size: 1rem;
+        max-width: 620px;
+      }}
+      .badge-row {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 8px;
+      }}
+      .badge {{
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: var(--card);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        font-size: 0.85rem;
+        color: var(--muted);
+      }}
+      .grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 16px;
+      }}
+      .card {{
+        padding: 18px;
+        border-radius: 18px;
+        background: var(--card);
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        backdrop-filter: blur(6px);
+        box-shadow: 0 18px 50px rgba(2, 6, 23, 0.4);
+        transition: transform 0.25s ease, border-color 0.25s ease;
+      }}
+      .card:hover {{
+        transform: translateY(-4px);
+        border-color: rgba(249, 115, 22, 0.6);
+      }}
+      .label {{
+        color: var(--muted);
+        font-size: 0.85rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }}
+      .value {{
+        font-size: 1.6rem;
+        margin-top: 6px;
+      }}
+      .links {{
+        display: grid;
+        gap: 10px;
+        margin-top: 12px;
+      }}
+      a {{
+        color: var(--text);
+        text-decoration: none;
+        background: var(--card-strong);
+        padding: 10px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        transition: border-color 0.2s ease, transform 0.2s ease;
+        font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.9rem;
+      }}
+      a:hover {{
+        border-color: var(--accent-2);
+        transform: translateY(-1px);
+      }}
+      footer {{
+        margin-top: 32px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }}
+      @media (max-width: 640px) {{
+        .badge-row {{ gap: 8px; }}
+        .card {{ padding: 16px; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>PBS Cloud</h1>
+        <div class="subtitle">
+          A PBS-compatible backup server with S3 and local storage, multi-tenancy, and
+          compliance-focused tooling. Use the quick links below to explore the API surface.
+        </div>
+        <div class="badge-row">
+          <div class="badge">Version {version}</div>
+          <div class="badge">Uptime {uptime_text}</div>
+        </div>
+      </header>
+
+      <section class="grid">
+        <div class="card">
+          <div class="label">Datastores</div>
+          <div class="value">{datastores}</div>
+        </div>
+        <div class="card">
+          <div class="label">Tasks Running</div>
+          <div class="value">{running_tasks}</div>
+        </div>
+        <div class="card">
+          <div class="label">Sessions</div>
+          <div class="value">{backup_sessions} backup / {reader_sessions} reader</div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top: 18px;">
+        <div class="label">Quick API Links</div>
+        <div class="links">
+          <a href="/api2/json/version">/api2/json/version</a>
+          <a href="/api2/json/ping">/api2/json/ping</a>
+          <a href="/api2/json/status">/api2/json/status</a>
+          <a href="/api2/json/status/datastore-usage">/api2/json/status/datastore-usage</a>
+          <a href="/api2/json/nodes">/api2/json/nodes</a>
+          <a href="/metrics">/metrics</a>
+        </div>
+      </section>
+
+      <footer>Auth-protected endpoints require a PBS API token.</footer>
+    </main>
+  </body>
+</html>"#
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(html)))
+        .expect("valid response")
 }
 
 async fn handle_version() -> Response<Full<Bytes>> {

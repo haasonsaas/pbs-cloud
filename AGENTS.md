@@ -128,6 +128,7 @@
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.
+- Root UI: `/` (lightweight HTML status dashboard).
 - Ping: `/api2/json/ping`.
 - Status: `/api2/json/status`, `/api2/json/status/datastore-usage`, `/api2/json/nodes/localhost/status`.
 - Metrics: `/metrics` (public).

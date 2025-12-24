@@ -214,6 +214,8 @@ export PBS_DATA_DIR=/var/lib/pbs-cloud
 ./target/release/pbs-cloud-server
 ```
 
+Open `http://localhost:8007/` for a lightweight status dashboard and quick API links.
+
 ### Run with S3 Storage
 
 ```bash
