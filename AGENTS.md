@@ -96,6 +96,7 @@
 - Admin/REST surface is a focused subset of PBS APIs (no task scheduler or UI-specific endpoints).
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
+- Task APIs are present for CLI compatibility but do not track real server tasks yet.
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.

@@ -537,6 +537,13 @@ async fn handle_request(
             })
             .await
         }
+        (_, p) if p.starts_with("/api2/json/nodes/localhost/tasks") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_tasks_api(state, &ctx, req).await }
+            })
+            .await
+        }
         (_, p) if p.starts_with("/api2/json/admin/datastore") => {
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
@@ -2170,6 +2177,55 @@ async fn handle_datastore_api(
     }
 }
 
+async fn handle_tasks_api(
+    _state: Arc<ServerState>,
+    _ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let path = uri.path();
+    let prefix = "/api2/json/nodes/localhost/tasks";
+    let rest = path
+        .strip_prefix(prefix)
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    if rest.is_empty() {
+        if req.method() != Method::GET {
+            return not_found();
+        }
+        return json_response(StatusCode::OK, &serde_json::json!({ "data": [] }));
+    }
+
+    let mut parts = rest.split('/');
+    let _upid = parts.next().unwrap_or("");
+    let action = parts.next();
+
+    match (req.method().clone(), action) {
+        (Method::GET, Some("log")) => {
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "data": [],
+                    "total": 0,
+                    "active": false,
+                }),
+            )
+        }
+        (Method::GET, Some("status")) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "data": {
+                    "status": "stopped",
+                    "exitstatus": "OK",
+                }
+            }),
+        ),
+        (Method::DELETE, None) => json_response(StatusCode::OK, &serde_json::json!({"data": null})),
+        _ => not_found(),
+    }
+}
+
 async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
     let status = serde_json::json!({
@@ -2707,7 +2763,7 @@ async fn handle_h2_backup(
             };
             Response::builder()
                 .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(data)))
+                .body(Full::new(data))
                 .expect("valid response")
         }
         _ => not_found(),
@@ -2757,7 +2813,7 @@ async fn handle_h2_reader(
             };
             Response::builder()
                 .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(data)))
+                .body(Full::new(data))
                 .expect("valid response")
         }
         (Method::GET, "chunk") => {
@@ -2782,7 +2838,7 @@ async fn handle_h2_reader(
             };
             Response::builder()
                 .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(data)))
+                .body(Full::new(data))
                 .expect("valid response")
         }
         (Method::GET, "speedtest") => {

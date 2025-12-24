@@ -166,7 +166,7 @@ impl Default for GcConfig {
 }
 
 /// WORM/immutability configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WormConfig {
     /// Enable WORM protection
     pub enabled: bool,
@@ -174,16 +174,6 @@ pub struct WormConfig {
     pub default_retention_days: Option<u64>,
     /// Allow per-backup override
     pub allow_override: bool,
-}
-
-impl Default for WormConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_retention_days: None,
-            allow_override: false,
-        }
-    }
 }
 
 #[cfg(test)]
