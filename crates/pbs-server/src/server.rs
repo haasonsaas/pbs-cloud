@@ -14,7 +14,7 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use pbs_core::{BackupManifest, ChunkDigest, CryptoConfig};
+use pbs_core::{BackupManifest, ChunkDigest, CryptoConfig, DynamicIndex, FileType, FixedIndex};
 use pbs_storage::error::StorageError;
 use pbs_storage::{
     Datastore, GarbageCollector, GcOptions, LocalBackend, PruneOptions, Pruner, S3Backend,
@@ -4510,6 +4510,10 @@ async fn handle_verify_api(
                         let prefix = format!("{}/", snapshot_path);
                         let mut missing = Vec::new();
                         let mut size_mismatch = Vec::new();
+                        let mut index_errors = Vec::new();
+                        let mut missing_chunks = Vec::new();
+                        let mut chunk_checked = 0usize;
+                        let mut chunk_missing = 0usize;
                         let existing = match datastore_clone.backend().list_files(&prefix).await {
                             Ok(files) => {
                                 let mut set = std::collections::HashSet::new();
@@ -4557,7 +4561,75 @@ async fn handle_verify_api(
                             }
                         }
 
-                        let verify_state = if missing.is_empty() && size_mismatch.is_empty() {
+                        for file in &manifest.files {
+                            if matches!(file.file_type, FileType::Fidx | FileType::Didx)
+                                && !missing.contains(&file.filename)
+                            {
+                                let path = format!("{}{}", prefix, file.filename);
+                                let data = match datastore_clone.backend().read_file(&path).await {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        index_errors.push(format!(
+                                            "{}: read failed ({})",
+                                            file.filename, e
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                let digests = match file.file_type {
+                                    FileType::Fidx => match FixedIndex::from_bytes(&data) {
+                                        Ok(index) => index.unique_digests(),
+                                        Err(e) => {
+                                            index_errors.push(format!(
+                                                "{}: parse failed ({})",
+                                                file.filename, e
+                                            ));
+                                            continue;
+                                        }
+                                    },
+                                    FileType::Didx => match DynamicIndex::from_bytes(&data) {
+                                        Ok(index) => index.unique_digests(),
+                                        Err(e) => {
+                                            index_errors.push(format!(
+                                                "{}: parse failed ({})",
+                                                file.filename, e
+                                            ));
+                                            continue;
+                                        }
+                                    },
+                                    FileType::Blob => Vec::new(),
+                                };
+
+                                for digest in digests {
+                                    chunk_checked = chunk_checked.saturating_add(1);
+                                    match datastore_clone.backend().chunk_exists(&digest).await {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            chunk_missing = chunk_missing.saturating_add(1);
+                                            if missing_chunks.len() < 10 {
+                                                missing_chunks.push(digest.to_hex());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            chunk_missing = chunk_missing.saturating_add(1);
+                                            if missing_chunks.len() < 10 {
+                                                missing_chunks.push(format!(
+                                                    "{} (error: {})",
+                                                    digest.to_hex(),
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let verify_state = if missing.is_empty()
+                            && size_mismatch.is_empty()
+                            && chunk_missing == 0
+                            && index_errors.is_empty()
+                        {
                             serde_json::json!({
                                 "upid": upid_clone.clone(),
                                 "state": "ok",
@@ -4581,7 +4653,11 @@ async fn handle_verify_api(
                                     &format!("Failed to store manifest {}: {}", snapshot_path, e),
                                 )
                                 .await;
-                        } else if missing.is_empty() && size_mismatch.is_empty() {
+                        } else if missing.is_empty()
+                            && size_mismatch.is_empty()
+                            && chunk_missing == 0
+                            && index_errors.is_empty()
+                        {
                             ok = ok.saturating_add(1);
                         } else {
                             failed = failed.saturating_add(1);
@@ -4605,6 +4681,34 @@ async fn handle_verify_api(
                                             "Size mismatches in {}: {}",
                                             snapshot_path,
                                             size_mismatch.join(", ")
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            if !index_errors.is_empty() {
+                                state_clone
+                                    .tasks
+                                    .log(
+                                        &upid_clone,
+                                        &format!(
+                                            "Index errors in {}: {}",
+                                            snapshot_path,
+                                            index_errors.join(", ")
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            if chunk_checked > 0 {
+                                state_clone
+                                    .tasks
+                                    .log(
+                                        &upid_clone,
+                                        &format!(
+                                            "Chunk check in {}: checked={}, missing={}, samples={}",
+                                            snapshot_path,
+                                            chunk_checked,
+                                            chunk_missing,
+                                            missing_chunks.join(", ")
                                         ),
                                     )
                                     .await;
