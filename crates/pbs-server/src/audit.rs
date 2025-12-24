@@ -238,3 +238,60 @@ pub fn log_prune_executed(actor_username: &str, actor_tenant: &str, snapshots_re
         .details(&format!("snapshots_removed={}", snapshots_removed))
         .log();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_event_creation() {
+        let event = AuditEvent::new(AuditEventType::UserCreated)
+            .actor("admin", "default")
+            .target("user", "user-123")
+            .details("Created new user");
+
+        assert!(event.success);
+        assert_eq!(event.actor, Some("admin".to_string()));
+        assert_eq!(event.actor_tenant, Some("default".to_string()));
+        assert_eq!(event.target_type, Some("user".to_string()));
+        assert_eq!(event.target_id, Some("user-123".to_string()));
+    }
+
+    #[test]
+    fn test_audit_event_failed() {
+        let event = AuditEvent::new(AuditEventType::AuthFailure).failed();
+        assert!(!event.success);
+    }
+
+    #[test]
+    fn test_audit_event_serialization() {
+        let event = AuditEvent::new(AuditEventType::TokenCreated)
+            .actor("user", "tenant1")
+            .target("token", "tok-abc");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("token_created"));
+        assert!(json.contains("user"));
+        assert!(json.contains("tenant1"));
+    }
+
+    #[test]
+    fn test_event_type_variants() {
+        // Ensure all event types can be created
+        let types = [
+            AuditEventType::AuthSuccess,
+            AuditEventType::AuthFailure,
+            AuditEventType::UserCreated,
+            AuditEventType::UserDeleted,
+            AuditEventType::TokenCreated,
+            AuditEventType::TenantCreated,
+            AuditEventType::GcStarted,
+            AuditEventType::BackupStarted,
+        ];
+
+        for event_type in types {
+            let event = AuditEvent::new(event_type);
+            assert!(event.success);
+        }
+    }
+}

@@ -148,3 +148,76 @@ impl Default for GcConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ServerConfig::default();
+        assert_eq!(config.listen_addr, "0.0.0.0:8007");
+        assert!(config.tls.is_some());
+        assert!(config.rate_limit.is_some());
+    }
+
+    #[test]
+    fn test_local_config() {
+        let config = ServerConfig::local("/data/backups");
+        assert!(matches!(config.storage, StorageConfig::Local { path } if path == "/data/backups"));
+    }
+
+    #[test]
+    fn test_s3_config() {
+        let config = ServerConfig::s3("my-bucket", "us-west-2");
+        match &config.storage {
+            StorageConfig::S3 { bucket, region, .. } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(region, &Some("us-west-2".to_string()));
+            }
+            _ => panic!("Expected S3 storage config"),
+        }
+    }
+
+    #[test]
+    fn test_config_builders() {
+        let config = ServerConfig::default()
+            .with_data_dir("/var/data")
+            .without_tls()
+            .without_rate_limit();
+
+        assert_eq!(config.data_dir, Some("/var/data".to_string()));
+    }
+
+    #[test]
+    fn test_gc_config_default() {
+        let gc = GcConfig::default();
+        assert!(gc.enabled);
+        assert_eq!(gc.interval_hours, 24);
+    }
+
+    #[test]
+    fn test_tenants_config_default() {
+        let tenants = TenantsConfig::default();
+        assert!(!tenants.enabled);
+        assert_eq!(tenants.default_tenant, "default");
+    }
+
+    #[test]
+    fn test_storage_config_serialization() {
+        let local = StorageConfig::Local { path: "/data".to_string() };
+        let json = serde_json::to_string(&local).unwrap();
+        assert!(json.contains("local"));
+        assert!(json.contains("/data"));
+
+        let s3 = StorageConfig::S3 {
+            bucket: "test".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: None,
+            prefix: None,
+        };
+        let json = serde_json::to_string(&s3).unwrap();
+        assert!(json.contains("s3"));
+        assert!(json.contains("test"));
+    }
+}
