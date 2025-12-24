@@ -32,8 +32,8 @@
 
 ## Build & test
 - Build: `cargo build --release`
-- Test: `./scripts/test.sh` (sets TMPDIR to `target/tmp` for low-space environments)
-- CI/local full check: `./scripts/ci.sh`
+- Test: `./scripts/test.sh` (sets TMPDIR/CARGO_HOME to `target/` for low-space environments)
+- CI/local full check: `./scripts/ci.sh` (also uses repo-scoped TMPDIR/CARGO_HOME)
 - Format (CI): `cargo fmt --all -- --check`
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
