@@ -329,6 +329,10 @@ curl https://localhost:8007/ready
 ### Status & Tasks
 
 ```bash
+# Status root (PBS-compatible subdir list; includes a `summary` field)
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/status
+
 # Datastore usage summary (PBS-compatible)
 curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
   https://localhost:8007/api2/json/status/datastore-usage

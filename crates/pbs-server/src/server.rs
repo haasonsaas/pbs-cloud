@@ -3760,18 +3760,22 @@ async fn handle_tasks_api(
 async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
     let running_tasks = state.tasks.running_count().await;
-    let status = serde_json::json!({
-        "data": {
-            "uptime": state.start_time.elapsed().as_secs(),
-            "tasks": {
-                "running": running_tasks,
-                "scheduled": 0
-            },
-            "sessions": {
-                "backup": backup_sessions,
-                "reader": reader_sessions
-            }
+    let summary = serde_json::json!({
+        "uptime": state.start_time.elapsed().as_secs(),
+        "tasks": {
+            "running": running_tasks,
+            "scheduled": 0
+        },
+        "sessions": {
+            "backup": backup_sessions,
+            "reader": reader_sessions
         }
+    });
+    let status = serde_json::json!({
+        "data": [
+            { "subdir": "datastore-usage" }
+        ],
+        "summary": summary
     });
     json_response(StatusCode::OK, &status)
 }
