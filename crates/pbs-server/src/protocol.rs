@@ -118,6 +118,14 @@ pub struct ApiError {
     pub status: u16,
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (HTTP {})", self.message, self.status)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 impl ApiError {
     pub fn new(status: u16, message: &str) -> Self {
         Self {
