@@ -183,6 +183,14 @@ fn load_config() -> Result<ServerConfig> {
         }
     }
 
+    if let Ok(value) = std::env::var("PBS_TASK_LOG_MAX_LINES") {
+        if let Ok(lines) = value.parse::<usize>() {
+            if lines > 0 {
+                config.tasks.log_max_lines = lines;
+            }
+        }
+    }
+
     if let Ok(path) = std::env::var("PBS_ENCRYPTION_KEY_FILE") {
         if !path.is_empty() {
             let key = std::fs::read_to_string(&path)?;

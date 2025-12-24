@@ -34,6 +34,9 @@ pub struct ServerConfig {
     /// WORM/immutability configuration
     #[serde(default)]
     pub worm: WormConfig,
+    /// Task tracking configuration
+    #[serde(default)]
+    pub tasks: TaskConfig,
     /// Shared secret for inbound webhook verification
     pub webhook_receiver_secret: Option<String>,
     /// Optional encryption key (hex, 32 bytes)
@@ -53,6 +56,7 @@ impl Default for ServerConfig {
             gc: GcConfig::default(),
             verify: VerifyConfig::default(),
             worm: WormConfig::default(),
+            tasks: TaskConfig::default(),
             webhook_receiver_secret: None,
             encryption_key: None,
         }
@@ -198,6 +202,21 @@ pub struct WormConfig {
     pub allow_override: bool,
 }
 
+/// Task tracking configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskConfig {
+    /// Maximum number of log lines stored per task
+    pub log_max_lines: usize,
+}
+
+impl Default for TaskConfig {
+    fn default() -> Self {
+        Self {
+            log_max_lines: 1000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +276,12 @@ mod tests {
         let tenants = TenantsConfig::default();
         assert!(!tenants.enabled);
         assert_eq!(tenants.default_tenant, "default");
+    }
+
+    #[test]
+    fn test_tasks_config_default() {
+        let tasks = TaskConfig::default();
+        assert_eq!(tasks.log_max_lines, 1000);
     }
 
     #[test]

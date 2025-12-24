@@ -150,7 +150,7 @@ impl ApiToken {
 pub struct AuthContext {
     /// Authenticated user
     pub user: User,
-    /// Token used (if token auth)
+    /// Token name used (if token auth)
     pub token_id: Option<String>,
     /// Effective permission
     pub permission: Permission,
@@ -402,7 +402,7 @@ impl AuthManager {
         Ok(AuthContext {
             permission: token.permission, // Use token's permission (may be lower than user's)
             user,
-            token_id: Some(token.id),
+            token_id: Some(token.name),
         })
     }
 

@@ -222,7 +222,11 @@ impl ServerState {
             tenants.tenant_count().await
         );
 
-        let tasks = Arc::new(TaskRegistry::new("localhost"));
+        let tasks = Arc::new(TaskRegistry::with_limits(
+            "localhost",
+            1000,
+            config.tasks.log_max_lines,
+        ));
         let gc_status = Arc::new(RwLock::new(HashMap::new()));
         let backup_tasks = Arc::new(RwLock::new(HashMap::new()));
         let reader_tasks = Arc::new(RwLock::new(HashMap::new()));
@@ -468,7 +472,7 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                         );
                         continue;
                     }
-                    let auth_id = "root@pam@pbs".to_string();
+                    let auth_id = "root@pam".to_string();
                     let _ = spawn_verify_task(
                         state_for_verify.clone(),
                         datastore,
@@ -1085,10 +1089,20 @@ fn parse_bool_param(value: &str) -> Option<bool> {
 
 fn task_auth_id(ctx: &AuthContext) -> String {
     if let Some(token_id) = ctx.token_id.as_deref() {
-        format!("{}!{}@pbs", ctx.user.username, token_id)
+        format!("{}!{}", ctx.user.username, token_id)
     } else {
-        format!("{}@pbs", ctx.user.username)
+        ctx.user.username.clone()
     }
+}
+
+fn decode_chunk_blob(blob_bytes: &[u8], crypto: &CryptoConfig) -> Result<Option<Chunk>, String> {
+    let blob = DataBlob::from_bytes(blob_bytes).map_err(|e| e.to_string())?;
+    if blob.blob_type().is_encrypted() && crypto.key.is_none() {
+        return Ok(None);
+    }
+    let raw_data = blob.decode(crypto).map_err(|e| e.to_string())?;
+    let chunk = Chunk::new(raw_data).map_err(|e| e.to_string())?;
+    Ok(Some(chunk))
 }
 
 async fn store_session_task(
@@ -2509,6 +2523,9 @@ async fn handle_tasks_api(
             return not_found();
         }
         let running = get_query_param(&uri, "running").and_then(|v| parse_bool_param(&v));
+        let errors = get_query_param(&uri, "errors")
+            .and_then(|v| parse_bool_param(&v))
+            .unwrap_or(false);
         let start = get_query_param(&uri, "start")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
@@ -2517,18 +2534,38 @@ async fn handle_tasks_api(
             .unwrap_or(50);
         let userfilter = get_query_param(&uri, "userfilter");
         let store = get_query_param(&uri, "store");
+        let since = get_query_param(&uri, "since").and_then(|v| v.parse::<i64>().ok());
+        let until = get_query_param(&uri, "until").and_then(|v| v.parse::<i64>().ok());
+        let typefilter = get_query_param(&uri, "typefilter");
+        let statusfilter = get_query_param(&uri, "statusfilter").map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        });
 
-        let list = state
+        let (list, total) = state
             .tasks
-            .list(
-                running,
+            .list(crate::tasks::TaskListRequest {
                 start,
                 limit,
-                userfilter.as_deref(),
-                store.as_deref(),
-            )
+                filter: crate::tasks::TaskListFilter {
+                    running,
+                    userfilter: userfilter.as_deref(),
+                    store: store.as_deref(),
+                    errors,
+                    since,
+                    until,
+                    typefilter: typefilter.as_deref(),
+                    statusfilter: statusfilter.as_deref(),
+                },
+            })
             .await;
-        return json_response(StatusCode::OK, &serde_json::json!({ "data": list }));
+        return json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "data": list, "total": total }),
+        );
     }
 
     let mut parts = rest.split('/');
@@ -2546,7 +2583,7 @@ async fn handle_tasks_api(
                 .unwrap_or(1);
             let limit = get_query_param(&uri, "limit")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(500);
+                .unwrap_or(50);
             match state.tasks.log_entries(&upid, start, limit).await {
                 Some((data, total, active)) => json_response(
                     StatusCode::OK,
@@ -2559,16 +2596,32 @@ async fn handle_tasks_api(
                 None => not_found(),
             }
         }
-        (Method::GET, Some("status")) => match state.tasks.status(&upid).await {
-            Some((status, exitstatus)) => json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "data": {
-                        "status": status,
-                        "exitstatus": exitstatus,
-                    }
-                }),
-            ),
+        (Method::GET, Some("status")) => match state.tasks.get(&upid).await {
+            Some(task) => {
+                let status = if task.running { "running" } else { "stopped" };
+                let (user, tokenid) = match task.user.split_once('!') {
+                    Some((base, token)) => (base.to_string(), Some(token.to_string())),
+                    None => (task.user.clone(), None),
+                };
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "data": {
+                            "upid": task.upid,
+                            "node": task.node,
+                            "pid": task.pid,
+                            "pstart": task.pstart,
+                            "starttime": task.starttime,
+                            "type": task.worker_type,
+                            "id": task.worker_id,
+                            "user": user,
+                            "tokenid": tokenid,
+                            "status": status,
+                            "exitstatus": task.exitstatus,
+                        }
+                    }),
+                )
+            }
             None => not_found(),
         },
         (Method::DELETE, None) => {
@@ -2581,11 +2634,12 @@ async fn handle_tasks_api(
 
 async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
+    let running_tasks = state.tasks.running_count().await;
     let status = serde_json::json!({
         "data": {
             "uptime": state.start_time.elapsed().as_secs(),
             "tasks": {
-                "running": backup_sessions + reader_sessions,
+                "running": running_tasks,
                 "scheduled": 0
             },
             "sessions": {
@@ -4564,7 +4618,6 @@ async fn spawn_verify_task(
                         let mut chunk_skipped = 0usize;
                         let mut skipped_chunks = Vec::new();
                         let crypto = datastore_clone.crypto_config();
-                        let has_encryption_key = crypto.key.is_some();
                         let existing = match datastore_clone.backend().list_files(&prefix).await {
                             Ok(files) => {
                                 let mut set = std::collections::HashSet::new();
@@ -4680,51 +4733,20 @@ async fn spawn_verify_task(
                                 }
                             };
 
-                            let blob = match DataBlob::from_bytes(&blob_bytes) {
-                                Ok(blob) => blob,
-                                Err(e) => {
-                                    chunk_missing = chunk_missing.saturating_add(1);
-                                    if missing_chunks.len() < 10 {
-                                        missing_chunks.push(format!(
-                                            "{} (parse error: {})",
-                                            digest.to_hex(),
-                                            e
-                                        ));
+                            let chunk = match decode_chunk_blob(&blob_bytes, &crypto) {
+                                Ok(Some(chunk)) => chunk,
+                                Ok(None) => {
+                                    chunk_skipped = chunk_skipped.saturating_add(1);
+                                    if skipped_chunks.len() < 10 {
+                                        skipped_chunks.push(digest.to_hex());
                                     }
                                     continue;
                                 }
-                            };
-
-                            if blob.blob_type().is_encrypted() && !has_encryption_key {
-                                chunk_skipped = chunk_skipped.saturating_add(1);
-                                if skipped_chunks.len() < 10 {
-                                    skipped_chunks.push(digest.to_hex());
-                                }
-                                continue;
-                            }
-
-                            let raw_data = match blob.decode(&crypto) {
-                                Ok(data) => data,
                                 Err(e) => {
                                     chunk_missing = chunk_missing.saturating_add(1);
                                     if missing_chunks.len() < 10 {
                                         missing_chunks.push(format!(
                                             "{} (decode error: {})",
-                                            digest.to_hex(),
-                                            e
-                                        ));
-                                    }
-                                    continue;
-                                }
-                            };
-
-                            let chunk = match Chunk::new(raw_data) {
-                                Ok(chunk) => chunk,
-                                Err(e) => {
-                                    chunk_missing = chunk_missing.saturating_add(1);
-                                    if missing_chunks.len() < 10 {
-                                        missing_chunks.push(format!(
-                                            "{} (chunk error: {})",
                                             digest.to_hex(),
                                             e
                                         ));
@@ -5053,4 +5075,28 @@ fn not_found() -> Response<Full<Bytes>> {
 
 fn bad_request(message: &str) -> Response<Full<Bytes>> {
     error_response(ApiError::bad_request(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbs_core::EncryptionKey;
+
+    #[test]
+    fn test_decode_chunk_blob_skips_without_key() {
+        let data = vec![7u8; 128];
+        let chunk = Chunk::new(data).expect("chunk");
+        let crypto = CryptoConfig::with_encryption(EncryptionKey::generate());
+        let blob = DataBlob::encode(chunk.data(), &crypto, true).expect("blob");
+        let bytes = blob.to_bytes();
+
+        let no_key = CryptoConfig::default();
+        let decoded = decode_chunk_blob(&bytes, &no_key).expect("decode");
+        assert!(decoded.is_none());
+
+        let decoded = decode_chunk_blob(&bytes, &crypto)
+            .expect("decode")
+            .expect("chunk");
+        assert_eq!(decoded.digest(), chunk.digest());
+    }
 }

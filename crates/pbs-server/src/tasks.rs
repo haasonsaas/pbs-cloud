@@ -17,6 +17,23 @@ pub struct TaskRegistry {
     max_log_lines: usize,
 }
 
+pub struct TaskListFilter<'a> {
+    pub running: Option<bool>,
+    pub userfilter: Option<&'a str>,
+    pub store: Option<&'a str>,
+    pub errors: bool,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub typefilter: Option<&'a str>,
+    pub statusfilter: Option<&'a [String]>,
+}
+
+pub struct TaskListRequest<'a> {
+    pub start: usize,
+    pub limit: usize,
+    pub filter: TaskListFilter<'a>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct TaskEntry {
     upid: String,
@@ -97,12 +114,16 @@ impl From<TaskSnapshot> for TaskEntry {
 
 impl TaskRegistry {
     pub fn new(node: impl Into<String>) -> Self {
+        Self::with_limits(node, 1000, 1000)
+    }
+
+    pub fn with_limits(node: impl Into<String>, max_tasks: usize, max_log_lines: usize) -> Self {
         Self {
             node: node.into(),
             tasks: Arc::new(RwLock::new(HashMap::new())),
             order: Arc::new(RwLock::new(VecDeque::new())),
-            max_tasks: 1000,
-            max_log_lines: 1000,
+            max_tasks: max_tasks.max(1),
+            max_log_lines: max_log_lines.max(1),
         }
     }
 
@@ -204,17 +225,26 @@ impl TaskRegistry {
         }
     }
 
-    pub async fn list(
-        &self,
-        running: Option<bool>,
-        start: usize,
-        limit: usize,
-        userfilter: Option<&str>,
-        store: Option<&str>,
-    ) -> Vec<Value> {
+    pub async fn list(&self, req: TaskListRequest<'_>) -> (Vec<Value>, usize) {
         let tasks = self.tasks.read().await;
         let order = self.order.read().await;
         let mut entries = Vec::new();
+
+        let TaskListRequest {
+            start,
+            limit,
+            filter:
+                TaskListFilter {
+                    running,
+                    userfilter,
+                    store,
+                    errors,
+                    since,
+                    until,
+                    typefilter,
+                    statusfilter,
+                },
+        } = req;
 
         for upid in order.iter() {
             let Some(task) = tasks.get(upid) else {
@@ -222,6 +252,17 @@ impl TaskRegistry {
             };
             if let Some(true) = running {
                 if !task.running {
+                    continue;
+                }
+            }
+            if let Some(until) = until {
+                if task.starttime > until {
+                    continue;
+                }
+            }
+            if let Some(since) = since {
+                let endtime = task.endtime.unwrap_or(task.starttime);
+                if endtime < since {
                     continue;
                 }
             }
@@ -235,13 +276,56 @@ impl TaskRegistry {
                     continue;
                 }
             }
+            if let Some(typefilter) = typefilter {
+                if !task.worker_type.contains(typefilter) {
+                    continue;
+                }
+            }
+
+            let task_state = if task.running {
+                None
+            } else {
+                task.exitstatus.as_deref().map(|status| {
+                    let status_upper = status.to_ascii_uppercase();
+                    if status_upper.starts_with("OK") {
+                        "ok"
+                    } else if status_upper.starts_with("WARNINGS")
+                        || status_upper.starts_with("WARNING")
+                    {
+                        "warning"
+                    } else if status_upper.starts_with("ERROR")
+                        || status_upper.starts_with("ABORTED")
+                    {
+                        "error"
+                    } else {
+                        "unknown"
+                    }
+                })
+            };
+
+            if errors {
+                match task_state {
+                    Some("warning") | Some("error") => {}
+                    _ => continue,
+                }
+            }
+
+            if let Some(filters) = statusfilter {
+                let Some(state) = task_state else {
+                    continue;
+                };
+                if !filters.iter().any(|entry| entry == state) {
+                    continue;
+                }
+            }
             entries.push(task.clone());
         }
 
+        let total = entries.len();
         let start_idx = start.min(entries.len());
         let end_idx = entries.len().min(start_idx.saturating_add(limit));
 
-        entries[start_idx..end_idx]
+        let list = entries[start_idx..end_idx]
             .iter()
             .map(|task| {
                 serde_json::json!({
@@ -257,7 +341,8 @@ impl TaskRegistry {
                     "status": task.status,
                 })
             })
-            .collect()
+            .collect();
+        (list, total)
     }
 
     pub async fn log_entries(
@@ -293,6 +378,16 @@ impl TaskRegistry {
             "stopped".to_string()
         };
         Some((status, task.exitstatus.clone()))
+    }
+
+    pub async fn get(&self, upid: &str) -> Option<TaskSnapshot> {
+        let tasks = self.tasks.read().await;
+        tasks.get(upid).cloned().map(TaskSnapshot::from)
+    }
+
+    pub async fn running_count(&self) -> usize {
+        let tasks = self.tasks.read().await;
+        tasks.values().filter(|task| task.running).count()
     }
 
     pub async fn snapshot(&self) -> Vec<TaskSnapshot> {
