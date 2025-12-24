@@ -63,6 +63,10 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare temp dirs
+        run: |
+          mkdir -p target/tmp
+          mkdir -p target/cargo-home
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
