@@ -333,3 +333,37 @@ impl TaskRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_task_log_capped() {
+        let registry = TaskRegistry::new("node");
+        let upid = registry
+            .create("user@pam", "test", Some("worker"), Some("store"))
+            .await;
+
+        for idx in 0..1200usize {
+            registry.log(&upid, &format!("line {}", idx)).await;
+        }
+
+        let snapshots = registry.snapshot().await;
+        let task = snapshots
+            .into_iter()
+            .find(|task| task.upid == upid)
+            .expect("task exists");
+        assert_eq!(task.log.len(), 1000);
+        assert!(task
+            .log
+            .first()
+            .expect("log has entries")
+            .ends_with("line 200"));
+        assert!(task
+            .log
+            .last()
+            .expect("log has entries")
+            .ends_with("line 1199"));
+    }
+}
