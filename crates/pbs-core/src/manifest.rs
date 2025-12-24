@@ -3,9 +3,9 @@
 //! The manifest is the top-level description of a backup snapshot.
 //! It lists all files (blobs and indexes) that make up the backup.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use chrono::{DateTime, Utc};
 
 use crate::error::Result;
 

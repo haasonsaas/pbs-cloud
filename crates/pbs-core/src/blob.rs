@@ -131,12 +131,14 @@ impl DataBlob {
     pub fn decode(&self, config: &CryptoConfig) -> Result<Vec<u8>> {
         // Decrypt if needed
         let decrypted = if self.blob_type.is_encrypted() {
-            let iv = self.iv.as_ref().ok_or_else(|| {
-                Error::Decryption("Missing IV for encrypted blob".into())
-            })?;
-            let tag = self.tag.as_ref().ok_or_else(|| {
-                Error::Decryption("Missing tag for encrypted blob".into())
-            })?;
+            let iv = self
+                .iv
+                .as_ref()
+                .ok_or_else(|| Error::Decryption("Missing IV for encrypted blob".into()))?;
+            let tag = self
+                .tag
+                .as_ref()
+                .ok_or_else(|| Error::Decryption("Missing tag for encrypted blob".into()))?;
             config.decrypt(iv, tag, &self.raw_data)?
         } else {
             self.raw_data.clone()
@@ -196,11 +198,9 @@ impl DataBlob {
         // Parse magic
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&bytes[..8]);
-        let blob_type = BlobType::from_magic(&magic).ok_or_else(|| {
-            Error::InvalidMagic {
-                expected: BlobType::Uncompressed.magic(),
-                got: magic,
-            }
+        let blob_type = BlobType::from_magic(&magic).ok_or_else(|| Error::InvalidMagic {
+            expected: BlobType::Uncompressed.magic(),
+            got: magic,
         })?;
 
         // Parse CRC

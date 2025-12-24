@@ -71,8 +71,7 @@ impl TlsConfig {
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
     Ok(certs)
 }
 
@@ -82,8 +81,8 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     let mut reader = BufReader::new(file);
 
     // Try to read PKCS8 key first
-    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let keys: Vec<_> =
+        rustls_pemfile::pkcs8_private_keys(&mut reader).collect::<Result<Vec<_>, _>>()?;
 
     if let Some(key) = keys.into_iter().next() {
         return Ok(PrivateKeyDer::Pkcs8(key));
@@ -92,8 +91,8 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     // Try RSA key
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let keys: Vec<_> = rustls_pemfile::rsa_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let keys: Vec<_> =
+        rustls_pemfile::rsa_private_keys(&mut reader).collect::<Result<Vec<_>, _>>()?;
 
     if let Some(key) = keys.into_iter().next() {
         return Ok(PrivateKeyDer::Pkcs1(key));
@@ -102,8 +101,8 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     // Try EC key
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let keys: Vec<_> = rustls_pemfile::ec_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let keys: Vec<_> =
+        rustls_pemfile::ec_private_keys(&mut reader).collect::<Result<Vec<_>, _>>()?;
 
     if let Some(key) = keys.into_iter().next() {
         return Ok(PrivateKeyDer::Sec1(key));
@@ -113,8 +112,9 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
 }
 
 /// Generate a self-signed certificate
-fn generate_self_signed_cert() -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
+fn generate_self_signed_cert(
+) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
 
     info!("Generating self-signed certificate...");
 
@@ -131,7 +131,10 @@ fn generate_self_signed_cert() -> anyhow::Result<(Vec<CertificateDer<'static>>, 
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {:?}", e))?;
 
     warn!("Using self-signed certificate - not suitable for production!");
-    info!("Certificate fingerprint: {}", hex::encode(&cert.der()[..20]));
+    info!(
+        "Certificate fingerprint: {}",
+        hex::encode(&cert.der()[..20])
+    );
 
     Ok((vec![cert_der], key_der))
 }
@@ -143,16 +146,17 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> anyhow::Result<Option<TlsAccep
         return Ok(None);
     }
 
-    let (certs, key) = if let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) {
-        info!("Loading TLS certificate from {}", cert_path);
-        let certs = load_certs(Path::new(cert_path))?;
-        let key = load_private_key(Path::new(key_path))?;
-        (certs, key)
-    } else if config.generate_self_signed {
-        generate_self_signed_cert()?
-    } else {
-        anyhow::bail!("TLS enabled but no certificates configured");
-    };
+    let (certs, key) =
+        if let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) {
+            info!("Loading TLS certificate from {}", cert_path);
+            let certs = load_certs(Path::new(cert_path))?;
+            let key = load_private_key(Path::new(key_path))?;
+            (certs, key)
+        } else if config.generate_self_signed {
+            generate_self_signed_cert()?
+        } else {
+            anyhow::bail!("TLS enabled but no certificates configured");
+        };
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -165,10 +169,8 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> anyhow::Result<Option<TlsAccep
 }
 
 /// Save generated certificate to files (for debugging/inspection)
-pub async fn save_self_signed_cert(
-    data_dir: &Path,
-) -> anyhow::Result<(String, String)> {
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
+pub async fn save_self_signed_cert(data_dir: &Path) -> anyhow::Result<(String, String)> {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
     use tokio::fs;
 
     let subject_alt_names = vec![

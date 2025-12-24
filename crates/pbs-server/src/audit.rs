@@ -144,7 +144,12 @@ impl AuditEvent {
 }
 
 /// Helper functions for common audit events
-pub fn log_user_created(actor_username: &str, actor_tenant: &str, new_user_id: &str, new_username: &str) {
+pub fn log_user_created(
+    actor_username: &str,
+    actor_tenant: &str,
+    new_user_id: &str,
+    new_username: &str,
+) {
     AuditEvent::new(AuditEventType::UserCreated)
         .actor(actor_username, actor_tenant)
         .target("user", new_user_id)
@@ -152,7 +157,12 @@ pub fn log_user_created(actor_username: &str, actor_tenant: &str, new_user_id: &
         .log();
 }
 
-pub fn log_user_deleted(actor_username: &str, actor_tenant: &str, deleted_user_id: &str, deleted_username: &str) {
+pub fn log_user_deleted(
+    actor_username: &str,
+    actor_tenant: &str,
+    deleted_user_id: &str,
+    deleted_username: &str,
+) {
     AuditEvent::new(AuditEventType::UserDeleted)
         .actor(actor_username, actor_tenant)
         .target("user", deleted_user_id)
@@ -160,7 +170,12 @@ pub fn log_user_deleted(actor_username: &str, actor_tenant: &str, deleted_user_i
         .log();
 }
 
-pub fn log_token_created(actor_username: &str, actor_tenant: &str, token_id: &str, token_name: &str) {
+pub fn log_token_created(
+    actor_username: &str,
+    actor_tenant: &str,
+    token_id: &str,
+    token_name: &str,
+) {
     AuditEvent::new(AuditEventType::TokenCreated)
         .actor(actor_username, actor_tenant)
         .target("token", token_id)
@@ -175,7 +190,12 @@ pub fn log_token_deleted(actor_username: &str, actor_tenant: &str, token_id: &st
         .log();
 }
 
-pub fn log_tenant_created(actor_username: &str, actor_tenant: &str, new_tenant_id: &str, tenant_name: &str) {
+pub fn log_tenant_created(
+    actor_username: &str,
+    actor_tenant: &str,
+    new_tenant_id: &str,
+    tenant_name: &str,
+) {
     AuditEvent::new(AuditEventType::TenantCreated)
         .actor(actor_username, actor_tenant)
         .target("tenant", new_tenant_id)
@@ -183,7 +203,12 @@ pub fn log_tenant_created(actor_username: &str, actor_tenant: &str, new_tenant_i
         .log();
 }
 
-pub fn log_tenant_deleted(actor_username: &str, actor_tenant: &str, deleted_tenant_id: &str, tenant_name: &str) {
+pub fn log_tenant_deleted(
+    actor_username: &str,
+    actor_tenant: &str,
+    deleted_tenant_id: &str,
+    tenant_name: &str,
+) {
     AuditEvent::new(AuditEventType::TenantDeleted)
         .actor(actor_username, actor_tenant)
         .target("tenant", deleted_tenant_id)
@@ -192,8 +217,7 @@ pub fn log_tenant_deleted(actor_username: &str, actor_tenant: &str, deleted_tena
 }
 
 pub fn log_auth_success(username: &str, tenant_id: &str, client_ip: Option<&str>) {
-    let mut event = AuditEvent::new(AuditEventType::AuthSuccess)
-        .actor(username, tenant_id);
+    let mut event = AuditEvent::new(AuditEventType::AuthSuccess).actor(username, tenant_id);
 
     if let Some(ip) = client_ip {
         event = event.client_ip(ip);
@@ -225,10 +249,18 @@ pub fn log_gc_started(actor_username: &str, actor_tenant: &str, dry_run: bool) {
         .log();
 }
 
-pub fn log_gc_completed(actor_username: &str, actor_tenant: &str, chunks_deleted: u64, bytes_freed: u64) {
+pub fn log_gc_completed(
+    actor_username: &str,
+    actor_tenant: &str,
+    chunks_deleted: u64,
+    bytes_freed: u64,
+) {
     AuditEvent::new(AuditEventType::GcCompleted)
         .actor(actor_username, actor_tenant)
-        .details(&format!("chunks_deleted={}, bytes_freed={}", chunks_deleted, bytes_freed))
+        .details(&format!(
+            "chunks_deleted={}, bytes_freed={}",
+            chunks_deleted, bytes_freed
+        ))
         .log();
 }
 

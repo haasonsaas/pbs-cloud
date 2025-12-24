@@ -45,7 +45,9 @@ impl ServerConfig {
     /// Create config with local storage
     pub fn local(path: &str) -> Self {
         Self {
-            storage: StorageConfig::Local { path: path.to_string() },
+            storage: StorageConfig::Local {
+                path: path.to_string(),
+            },
             ..Default::default()
         }
     }
@@ -205,7 +207,9 @@ mod tests {
 
     #[test]
     fn test_storage_config_serialization() {
-        let local = StorageConfig::Local { path: "/data".to_string() };
+        let local = StorageConfig::Local {
+            path: "/data".to_string(),
+        };
         let json = serde_json::to_string(&local).unwrap();
         assert!(json.contains("local"));
         assert!(json.contains("/data"));

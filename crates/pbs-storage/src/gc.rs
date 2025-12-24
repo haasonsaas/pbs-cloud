@@ -2,26 +2,24 @@
 //!
 //! Identifies and removes chunks that are no longer referenced by any index.
 
+use chrono::Datelike;
+use pbs_core::ChunkDigest;
 use std::collections::HashSet;
 use std::sync::Arc;
-use pbs_core::ChunkDigest;
-use chrono::Datelike;
-use tracing::{info, warn, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::backend::StorageBackend;
 use crate::datastore::Datastore;
 use crate::error::StorageResult;
 
 /// Garbage collection options
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GcOptions {
     /// Only report what would be deleted, don't actually delete
     pub dry_run: bool,
     /// Maximum number of chunks to delete in one run
     pub max_delete: Option<usize>,
 }
-
 
 /// Garbage collection result
 #[derive(Debug, Clone, Default)]
@@ -83,7 +81,11 @@ impl GarbageCollector {
         // Apply max_delete limit
         if let Some(max) = options.max_delete {
             if orphaned_chunks.len() > max {
-                warn!("Limiting deletion to {} chunks (found {})", max, orphaned_chunks.len());
+                warn!(
+                    "Limiting deletion to {} chunks (found {})",
+                    max,
+                    orphaned_chunks.len()
+                );
                 orphaned_chunks.truncate(max);
             }
         }
@@ -92,7 +94,10 @@ impl GarbageCollector {
         if options.dry_run {
             info!("Dry run: would delete {} chunks", orphaned_chunks.len());
         } else {
-            info!("Phase 4: Deleting {} orphaned chunks...", orphaned_chunks.len());
+            info!(
+                "Phase 4: Deleting {} orphaned chunks...",
+                orphaned_chunks.len()
+            );
             for digest in &orphaned_chunks {
                 let size = self.backend.chunk_size(digest).await.ok();
                 match self.backend.delete_chunk(digest).await {
@@ -103,7 +108,9 @@ impl GarbageCollector {
                         }
                     }
                     Err(e) => {
-                        result.errors.push(format!("Failed to delete {}: {}", digest, e));
+                        result
+                            .errors
+                            .push(format!("Failed to delete {}: {}", digest, e));
                     }
                 }
             }
@@ -114,7 +121,10 @@ impl GarbageCollector {
     }
 
     /// Collect all referenced chunks from all indexes
-    async fn collect_referenced_chunks(&self, result: &mut GcResult) -> StorageResult<HashSet<ChunkDigest>> {
+    async fn collect_referenced_chunks(
+        &self,
+        result: &mut GcResult,
+    ) -> StorageResult<HashSet<ChunkDigest>> {
         let mut referenced = HashSet::new();
 
         // List all backup groups
@@ -122,19 +132,26 @@ impl GarbageCollector {
 
         for group in groups {
             // List snapshots in this group
-            let snapshots = self.datastore
+            let snapshots = self
+                .datastore
                 .list_snapshots(&group.backup_type, &group.backup_id)
                 .await?;
 
             for timestamp in snapshots {
                 // Read the manifest
-                let manifest_path = format!("{}/{}/{}/index.json", group.backup_type, group.backup_id, timestamp);
+                let manifest_path = format!(
+                    "{}/{}/{}/index.json",
+                    group.backup_type, group.backup_id, timestamp
+                );
 
                 match self.datastore.read_manifest(&manifest_path).await {
                     Ok(manifest) => {
                         // Process each index file
                         for file in manifest.files {
-                            let file_path = format!("{}/{}/{}/{}", group.backup_type, group.backup_id, timestamp, file.filename);
+                            let file_path = format!(
+                                "{}/{}/{}/{}",
+                                group.backup_type, group.backup_id, timestamp, file.filename
+                            );
 
                             match file.file_type {
                                 pbs_core::FileType::Fidx => {
@@ -145,7 +162,10 @@ impl GarbageCollector {
                                             }
                                         }
                                         Err(e) => {
-                                            result.errors.push(format!("Failed to read index {}: {}", file_path, e));
+                                            result.errors.push(format!(
+                                                "Failed to read index {}: {}",
+                                                file_path, e
+                                            ));
                                         }
                                     }
                                 }
@@ -157,7 +177,10 @@ impl GarbageCollector {
                                             }
                                         }
                                         Err(e) => {
-                                            result.errors.push(format!("Failed to read index {}: {}", file_path, e));
+                                            result.errors.push(format!(
+                                                "Failed to read index {}: {}",
+                                                file_path, e
+                                            ));
                                         }
                                     }
                                 }
@@ -168,7 +191,9 @@ impl GarbageCollector {
                         }
                     }
                     Err(e) => {
-                        result.errors.push(format!("Failed to read manifest {}: {}", manifest_path, e));
+                        result
+                            .errors
+                            .push(format!("Failed to read manifest {}: {}", manifest_path, e));
                     }
                 }
             }
@@ -244,7 +269,8 @@ impl Pruner {
         let mut result = PruneResult::default();
 
         // List all snapshots
-        let mut snapshots = self.datastore
+        let mut snapshots = self
+            .datastore
             .list_snapshots(backup_type, backup_id)
             .await?;
 
@@ -337,7 +363,8 @@ impl Pruner {
         // Delete pruned snapshots
         if !options.dry_run {
             for snapshot in &result.pruned {
-                match self.datastore
+                match self
+                    .datastore
                     .delete_snapshot(backup_type, backup_id, snapshot)
                     .await
                 {

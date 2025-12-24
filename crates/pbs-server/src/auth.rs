@@ -2,12 +2,12 @@
 //!
 //! Supports API tokens and PBS-compatible authentication.
 
-use std::collections::HashMap;
-use tokio::sync::RwLock;
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use rand::RngCore;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 use crate::protocol::ApiError;
 
@@ -92,7 +92,12 @@ pub struct ApiToken {
 impl ApiToken {
     /// Generate a new API token
     /// Returns (token_struct, actual_token_string)
-    pub fn generate(user_id: &str, name: &str, permission: Permission, expires_at: Option<DateTime<Utc>>) -> (Self, String) {
+    pub fn generate(
+        user_id: &str,
+        name: &str,
+        permission: Permission,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> (Self, String) {
         // Generate random token
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut token_bytes);
@@ -186,7 +191,12 @@ impl AuthManager {
     }
 
     /// Create a user
-    pub async fn create_user(&self, username: &str, tenant_id: &str, permission: Permission) -> Result<User, ApiError> {
+    pub async fn create_user(
+        &self,
+        username: &str,
+        tenant_id: &str,
+        permission: Permission,
+    ) -> Result<User, ApiError> {
         // Check if username exists
         {
             let index = self.username_index.read().await;
@@ -232,9 +242,14 @@ impl AuthManager {
     }
 
     /// Update user permission
-    pub async fn update_user_permission(&self, user_id: &str, permission: Permission) -> Result<User, ApiError> {
+    pub async fn update_user_permission(
+        &self,
+        user_id: &str,
+        permission: Permission,
+    ) -> Result<User, ApiError> {
         let mut users = self.users.write().await;
-        let user = users.get_mut(user_id)
+        let user = users
+            .get_mut(user_id)
             .ok_or_else(|| ApiError::not_found("User not found"))?;
         user.permission = permission;
         Ok(user.clone())
@@ -243,7 +258,8 @@ impl AuthManager {
     /// Deactivate a user
     pub async fn deactivate_user(&self, user_id: &str) -> Result<User, ApiError> {
         let mut users = self.users.write().await;
-        let user = users.get_mut(user_id)
+        let user = users
+            .get_mut(user_id)
             .ok_or_else(|| ApiError::not_found("User not found"))?;
         user.active = false;
         Ok(user.clone())
@@ -261,7 +277,8 @@ impl AuthManager {
         let mut users = self.users.write().await;
         let mut index = self.username_index.write().await;
 
-        let user = users.remove(user_id)
+        let user = users
+            .remove(user_id)
             .ok_or_else(|| ApiError::not_found("User not found"))?;
 
         index.remove(&user.username);
@@ -280,14 +297,17 @@ impl AuthManager {
         // Verify user exists and is active
         {
             let users = self.users.read().await;
-            let user = users.get(user_id)
+            let user = users
+                .get(user_id)
                 .ok_or_else(|| ApiError::not_found("User not found"))?;
             if !user.active {
                 return Err(ApiError::bad_request("User is not active"));
             }
             // Token permission can't exceed user permission
             if permission > user.permission {
-                return Err(ApiError::bad_request("Token permission exceeds user permission"));
+                return Err(ApiError::bad_request(
+                    "Token permission exceeds user permission",
+                ));
             }
         }
 
@@ -320,7 +340,8 @@ impl AuthManager {
     /// Revoke a token
     pub async fn revoke_token(&self, token_id: &str) -> Result<(), ApiError> {
         let mut tokens = self.tokens.write().await;
-        let token = tokens.get_mut(token_id)
+        let token = tokens
+            .get_mut(token_id)
             .ok_or_else(|| ApiError::not_found("Token not found"))?;
         token.active = false;
         Ok(())
@@ -329,7 +350,8 @@ impl AuthManager {
     /// Delete a token
     pub async fn delete_token(&self, token_id: &str) -> Result<(), ApiError> {
         let mut tokens = self.tokens.write().await;
-        tokens.remove(token_id)
+        tokens
+            .remove(token_id)
             .ok_or_else(|| ApiError::not_found("Token not found"))?;
         Ok(())
     }
@@ -403,13 +425,12 @@ impl AuthManager {
 
     /// Create a root/bootstrap user (for initial setup)
     pub async fn create_root_user(&self, tenant_id: &str) -> Result<(User, String), ApiError> {
-        let user = self.create_user("root@pam", tenant_id, Permission::Admin).await?;
-        let (_, token_string) = self.create_token(
-            &user.id,
-            "root-token",
-            Permission::Admin,
-            None,
-        ).await?;
+        let user = self
+            .create_user("root@pam", tenant_id, Permission::Admin)
+            .await?;
+        let (_, token_string) = self
+            .create_token(&user.id, "root-token", Permission::Admin, None)
+            .await?;
         Ok((user, token_string))
     }
 }
@@ -459,7 +480,10 @@ mod tests {
     #[tokio::test]
     async fn test_user_creation() {
         let auth = AuthManager::new();
-        let user = auth.create_user("test@pam", "tenant1", Permission::Backup).await.unwrap();
+        let user = auth
+            .create_user("test@pam", "tenant1", Permission::Backup)
+            .await
+            .unwrap();
         assert_eq!(user.username, "test@pam");
         assert_eq!(user.permission, Permission::Backup);
     }
@@ -467,14 +491,15 @@ mod tests {
     #[tokio::test]
     async fn test_token_auth() {
         let auth = AuthManager::new();
-        let user = auth.create_user("test@pam", "tenant1", Permission::Admin).await.unwrap();
+        let user = auth
+            .create_user("test@pam", "tenant1", Permission::Admin)
+            .await
+            .unwrap();
 
-        let (token, token_string) = auth.create_token(
-            &user.id,
-            "test-token",
-            Permission::Backup,
-            None,
-        ).await.unwrap();
+        let (token, token_string) = auth
+            .create_token(&user.id, "test-token", Permission::Backup, None)
+            .await
+            .unwrap();
 
         // Authenticate with the token
         let ctx = auth.authenticate_token(&token_string).await.unwrap();
@@ -485,16 +510,22 @@ mod tests {
     #[tokio::test]
     async fn test_token_expiration() {
         let auth = AuthManager::new();
-        let user = auth.create_user("test@pam", "tenant1", Permission::Admin).await.unwrap();
+        let user = auth
+            .create_user("test@pam", "tenant1", Permission::Admin)
+            .await
+            .unwrap();
 
         // Create an already-expired token
         let expires_at = Utc::now() - chrono::Duration::hours(1);
-        let (_, token_string) = auth.create_token(
-            &user.id,
-            "expired-token",
-            Permission::Backup,
-            Some(expires_at),
-        ).await.unwrap();
+        let (_, token_string) = auth
+            .create_token(
+                &user.id,
+                "expired-token",
+                Permission::Backup,
+                Some(expires_at),
+            )
+            .await
+            .unwrap();
 
         // Should fail to authenticate
         let result = auth.authenticate_token(&token_string).await;

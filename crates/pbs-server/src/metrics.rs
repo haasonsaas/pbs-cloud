@@ -3,11 +3,10 @@
 //! Exports server metrics in Prometheus format.
 
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, HistogramVec,
-    Encoder, TextEncoder, Registry, Opts, HistogramOpts,
-    register_counter_vec_with_registry, register_gauge_vec_with_registry,
-    register_histogram_vec_with_registry, register_counter_with_registry,
-    register_gauge_with_registry,
+    register_counter_vec_with_registry, register_counter_with_registry,
+    register_gauge_vec_with_registry, register_gauge_with_registry,
+    register_histogram_vec_with_registry, Counter, CounterVec, Encoder, Gauge, GaugeVec,
+    HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 use std::sync::Arc;
 use tracing::error;
@@ -72,8 +71,7 @@ impl Metrics {
 
         // Request metrics
         let requests_total = register_counter_vec_with_registry!(
-            Opts::new("requests_total", "Total API requests")
-                .namespace(ns),
+            Opts::new("requests_total", "Total API requests").namespace(ns),
             &["endpoint", "method", "status"],
             registry
         )?;
@@ -81,92 +79,82 @@ impl Metrics {
         let request_duration_seconds = register_histogram_vec_with_registry!(
             HistogramOpts::new("request_duration_seconds", "Request latency in seconds")
                 .namespace(ns)
-                .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+                .buckets(vec![
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+                ]),
             &["endpoint", "method"],
             registry
         )?;
 
         // Session metrics
         let active_backup_sessions = register_gauge_with_registry!(
-            Opts::new("active_backup_sessions", "Current active backup sessions")
-                .namespace(ns),
+            Opts::new("active_backup_sessions", "Current active backup sessions").namespace(ns),
             registry
         )?;
 
         let active_reader_sessions = register_gauge_with_registry!(
-            Opts::new("active_reader_sessions", "Current active reader sessions")
-                .namespace(ns),
+            Opts::new("active_reader_sessions", "Current active reader sessions").namespace(ns),
             registry
         )?;
 
         // Storage metrics
         let chunks_total = register_gauge_vec_with_registry!(
-            Opts::new("chunks_total", "Total chunks stored")
-                .namespace(ns),
+            Opts::new("chunks_total", "Total chunks stored").namespace(ns),
             &["tenant"],
             registry
         )?;
 
         let chunks_bytes = register_gauge_vec_with_registry!(
-            Opts::new("chunks_bytes", "Total chunk storage bytes")
-                .namespace(ns),
+            Opts::new("chunks_bytes", "Total chunk storage bytes").namespace(ns),
             &["tenant"],
             registry
         )?;
 
         let dedup_ratio = register_gauge_vec_with_registry!(
-            Opts::new("dedup_ratio", "Deduplication ratio")
-                .namespace(ns),
+            Opts::new("dedup_ratio", "Deduplication ratio").namespace(ns),
             &["tenant"],
             registry
         )?;
 
         // Backup metrics
         let backups_total = register_counter_vec_with_registry!(
-            Opts::new("backups_total", "Total backups by tenant")
-                .namespace(ns),
+            Opts::new("backups_total", "Total backups by tenant").namespace(ns),
             &["tenant", "backup_type"],
             registry
         )?;
 
         let backup_bytes = register_counter_vec_with_registry!(
-            Opts::new("backup_bytes", "Total bytes backed up")
-                .namespace(ns),
+            Opts::new("backup_bytes", "Total bytes backed up").namespace(ns),
             &["tenant"],
             registry
         )?;
 
         // GC metrics
         let gc_runs_total = register_counter_with_registry!(
-            Opts::new("gc_runs_total", "Garbage collection runs")
-                .namespace(ns),
+            Opts::new("gc_runs_total", "Garbage collection runs").namespace(ns),
             registry
         )?;
 
         let gc_chunks_deleted = register_counter_with_registry!(
-            Opts::new("gc_chunks_deleted", "Chunks removed by GC")
-                .namespace(ns),
+            Opts::new("gc_chunks_deleted", "Chunks removed by GC").namespace(ns),
             registry
         )?;
 
         let gc_bytes_freed = register_counter_with_registry!(
-            Opts::new("gc_bytes_freed", "Bytes freed by GC")
-                .namespace(ns),
+            Opts::new("gc_bytes_freed", "Bytes freed by GC").namespace(ns),
             registry
         )?;
 
         // Auth metrics
         let auth_attempts_total = register_counter_vec_with_registry!(
-            Opts::new("auth_attempts_total", "Authentication attempts")
-                .namespace(ns),
-            &["result"],  // "success" or "failure"
+            Opts::new("auth_attempts_total", "Authentication attempts").namespace(ns),
+            &["result"], // "success" or "failure"
             registry
         )?;
 
         // Error metrics
         let errors_total = register_counter_vec_with_registry!(
-            Opts::new("errors_total", "Total errors by type")
-                .namespace(ns),
+            Opts::new("errors_total", "Total errors by type").namespace(ns),
             &["type"],
             registry
         )?;
@@ -231,8 +219,12 @@ impl Metrics {
 
     /// Update storage metrics
     pub fn update_storage_metrics(&self, tenant_id: &str, chunks: u64, bytes: u64, dedup: f64) {
-        self.chunks_total.with_label_values(&[tenant_id]).set(chunks as f64);
-        self.chunks_bytes.with_label_values(&[tenant_id]).set(bytes as f64);
+        self.chunks_total
+            .with_label_values(&[tenant_id])
+            .set(chunks as f64);
+        self.chunks_bytes
+            .with_label_values(&[tenant_id])
+            .set(bytes as f64);
         self.dedup_ratio.with_label_values(&[tenant_id]).set(dedup);
     }
 
@@ -291,7 +283,8 @@ impl RequestTimer {
     /// Stop the timer and record the request
     pub fn finish(self, status: u16) {
         let duration = self.start.elapsed().as_secs_f64();
-        self.metrics.record_request(&self.endpoint, &self.method, status, duration);
+        self.metrics
+            .record_request(&self.endpoint, &self.method, status, duration);
     }
 }
 

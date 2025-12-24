@@ -73,20 +73,20 @@ impl CryptoConfig {
 
     /// Compress data using zstd
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        encode_all(data, self.compression_level)
-            .map_err(|e| Error::Compression(e.to_string()))
+        encode_all(data, self.compression_level).map_err(|e| Error::Compression(e.to_string()))
     }
 
     /// Decompress data using zstd
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        decode_all(data)
-            .map_err(|e| Error::Decompression(e.to_string()))
+        decode_all(data).map_err(|e| Error::Decompression(e.to_string()))
     }
 
     /// Encrypt data using AES-256-GCM
     /// Returns (iv, tag, ciphertext)
     pub fn encrypt(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        let key = self.key.as_ref()
+        let key = self
+            .key
+            .as_ref()
             .ok_or_else(|| Error::Encryption("No encryption key configured".into()))?;
 
         let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
@@ -112,7 +112,9 @@ impl CryptoConfig {
 
     /// Decrypt data using AES-256-GCM
     pub fn decrypt(&self, iv: &[u8], tag: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let key = self.key.as_ref()
+        let key = self
+            .key
+            .as_ref()
             .ok_or_else(|| Error::Decryption("No encryption key configured".into()))?;
 
         let cipher = Aes256Gcm::new_from_slice(key.as_bytes())

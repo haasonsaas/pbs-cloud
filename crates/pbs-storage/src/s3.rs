@@ -6,10 +6,7 @@
 //! - data/{path} - files (manifests, indexes, blobs)
 
 use async_trait::async_trait;
-use aws_sdk_s3::{
-    primitives::ByteStream,
-    Client,
-};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use bytes::Bytes;
 use pbs_core::ChunkDigest;
 use tracing::{debug, instrument};
@@ -293,7 +290,9 @@ impl ChunkReader for S3Backend {
 
         for key in keys {
             // Parse chunk key: chunks/{prefix}/{digest}
-            if let Some(digest_hex) = key.strip_prefix("chunks/").and_then(|s| s.split('/').nth(1))
+            if let Some(digest_hex) = key
+                .strip_prefix("chunks/")
+                .and_then(|s| s.split('/').nth(1))
             {
                 if let Ok(digest) = ChunkDigest::from_hex(digest_hex) {
                     digests.push(digest);

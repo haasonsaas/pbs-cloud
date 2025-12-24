@@ -1,9 +1,12 @@
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use pbs_server::{ServerConfig, server::{ServerState, run_server}};
+use pbs_server::{
+    server::{run_server, ServerState},
+    ServerConfig,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -112,7 +115,9 @@ fn load_config() -> Result<ServerConfig> {
     // TLS configuration
     if std::env::var("PBS_TLS_DISABLED").is_ok() {
         config.tls = Some(pbs_server::tls::TlsConfig::disabled());
-    } else if let (Ok(cert), Ok(key)) = (std::env::var("PBS_TLS_CERT"), std::env::var("PBS_TLS_KEY")) {
+    } else if let (Ok(cert), Ok(key)) =
+        (std::env::var("PBS_TLS_CERT"), std::env::var("PBS_TLS_KEY"))
+    {
         config.tls = Some(pbs_server::tls::TlsConfig::with_certs(&cert, &key));
     }
 

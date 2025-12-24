@@ -13,6 +13,6 @@ pub mod s3;
 pub use backend::{BackendStats, ChunkReader, ChunkWriter, StorageBackend};
 pub use datastore::{BackupGroup, Datastore};
 pub use error::{StorageError, StorageResult};
-pub use gc::{GarbageCollector, GcOptions, GcResult, Pruner, PruneOptions, PruneResult};
+pub use gc::{GarbageCollector, GcOptions, GcResult, PruneOptions, PruneResult, Pruner};
 pub use local::LocalBackend;
 pub use s3::{S3Backend, S3Config};

@@ -2,14 +2,14 @@
 //!
 //! Manages active backup/restore sessions with proper state tracking.
 
+use chrono::{DateTime, Utc};
+use pbs_core::{BackupManifest, ChunkDigest, DynamicIndex, FileType, FixedIndex};
+use pbs_storage::Datastore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
-use pbs_core::{ChunkDigest, FixedIndex, DynamicIndex, BackupManifest, FileType};
-use pbs_storage::Datastore;
 
-use crate::protocol::{BackupParams, ApiError};
+use crate::protocol::{ApiError, BackupParams};
 
 /// Session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,16 +105,21 @@ impl BackupSession {
 
     /// Create a new fixed index
     pub fn create_fixed_index(&mut self, name: &str, chunk_size: u64) {
-        self.fixed_indexes.insert(
-            name.to_string(),
-            FixedIndexBuilder::new(chunk_size),
-        );
+        self.fixed_indexes
+            .insert(name.to_string(), FixedIndexBuilder::new(chunk_size));
         self.touch();
     }
 
     /// Append to a fixed index
-    pub fn append_fixed_index(&mut self, name: &str, digest: ChunkDigest, size: u64) -> Result<(), ApiError> {
-        let builder = self.fixed_indexes.get_mut(name)
+    pub fn append_fixed_index(
+        &mut self,
+        name: &str,
+        digest: ChunkDigest,
+        size: u64,
+    ) -> Result<(), ApiError> {
+        let builder = self
+            .fixed_indexes
+            .get_mut(name)
             .ok_or_else(|| ApiError::not_found(&format!("Fixed index '{}' not found", name)))?;
         builder.push(digest, size);
         self.touch();
@@ -123,7 +128,9 @@ impl BackupSession {
 
     /// Close a fixed index
     pub fn close_fixed_index(&mut self, name: &str) -> Result<FixedIndex, ApiError> {
-        let builder = self.fixed_indexes.remove(name)
+        let builder = self
+            .fixed_indexes
+            .remove(name)
             .ok_or_else(|| ApiError::not_found(&format!("Fixed index '{}' not found", name)))?;
         self.touch();
         Ok(builder.build())
@@ -131,10 +138,8 @@ impl BackupSession {
 
     /// Create a new dynamic index
     pub fn create_dynamic_index(&mut self, name: &str) {
-        self.dynamic_indexes.insert(
-            name.to_string(),
-            DynamicIndexBuilder::new(),
-        );
+        self.dynamic_indexes
+            .insert(name.to_string(), DynamicIndexBuilder::new());
         self.touch();
     }
 
@@ -146,7 +151,9 @@ impl BackupSession {
         offset: u64,
         size: u64,
     ) -> Result<(), ApiError> {
-        let builder = self.dynamic_indexes.get_mut(name)
+        let builder = self
+            .dynamic_indexes
+            .get_mut(name)
             .ok_or_else(|| ApiError::not_found(&format!("Dynamic index '{}' not found", name)))?;
         builder.push(digest, offset, size);
         self.touch();
@@ -155,7 +162,9 @@ impl BackupSession {
 
     /// Close a dynamic index
     pub fn close_dynamic_index(&mut self, name: &str) -> Result<DynamicIndex, ApiError> {
-        let builder = self.dynamic_indexes.remove(name)
+        let builder = self
+            .dynamic_indexes
+            .remove(name)
             .ok_or_else(|| ApiError::not_found(&format!("Dynamic index '{}' not found", name)))?;
         self.touch();
         Ok(builder.build())
@@ -176,10 +185,7 @@ impl BackupSession {
         self.state = SessionState::Finishing;
 
         // Create manifest
-        let mut manifest = BackupManifest::new(
-            &self.params.backup_type,
-            &self.params.backup_id,
-        );
+        let mut manifest = BackupManifest::new(&self.params.backup_type, &self.params.backup_id);
 
         // Store remaining fixed indexes
         for (name, builder) in std::mem::take(&mut self.fixed_indexes) {
@@ -187,7 +193,9 @@ impl BackupSession {
             let path = format!("{}/{}", self.snapshot_path(), name);
             let data = index.to_bytes();
 
-            self.datastore.store_fixed_index(&path, &index).await
+            self.datastore
+                .store_fixed_index(&path, &index)
+                .await
                 .map_err(|e| ApiError::internal(&e.to_string()))?;
 
             manifest.add_file(&name, FileType::Fidx, data.len() as u64, &data);
@@ -199,7 +207,9 @@ impl BackupSession {
             let path = format!("{}/{}", self.snapshot_path(), name);
             let data = index.to_bytes();
 
-            self.datastore.store_dynamic_index(&path, &index).await
+            self.datastore
+                .store_dynamic_index(&path, &index)
+                .await
                 .map_err(|e| ApiError::internal(&e.to_string()))?;
 
             manifest.add_file(&name, FileType::Didx, data.len() as u64, &data);
@@ -209,14 +219,18 @@ impl BackupSession {
         for (name, data) in std::mem::take(&mut self.blobs) {
             let path = format!("{}/{}", self.snapshot_path(), name);
 
-            self.datastore.store_blob(&path, &data).await
+            self.datastore
+                .store_blob(&path, &data)
+                .await
                 .map_err(|e| ApiError::internal(&e.to_string()))?;
 
             manifest.add_file(&name, FileType::Blob, data.len() as u64, &data);
         }
 
         // Store manifest
-        self.datastore.store_manifest(&manifest).await
+        self.datastore
+            .store_manifest(&manifest)
+            .await
             .map_err(|e| ApiError::internal(&e.to_string()))?;
 
         self.state = SessionState::Completed;
@@ -331,7 +345,10 @@ impl ReaderSession {
 
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
-        format!("{}/{}/{}", self.backup_type, self.backup_id, self.backup_time)
+        format!(
+            "{}/{}/{}",
+            self.backup_type, self.backup_id, self.backup_time
+        )
     }
 
     /// Update last activity
@@ -343,7 +360,10 @@ impl ReaderSession {
     pub async fn load_manifest(&mut self) -> Result<&BackupManifest, ApiError> {
         if self.manifest.is_none() {
             let path = format!("{}/index.json", self.snapshot_path());
-            let manifest = self.datastore.read_manifest(&path).await
+            let manifest = self
+                .datastore
+                .read_manifest(&path)
+                .await
                 .map_err(|e| ApiError::not_found(&e.to_string()))?;
             self.manifest = Some(manifest);
         }
@@ -355,7 +375,10 @@ impl ReaderSession {
     /// Read a chunk
     pub async fn read_chunk(&mut self, digest: &ChunkDigest) -> Result<Vec<u8>, ApiError> {
         self.touch();
-        let chunk = self.datastore.read_chunk(digest).await
+        let chunk = self
+            .datastore
+            .read_chunk(digest)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))?;
         Ok(chunk.into_data())
     }
@@ -364,7 +387,9 @@ impl ReaderSession {
     pub async fn read_fixed_index(&mut self, name: &str) -> Result<FixedIndex, ApiError> {
         self.touch();
         let path = format!("{}/{}", self.snapshot_path(), name);
-        self.datastore.read_fixed_index(&path).await
+        self.datastore
+            .read_fixed_index(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
@@ -372,7 +397,9 @@ impl ReaderSession {
     pub async fn read_dynamic_index(&mut self, name: &str) -> Result<DynamicIndex, ApiError> {
         self.touch();
         let path = format!("{}/{}", self.snapshot_path(), name);
-        self.datastore.read_dynamic_index(&path).await
+        self.datastore
+            .read_dynamic_index(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
@@ -380,7 +407,9 @@ impl ReaderSession {
     pub async fn read_blob(&mut self, name: &str) -> Result<Vec<u8>, ApiError> {
         self.touch();
         let path = format!("{}/{}", self.snapshot_path(), name);
-        self.datastore.read_blob(&path).await
+        self.datastore
+            .read_blob(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
@@ -416,12 +445,7 @@ impl SessionManager {
         datastore: Arc<Datastore>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let session = BackupSession::new(
-            id.clone(),
-            tenant_id.to_string(),
-            params,
-            datastore,
-        );
+        let session = BackupSession::new(id.clone(), tenant_id.to_string(), params, datastore);
 
         let mut sessions = self.backup_sessions.write().await;
         sessions.insert(id.clone(), session);
@@ -440,7 +464,8 @@ impl SessionManager {
         F: FnOnce(&mut BackupSession) -> Result<R, ApiError>,
     {
         let mut sessions = self.backup_sessions.write().await;
-        let session = sessions.get_mut(id)
+        let session = sessions
+            .get_mut(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         if session.state != SessionState::Active {
@@ -461,12 +486,16 @@ impl SessionManager {
         F: FnOnce(&mut BackupSession) -> Result<R, ApiError>,
     {
         let mut sessions = self.backup_sessions.write().await;
-        let session = sessions.get_mut(id)
+        let session = sessions
+            .get_mut(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         // Verify tenant ownership
         if session.tenant_id != tenant_id {
-            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            return Err(ApiError::new(
+                403,
+                "Access denied: session belongs to different tenant",
+            ));
         }
 
         if session.state != SessionState::Active {
@@ -477,13 +506,21 @@ impl SessionManager {
     }
 
     /// Verify session exists and belongs to the given tenant
-    pub async fn verify_session_ownership(&self, id: &str, tenant_id: &str) -> Result<(), ApiError> {
+    pub async fn verify_session_ownership(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> Result<(), ApiError> {
         let sessions = self.backup_sessions.read().await;
-        let session = sessions.get(id)
+        let session = sessions
+            .get(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         if session.tenant_id != tenant_id {
-            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            return Err(ApiError::new(
+                403,
+                "Access denied: session belongs to different tenant",
+            ));
         }
 
         Ok(())
@@ -496,7 +533,8 @@ impl SessionManager {
         Fut: std::future::Future<Output = Result<R, ApiError>>,
     {
         let mut sessions = self.backup_sessions.write().await;
-        let session = sessions.get_mut(id)
+        let session = sessions
+            .get_mut(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         f(session).await
@@ -539,20 +577,29 @@ impl SessionManager {
         Fut: std::future::Future<Output = Result<R, ApiError>>,
     {
         let mut sessions = self.reader_sessions.write().await;
-        let session = sessions.get_mut(id)
+        let session = sessions
+            .get_mut(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         f(session).await
     }
 
     /// Verify reader session exists and belongs to the given tenant
-    pub async fn verify_reader_session_ownership(&self, id: &str, tenant_id: &str) -> Result<(), ApiError> {
+    pub async fn verify_reader_session_ownership(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> Result<(), ApiError> {
         let sessions = self.reader_sessions.read().await;
-        let session = sessions.get(id)
+        let session = sessions
+            .get(id)
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         if session.tenant_id != tenant_id {
-            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            return Err(ApiError::new(
+                403,
+                "Access denied: session belongs to different tenant",
+            ));
         }
 
         Ok(())
@@ -565,15 +612,24 @@ impl SessionManager {
     }
 
     /// Read a fixed index from a reader session (with ownership verification)
-    pub async fn reader_read_fixed_index(&self, id: &str, tenant_id: &str, name: &str) -> Result<FixedIndex, ApiError> {
+    pub async fn reader_read_fixed_index(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<FixedIndex, ApiError> {
         // Get session info and datastore reference
         let (snapshot_path, datastore) = {
             let mut sessions = self.reader_sessions.write().await;
-            let session = sessions.get_mut(id)
+            let session = sessions
+                .get_mut(id)
                 .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
             if session.tenant_id != tenant_id {
-                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+                return Err(ApiError::new(
+                    403,
+                    "Access denied: session belongs to different tenant",
+                ));
             }
 
             session.touch();
@@ -581,19 +637,30 @@ impl SessionManager {
         };
 
         let path = format!("{}/{}", snapshot_path, name);
-        datastore.read_fixed_index(&path).await
+        datastore
+            .read_fixed_index(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
     /// Read a dynamic index from a reader session (with ownership verification)
-    pub async fn reader_read_dynamic_index(&self, id: &str, tenant_id: &str, name: &str) -> Result<DynamicIndex, ApiError> {
+    pub async fn reader_read_dynamic_index(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<DynamicIndex, ApiError> {
         let (snapshot_path, datastore) = {
             let mut sessions = self.reader_sessions.write().await;
-            let session = sessions.get_mut(id)
+            let session = sessions
+                .get_mut(id)
                 .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
             if session.tenant_id != tenant_id {
-                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+                return Err(ApiError::new(
+                    403,
+                    "Access denied: session belongs to different tenant",
+                ));
             }
 
             session.touch();
@@ -601,19 +668,30 @@ impl SessionManager {
         };
 
         let path = format!("{}/{}", snapshot_path, name);
-        datastore.read_dynamic_index(&path).await
+        datastore
+            .read_dynamic_index(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
     /// Read a blob from a reader session (with ownership verification)
-    pub async fn reader_read_blob(&self, id: &str, tenant_id: &str, name: &str) -> Result<Vec<u8>, ApiError> {
+    pub async fn reader_read_blob(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, ApiError> {
         let (snapshot_path, datastore) = {
             let mut sessions = self.reader_sessions.write().await;
-            let session = sessions.get_mut(id)
+            let session = sessions
+                .get_mut(id)
                 .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
             if session.tenant_id != tenant_id {
-                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+                return Err(ApiError::new(
+                    403,
+                    "Access denied: session belongs to different tenant",
+                ));
             }
 
             session.touch();
@@ -621,18 +699,27 @@ impl SessionManager {
         };
 
         let path = format!("{}/{}", snapshot_path, name);
-        datastore.read_blob(&path).await
+        datastore
+            .read_blob(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))
     }
 
     /// Load manifest from a reader session (with ownership verification)
-    pub async fn reader_load_manifest(&self, id: &str, tenant_id: &str) -> Result<BackupManifest, ApiError> {
+    pub async fn reader_load_manifest(
+        &self,
+        id: &str,
+        tenant_id: &str,
+    ) -> Result<BackupManifest, ApiError> {
         // First check if we already have it cached
         {
             let sessions = self.reader_sessions.read().await;
             if let Some(session) = sessions.get(id) {
                 if session.tenant_id != tenant_id {
-                    return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+                    return Err(ApiError::new(
+                        403,
+                        "Access denied: session belongs to different tenant",
+                    ));
                 }
                 if let Some(manifest) = &session.manifest {
                     return Ok(manifest.clone());
@@ -645,13 +732,16 @@ impl SessionManager {
         // Need to load it
         let (snapshot_path, datastore) = {
             let sessions = self.reader_sessions.read().await;
-            let session = sessions.get(id)
+            let session = sessions
+                .get(id)
                 .ok_or_else(|| ApiError::not_found("Session not found"))?;
             (session.snapshot_path(), session.datastore.clone())
         };
 
         let path = format!("{}/index.json", snapshot_path);
-        let manifest = datastore.read_manifest(&path).await
+        let manifest = datastore
+            .read_manifest(&path)
+            .await
             .map_err(|e| ApiError::not_found(&e.to_string()))?;
 
         // Cache it
@@ -674,17 +764,15 @@ impl SessionManager {
         // Cleanup backup sessions
         {
             let mut sessions = self.backup_sessions.write().await;
-            sessions.retain(|_, session| {
-                now.signed_duration_since(session.last_activity) < timeout
-            });
+            sessions
+                .retain(|_, session| now.signed_duration_since(session.last_activity) < timeout);
         }
 
         // Cleanup reader sessions
         {
             let mut sessions = self.reader_sessions.write().await;
-            sessions.retain(|_, session| {
-                now.signed_duration_since(session.last_activity) < timeout
-            });
+            sessions
+                .retain(|_, session| now.signed_duration_since(session.last_activity) < timeout);
         }
     }
 
@@ -732,18 +820,20 @@ mod tests {
         // Create a session for tenant1
         let params = test_backup_params();
 
-        let session_id = manager.create_backup_session(
-            "tenant1",
-            params,
-            datastore,
-        ).await;
+        let session_id = manager
+            .create_backup_session("tenant1", params, datastore)
+            .await;
 
         // Verify tenant1 can access the session
-        let result = manager.verify_session_ownership(&session_id, "tenant1").await;
+        let result = manager
+            .verify_session_ownership(&session_id, "tenant1")
+            .await;
         assert!(result.is_ok());
 
         // Verify tenant2 cannot access the session
-        let result = manager.verify_session_ownership(&session_id, "tenant2").await;
+        let result = manager
+            .verify_session_ownership(&session_id, "tenant2")
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, 403);
@@ -756,20 +846,20 @@ mod tests {
         let datastore = create_test_datastore().await;
 
         // Create a reader session for tenant1
-        let session_id = manager.create_reader_session(
-            "tenant1",
-            "vm",
-            "100",
-            "2024-01-01T00:00:00Z",
-            datastore,
-        ).await;
+        let session_id = manager
+            .create_reader_session("tenant1", "vm", "100", "2024-01-01T00:00:00Z", datastore)
+            .await;
 
         // Verify tenant1 can access the session
-        let result = manager.verify_reader_session_ownership(&session_id, "tenant1").await;
+        let result = manager
+            .verify_reader_session_ownership(&session_id, "tenant1")
+            .await;
         assert!(result.is_ok());
 
         // Verify tenant2 cannot access the session
-        let result = manager.verify_reader_session_ownership(&session_id, "tenant2").await;
+        let result = manager
+            .verify_reader_session_ownership(&session_id, "tenant2")
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, 403);
@@ -782,23 +872,23 @@ mod tests {
 
         let params = test_backup_params();
 
-        let session_id = manager.create_backup_session(
-            "tenant1",
-            params,
-            datastore,
-        ).await;
+        let session_id = manager
+            .create_backup_session("tenant1", params, datastore)
+            .await;
 
         // Tenant1 can modify the session
-        let result = manager.with_backup_session_verified(&session_id, "tenant1", |session| {
-            assert_eq!(session.tenant_id, "tenant1");
-            Ok(())
-        }).await;
+        let result = manager
+            .with_backup_session_verified(&session_id, "tenant1", |session| {
+                assert_eq!(session.tenant_id, "tenant1");
+                Ok(())
+            })
+            .await;
         assert!(result.is_ok());
 
         // Tenant2 cannot modify the session
-        let result = manager.with_backup_session_verified(&session_id, "tenant2", |_session| {
-            Ok(())
-        }).await;
+        let result = manager
+            .with_backup_session_verified(&session_id, "tenant2", |_session| Ok(()))
+            .await;
         assert!(result.is_err());
     }
 
@@ -807,13 +897,17 @@ mod tests {
         let manager = SessionManager::new(3600);
 
         // Verify ownership of nonexistent session fails with 404
-        let result = manager.verify_session_ownership("nonexistent", "tenant1").await;
+        let result = manager
+            .verify_session_ownership("nonexistent", "tenant1")
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, 404);
 
         // Reader session
-        let result = manager.verify_reader_session_ownership("nonexistent", "tenant1").await;
+        let result = manager
+            .verify_reader_session_ownership("nonexistent", "tenant1")
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, 404);
@@ -826,14 +920,15 @@ mod tests {
 
         let params = test_backup_params();
 
-        let session_id = manager.create_backup_session(
-            "tenant1",
-            params,
-            datastore.clone(),
-        ).await;
+        let session_id = manager
+            .create_backup_session("tenant1", params, datastore.clone())
+            .await;
 
         // Session exists
-        assert!(manager.verify_session_ownership(&session_id, "tenant1").await.is_ok());
+        assert!(manager
+            .verify_session_ownership(&session_id, "tenant1")
+            .await
+            .is_ok());
 
         // Wait for expiration
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -842,6 +937,9 @@ mod tests {
         manager.cleanup_expired().await;
 
         // Session should be gone
-        assert!(manager.verify_session_ownership(&session_id, "tenant1").await.is_err());
+        assert!(manager
+            .verify_session_ownership(&session_id, "tenant1")
+            .await
+            .is_err());
     }
 }

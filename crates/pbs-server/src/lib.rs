@@ -28,12 +28,12 @@ pub mod tenant;
 pub mod tls;
 pub mod validation;
 
-pub use auth::{AuthContext, AuthManager, Permission, User, ApiToken};
+pub use auth::{ApiToken, AuthContext, AuthManager, Permission, User};
 pub use billing::{BillingManager, UsageEvent, UsageEventType, WebhookConfig};
-pub use config::{ServerConfig, GcConfig};
+pub use config::{GcConfig, ServerConfig};
 pub use metrics::{Metrics, MetricsConfig};
 pub use persistence::{PersistenceConfig, PersistenceManager};
-pub use rate_limit::{RateLimitConfig, RateLimiter_, RateLimitResult};
+pub use rate_limit::{RateLimitConfig, RateLimitResult, RateLimiter_};
 pub use session::{BackupSession, ReaderSession, SessionManager};
 pub use streaming::{BackupProtocolHandler, ReaderProtocolHandler};
 pub use tenant::{Tenant, TenantManager};

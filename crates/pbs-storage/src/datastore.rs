@@ -3,12 +3,11 @@
 //! A datastore manages backups for a single tenant/namespace.
 //! It handles backup snapshots, chunk deduplication, and garbage collection.
 
-use std::sync::Arc;
 use bytes::Bytes;
 use pbs_core::{
-    BackupManifest, Chunk, ChunkDigest, DataBlob, DynamicIndex, FixedIndex,
-    CryptoConfig,
+    BackupManifest, Chunk, ChunkDigest, CryptoConfig, DataBlob, DynamicIndex, FixedIndex,
 };
+use std::sync::Arc;
 use tracing::{info, instrument};
 
 use crate::backend::StorageBackend;
@@ -26,11 +25,7 @@ pub struct Datastore {
 
 impl Datastore {
     /// Create a new datastore
-    pub fn new(
-        name: &str,
-        backend: Arc<dyn StorageBackend>,
-        crypto: CryptoConfig,
-    ) -> Self {
+    pub fn new(name: &str, backend: Arc<dyn StorageBackend>, crypto: CryptoConfig) -> Self {
         Self {
             name: name.to_string(),
             backend,
@@ -54,8 +49,8 @@ impl Datastore {
         let digest = chunk.digest();
 
         // Create data blob (compressed, optionally encrypted)
-        let blob = DataBlob::encode(chunk.data(), &self.crypto, true)
-            .map_err(StorageError::Core)?;
+        let blob =
+            DataBlob::encode(chunk.data(), &self.crypto, true).map_err(StorageError::Core)?;
 
         let data = Bytes::from(blob.to_bytes());
         self.backend.write_chunk(digest, data).await
@@ -79,8 +74,7 @@ impl Datastore {
     #[instrument(skip(self, index), fields(datastore = %self.name, path = %path))]
     pub async fn store_fixed_index(&self, path: &str, index: &FixedIndex) -> StorageResult<()> {
         let data = index.to_bytes();
-        let blob = DataBlob::encode(&data, &self.crypto, true)
-            .map_err(StorageError::Core)?;
+        let blob = DataBlob::encode(&data, &self.crypto, true).map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -97,14 +91,9 @@ impl Datastore {
 
     /// Store a dynamic index
     #[instrument(skip(self, index), fields(datastore = %self.name, path = %path))]
-    pub async fn store_dynamic_index(
-        &self,
-        path: &str,
-        index: &DynamicIndex,
-    ) -> StorageResult<()> {
+    pub async fn store_dynamic_index(&self, path: &str, index: &DynamicIndex) -> StorageResult<()> {
         let data = index.to_bytes();
-        let blob = DataBlob::encode(&data, &self.crypto, true)
-            .map_err(StorageError::Core)?;
+        let blob = DataBlob::encode(&data, &self.crypto, true).map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -122,8 +111,7 @@ impl Datastore {
     /// Store a blob file
     #[instrument(skip(self, data), fields(datastore = %self.name, path = %path, size = data.len()))]
     pub async fn store_blob(&self, path: &str, data: &[u8]) -> StorageResult<()> {
-        let blob = DataBlob::encode(data, &self.crypto, true)
-            .map_err(StorageError::Core)?;
+        let blob = DataBlob::encode(data, &self.crypto, true).map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -151,8 +139,8 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, path = %path))]
     pub async fn read_manifest(&self, path: &str) -> StorageResult<BackupManifest> {
         let data = self.backend.read_file(path).await?;
-        let json = String::from_utf8(data.to_vec())
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let json =
+            String::from_utf8(data.to_vec()).map_err(|e| StorageError::Backend(e.to_string()))?;
         BackupManifest::from_json(&json).map_err(StorageError::Core)
     }
 

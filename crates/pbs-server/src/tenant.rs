@@ -2,11 +2,11 @@
 //!
 //! Each tenant has isolated datastores and can be billed separately.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 /// Tenant information
 #[derive(Debug, Clone, Serialize, Deserialize)]

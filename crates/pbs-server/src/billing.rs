@@ -2,12 +2,12 @@
 //!
 //! Tracks usage and sends events to billing systems via webhooks.
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error, instrument};
+use tracing::{error, info, instrument, warn};
 
 /// Usage event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,7 +229,10 @@ impl BillingManager {
                         if attempt < webhook.max_retries {
                             warn!(
                                 "Webhook to {} failed (attempt {}/{}): {}",
-                                webhook.url, attempt + 1, webhook.max_retries, e
+                                webhook.url,
+                                attempt + 1,
+                                webhook.max_retries,
+                                e
                             );
                             tokio::time::sleep(tokio::time::Duration::from_millis(
                                 100 * 2u64.pow(attempt),
@@ -238,7 +241,9 @@ impl BillingManager {
                         } else {
                             error!(
                                 "Webhook to {} failed after {} attempts: {}",
-                                webhook.url, webhook.max_retries + 1, e
+                                webhook.url,
+                                webhook.max_retries + 1,
+                                e
                             );
                         }
                     }
@@ -264,13 +269,13 @@ impl BillingManager {
 
         // Add signature if secret is configured
         if let Some(secret) = &config.secret {
-            use sha2::Sha256;
             use hmac::{Hmac, Mac};
+            use sha2::Sha256;
 
             type HmacSha256 = Hmac<Sha256>;
 
-            let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                .map_err(|e| e.to_string())?;
+            let mut mac =
+                HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
             mac.update(payload.as_bytes());
             let signature = hex::encode(mac.finalize().into_bytes());
 
@@ -344,9 +349,7 @@ impl UsageReport {
     pub fn estimate_cost(&self, rates: &BillingRates) -> f64 {
         let storage_gb = self.storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let egress_gb = self.download_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        let period_secs = (self.period_end - self.period_start)
-            .num_seconds()
-            .max(0) as f64;
+        let period_secs = (self.period_end - self.period_start).num_seconds().max(0) as f64;
         let month_secs = 30.0 * 24.0 * 3600.0;
         let month_fraction = if month_secs > 0.0 {
             period_secs / month_secs
@@ -374,9 +377,9 @@ pub struct BillingRates {
 impl Default for BillingRates {
     fn default() -> Self {
         Self {
-            storage_per_gb: 0.02,    // $0.02/GB/month (like S3)
-            egress_per_gb: 0.09,     // $0.09/GB egress
-            api_per_1k: 0.004,       // $0.004 per 1000 requests
+            storage_per_gb: 0.02, // $0.02/GB/month (like S3)
+            egress_per_gb: 0.09,  // $0.09/GB egress
+            api_per_1k: 0.004,    // $0.004 per 1000 requests
         }
     }
 }
@@ -402,15 +405,35 @@ mod tests {
         let (manager, _rx) = BillingManager::new();
 
         // Record some events
-        manager.record_event(UsageEvent::new("tenant1", UsageEventType::BackupCreated, 10 * 1024 * 1024 * 1024)).await;
-        manager.record_event(UsageEvent::new("tenant1", UsageEventType::StorageUpdated, 10 * 1024 * 1024 * 1024)).await;
-        manager.record_event(UsageEvent::new("tenant1", UsageEventType::DataRestored, 1024 * 1024 * 1024)).await;
+        manager
+            .record_event(UsageEvent::new(
+                "tenant1",
+                UsageEventType::BackupCreated,
+                10 * 1024 * 1024 * 1024,
+            ))
+            .await;
+        manager
+            .record_event(UsageEvent::new(
+                "tenant1",
+                UsageEventType::StorageUpdated,
+                10 * 1024 * 1024 * 1024,
+            ))
+            .await;
+        manager
+            .record_event(UsageEvent::new(
+                "tenant1",
+                UsageEventType::DataRestored,
+                1024 * 1024 * 1024,
+            ))
+            .await;
 
-        let report = manager.generate_report(
-            "tenant1",
-            Utc::now() - chrono::Duration::days(30),
-            Utc::now(),
-        ).await;
+        let report = manager
+            .generate_report(
+                "tenant1",
+                Utc::now() - chrono::Duration::days(30),
+                Utc::now(),
+            )
+            .await;
 
         let cost = report.estimate_cost(&BillingRates::default());
         assert!(cost > 0.0);

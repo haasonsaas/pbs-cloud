@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter};
-use tracing::{warn, debug, info};
+use tracing::{debug, info, warn};
 
 /// Rate limit configuration
 #[derive(Debug, Clone)]
@@ -29,11 +29,11 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            unauthenticated_rpm: 60,     // 1 request per second for unauth
-            authenticated_rpm: 1000,      // ~17 requests per second for auth
+            unauthenticated_rpm: 60, // 1 request per second for unauth
+            authenticated_rpm: 1000, // ~17 requests per second for auth
             upload_bytes_per_hour: 10 * 1024 * 1024 * 1024, // 10 GB/hour
             enabled: true,
-            limiter_ttl_secs: 3600,      // 1 hour TTL for inactive limiters
+            limiter_ttl_secs: 3600, // 1 hour TTL for inactive limiters
         }
     }
 }
@@ -110,7 +110,7 @@ impl RateLimiter_ {
 
         let mut entry = self.ip_limiters.entry(ip).or_insert_with(|| {
             let quota = Quota::per_minute(
-                NonZeroU32::new(self.config.unauthenticated_rpm).unwrap_or(NonZeroU32::MIN)
+                NonZeroU32::new(self.config.unauthenticated_rpm).unwrap_or(NonZeroU32::MIN),
             );
             LimiterEntry {
                 limiter: Arc::new(RateLimiter::direct(quota)),
@@ -140,15 +140,18 @@ impl RateLimiter_ {
             return RateLimitResult::Allowed;
         }
 
-        let mut entry = self.tenant_limiters.entry(tenant_id.to_string()).or_insert_with(|| {
-            let quota = Quota::per_minute(
-                NonZeroU32::new(self.config.authenticated_rpm).unwrap_or(NonZeroU32::MIN)
-            );
-            LimiterEntry {
-                limiter: Arc::new(RateLimiter::direct(quota)),
-                last_access: Instant::now(),
-            }
-        });
+        let mut entry = self
+            .tenant_limiters
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| {
+                let quota = Quota::per_minute(
+                    NonZeroU32::new(self.config.authenticated_rpm).unwrap_or(NonZeroU32::MIN),
+                );
+                LimiterEntry {
+                    limiter: Arc::new(RateLimiter::direct(quota)),
+                    last_access: Instant::now(),
+                }
+            });
 
         // Update last access time
         entry.last_access = Instant::now();
@@ -182,7 +185,10 @@ impl RateLimiter_ {
             }
         }
 
-        let mut entry = self.tenant_upload_bytes.entry(tenant_id.to_string()).or_insert(0);
+        let mut entry = self
+            .tenant_upload_bytes
+            .entry(tenant_id.to_string())
+            .or_insert(0);
         let current = *entry;
         let new_total = current + bytes;
 
@@ -205,7 +211,8 @@ impl RateLimiter_ {
 
     /// Get current usage stats for a tenant
     pub fn get_tenant_stats(&self, tenant_id: &str) -> TenantRateLimitStats {
-        let upload_bytes = self.tenant_upload_bytes
+        let upload_bytes = self
+            .tenant_upload_bytes
             .get(tenant_id)
             .map(|r| *r)
             .unwrap_or(0);
@@ -224,7 +231,8 @@ impl RateLimiter_ {
         let now = Instant::now();
 
         // Clean up IP limiters
-        let ip_keys_to_remove: Vec<_> = self.ip_limiters
+        let ip_keys_to_remove: Vec<_> = self
+            .ip_limiters
             .iter()
             .filter(|r| now.duration_since(r.last_access) > ttl)
             .map(|r| *r.key())
@@ -236,7 +244,8 @@ impl RateLimiter_ {
         }
 
         // Clean up tenant limiters
-        let tenant_keys_to_remove: Vec<_> = self.tenant_limiters
+        let tenant_keys_to_remove: Vec<_> = self
+            .tenant_limiters
             .iter()
             .filter(|r| now.duration_since(r.last_access) > ttl)
             .map(|r| r.key().clone())
@@ -294,7 +303,11 @@ impl RateLimitResult {
     pub fn headers(&self) -> Vec<(String, String)> {
         match self {
             RateLimitResult::Allowed => vec![],
-            RateLimitResult::Limited { retry_after_secs, limit, remaining } => {
+            RateLimitResult::Limited {
+                retry_after_secs,
+                limit,
+                remaining,
+            } => {
                 vec![
                     ("Retry-After".to_string(), retry_after_secs.to_string()),
                     ("X-RateLimit-Limit".to_string(), limit.to_string()),

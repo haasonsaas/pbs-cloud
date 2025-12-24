@@ -3,8 +3,8 @@
 //! Chunks are the fundamental unit of deduplication in PBS.
 //! Each chunk is identified by its SHA-256 digest.
 
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 use crate::error::{Error, Result};
@@ -40,8 +40,7 @@ impl ChunkDigest {
 
     /// Parse from hex string
     pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s)
-            .map_err(|e| Error::InvalidDigest(e.to_string()))?;
+        let bytes = hex::decode(s).map_err(|e| Error::InvalidDigest(e.to_string()))?;
         if bytes.len() != 32 {
             return Err(Error::InvalidDigest(format!(
                 "Expected 32 bytes, got {}",

@@ -37,17 +37,42 @@ lazy_static! {
 
 /// Reserved names that cannot be used
 const RESERVED_NAMES: &[&str] = &[
-    ".", "..", "con", "prn", "aux", "nul",
-    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-    "admin", "root", "system", "null", "undefined",
+    ".",
+    "..",
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9",
+    "admin",
+    "root",
+    "system",
+    "null",
+    "undefined",
 ];
 
 /// Validate backup type (vm, ct, host)
 pub fn validate_backup_type(backup_type: &str) -> Result<(), ApiError> {
     if !BACKUP_TYPE_RE.is_match(backup_type) {
         return Err(ApiError::bad_request(
-            "Invalid backup type: must be 'vm', 'ct', or 'host'"
+            "Invalid backup type: must be 'vm', 'ct', or 'host'",
         ));
     }
     Ok(())
@@ -76,12 +101,14 @@ pub fn validate_backup_time(backup_time: &str) -> Result<(), ApiError> {
     }
     if !BACKUP_TIME_RE.is_match(backup_time) {
         return Err(ApiError::bad_request(
-            "Invalid backup time: must be ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)"
+            "Invalid backup time: must be ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)",
         ));
     }
     // Verify it's a valid date/time
     if chrono::DateTime::parse_from_rfc3339(backup_time).is_err() {
-        return Err(ApiError::bad_request("Invalid backup time: not a valid timestamp"));
+        return Err(ApiError::bad_request(
+            "Invalid backup time: not a valid timestamp",
+        ));
     }
     Ok(())
 }
@@ -97,7 +124,9 @@ pub fn validate_filename(name: &str) -> Result<(), ApiError> {
         ));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(ApiError::bad_request("Invalid filename: path separators not allowed"));
+        return Err(ApiError::bad_request(
+            "Invalid filename: path separators not allowed",
+        ));
     }
     if is_reserved_name(name) {
         return Err(ApiError::bad_request("Filename uses a reserved name"));
@@ -157,7 +186,7 @@ pub fn validate_digest(digest: &str) -> Result<(), ApiError> {
     }
     if !DIGEST_RE.is_match(digest) {
         return Err(ApiError::bad_request(
-            "Invalid digest: must be 64 hexadecimal characters (SHA-256)"
+            "Invalid digest: must be 64 hexadecimal characters (SHA-256)",
         ));
     }
     Ok(())
@@ -324,20 +353,12 @@ mod tests {
     #[test]
     fn test_null_byte_injection() {
         // Null bytes can be used to truncate strings in some systems
-        let attacks = [
-            "file\x00.txt",
-            "file%00.txt",
-            "\x00malicious",
-        ];
+        let attacks = ["file\x00.txt", "file%00.txt", "\x00malicious"];
 
         for attack in attacks {
             // These should either fail or be sanitized
             let result = validate_filename(attack);
-            assert!(
-                result.is_err(),
-                "Null byte should be blocked: {:?}",
-                attack
-            );
+            assert!(result.is_err(), "Null byte should be blocked: {:?}", attack);
         }
     }
 
@@ -371,7 +392,7 @@ mod tests {
     fn test_unicode_normalization_attacks() {
         // Unicode lookalikes and normalization issues
         let attacks = [
-            "ａｄｍｉｎ", // fullwidth characters
+            "ａｄｍｉｎ",    // fullwidth characters
             "admin\u{200b}", // zero-width space
             "\u{202e}nimda", // right-to-left override
         ];
@@ -391,9 +412,7 @@ mod tests {
     fn test_windows_reserved_names() {
         // Windows reserved device names
         let reserved = [
-            "CON", "PRN", "AUX", "NUL",
-            "COM1", "COM2", "COM3", "COM4",
-            "LPT1", "LPT2", "LPT3",
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3",
             "con", "prn", "aux", // lowercase
         ];
 
@@ -433,15 +452,7 @@ mod tests {
     #[test]
     fn test_special_filenames() {
         // Special files that should be blocked
-        let specials = [
-            ".",
-            "..",
-            ".htaccess",
-            ".git",
-            ".svn",
-            ".env",
-            ".ssh",
-        ];
+        let specials = [".", "..", ".htaccess", ".git", ".svn", ".env", ".ssh"];
 
         for name in specials {
             // Either blocked by reserved names or by starting-char validation

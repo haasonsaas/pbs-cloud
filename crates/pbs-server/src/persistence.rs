@@ -2,12 +2,12 @@
 //!
 //! Stores authentication state to JSON files on disk.
 
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::info;
 
-use crate::auth::{User, ApiToken, Permission};
+use crate::auth::{ApiToken, Permission, User};
 use crate::tenant::Tenant;
 
 /// Persistence configuration
@@ -294,10 +294,7 @@ mod tests {
         let manager = PersistenceManager::new(config).await.unwrap();
 
         // Create some tenants
-        let tenants = vec![
-            Tenant::new("tenant1"),
-            Tenant::new("tenant2"),
-        ];
+        let tenants = vec![Tenant::new("tenant1"), Tenant::new("tenant2")];
 
         // Save
         manager.save_tenants(&tenants).await.unwrap();

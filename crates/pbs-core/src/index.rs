@@ -4,10 +4,10 @@
 //! - Fixed Index (.fidx): For VM disk images with fixed-size chunks
 //! - Dynamic Index (.didx): For file archives with variable-size chunks
 
-use sha2::{Digest, Sha256};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::chunk::ChunkDigest;
 use crate::error::{Error, Result};
@@ -139,30 +139,22 @@ impl FixedIndex {
         }
 
         // Parse UUID
-        let uuid = Uuid::from_slice(&bytes[8..24])
-            .map_err(|e| Error::IndexCorrupted(e.to_string()))?;
+        let uuid =
+            Uuid::from_slice(&bytes[8..24]).map_err(|e| Error::IndexCorrupted(e.to_string()))?;
 
         // Parse ctime (slice is exactly 8 bytes, guaranteed by HEADER_SIZE check)
-        let ctime_secs = i64::from_le_bytes(
-            bytes[24..32].try_into().expect("slice is 8 bytes")
-        );
+        let ctime_secs = i64::from_le_bytes(bytes[24..32].try_into().expect("slice is 8 bytes"));
         let ctime = DateTime::from_timestamp(ctime_secs, 0)
             .ok_or_else(|| Error::IndexCorrupted("Invalid timestamp".into()))?;
 
         // Skip stored checksum (we'll verify after parsing)
-        let stored_checksum: [u8; 32] = bytes[32..64]
-            .try_into()
-            .expect("slice is 32 bytes");
+        let stored_checksum: [u8; 32] = bytes[32..64].try_into().expect("slice is 32 bytes");
 
         // Parse size
-        let size = u64::from_le_bytes(
-            bytes[64..72].try_into().expect("slice is 8 bytes")
-        );
+        let size = u64::from_le_bytes(bytes[64..72].try_into().expect("slice is 8 bytes"));
 
         // Parse chunk size
-        let chunk_size = u64::from_le_bytes(
-            bytes[72..80].try_into().expect("slice is 8 bytes")
-        );
+        let chunk_size = u64::from_le_bytes(bytes[72..80].try_into().expect("slice is 8 bytes"));
 
         // Parse digests
         let digest_bytes = &bytes[HEADER_SIZE..];
@@ -310,25 +302,20 @@ impl DynamicIndex {
         }
 
         // Parse UUID
-        let uuid = Uuid::from_slice(&bytes[8..24])
-            .map_err(|e| Error::IndexCorrupted(e.to_string()))?;
+        let uuid =
+            Uuid::from_slice(&bytes[8..24]).map_err(|e| Error::IndexCorrupted(e.to_string()))?;
 
         // Parse ctime (slice is exactly 8 bytes, guaranteed by HEADER_SIZE check)
-        let ctime_secs = i64::from_le_bytes(
-            bytes[24..32].try_into().expect("slice is 8 bytes")
-        );
+        let ctime_secs = i64::from_le_bytes(bytes[24..32].try_into().expect("slice is 8 bytes"));
         let ctime = DateTime::from_timestamp(ctime_secs, 0)
             .ok_or_else(|| Error::IndexCorrupted("Invalid timestamp".into()))?;
 
         // Store checksum for verification
-        let stored_checksum: [u8; 32] = bytes[32..64]
-            .try_into()
-            .expect("slice is 32 bytes");
+        let stored_checksum: [u8; 32] = bytes[32..64].try_into().expect("slice is 32 bytes");
 
         // Parse entry count
-        let count = u64::from_le_bytes(
-            bytes[64..72].try_into().expect("slice is 8 bytes")
-        ) as usize;
+        let count =
+            u64::from_le_bytes(bytes[64..72].try_into().expect("slice is 8 bytes")) as usize;
 
         // Parse entries
         let entry_size = 32 + 8 + 8; // digest + offset + size
@@ -346,14 +333,12 @@ impl DynamicIndex {
             pos += 32;
 
             // Safe: length verified by expected_len check above
-            let offset = u64::from_le_bytes(
-                bytes[pos..pos + 8].try_into().expect("slice is 8 bytes")
-            );
+            let offset =
+                u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("slice is 8 bytes"));
             pos += 8;
 
-            let size = u64::from_le_bytes(
-                bytes[pos..pos + 8].try_into().expect("slice is 8 bytes")
-            );
+            let size =
+                u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("slice is 8 bytes"));
             pos += 8;
 
             entries.push(IndexEntry {
