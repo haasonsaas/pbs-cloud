@@ -199,6 +199,17 @@ impl StorageBackend for LocalBackend {
         Ok(stats)
     }
 
+    async fn chunk_size(&self, digest: &ChunkDigest) -> StorageResult<u64> {
+        let path = self.chunk_path(digest);
+        match fs::metadata(&path).await {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::ChunkNotFound(digest.to_hex()))
+            }
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
     #[instrument(skip(self))]
     async fn read_file(&self, path: &str) -> StorageResult<Bytes> {
         let file_path = self.file_path(path);

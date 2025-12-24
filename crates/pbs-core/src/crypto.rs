@@ -7,7 +7,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use rand::RngCore;
-use sha2::{Digest, Sha256};
+use scrypt::{scrypt, Params as ScryptParams};
 use zstd::stream::{decode_all, encode_all};
 
 use crate::error::{Error, Result};
@@ -29,14 +29,14 @@ impl EncryptionKey {
         Self(bytes)
     }
 
-    /// Derive a key from a password using SHA-256 (simplified, PBS uses scrypt)
-    pub fn from_password(password: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let result = hasher.finalize();
+    /// Derive a key from a password using scrypt (PBS-compatible KDF)
+    pub fn from_password(password: &str, salt: &[u8]) -> Result<Self> {
+        let params = ScryptParams::recommended()
+            .map_err(|e| Error::Encryption(e.to_string()))?;
         let mut key = [0u8; 32];
-        key.copy_from_slice(&result);
-        Self(key)
+        scrypt(password.as_bytes(), salt, &params, &mut key)
+            .map_err(|e| Error::Encryption(e.to_string()))?;
+        Ok(Self(key))
     }
 
     /// Get the raw key bytes

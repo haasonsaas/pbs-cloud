@@ -40,6 +40,9 @@ pub trait StorageBackend: ChunkWriter {
     /// Get backend statistics
     async fn stats(&self) -> StorageResult<BackendStats>;
 
+    /// Get stored size for a chunk (encoded bytes on backend)
+    async fn chunk_size(&self, digest: &ChunkDigest) -> StorageResult<u64>;
+
     /// Read a file (blob, index, manifest)
     async fn read_file(&self, path: &str) -> StorageResult<Bytes>;
 

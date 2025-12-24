@@ -122,7 +122,7 @@ impl BackupProtocolHandler {
         digest: ChunkDigest,
         data: Vec<u8>,
     ) -> Result<bool, ApiError> {
-        // Same as fixed chunk for now
+        // Dynamic chunks are stored the same as fixed chunks
         self.upload_fixed_chunk(session_id, tenant_id, digest, data).await
     }
 
@@ -277,12 +277,14 @@ impl BackupProtocolHandler {
     }
 
     /// Check known chunks (for deduplication)
-    /// Note: Session ownership is verified at the server handler level
     pub async fn check_known_chunks(
         &self,
-        _session_id: &str,
+        session_id: &str,
+        tenant_id: &str,
         digests: &[ChunkDigest],
     ) -> Result<Vec<bool>, ApiError> {
+        // Verify session ownership
+        self.state.sessions.verify_session_ownership(session_id, tenant_id).await?;
         let datastore = self.state.default_datastore();
         let mut results = Vec::with_capacity(digests.len());
 
@@ -382,13 +384,18 @@ impl ReaderProtocolHandler {
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
         // Verify reader session ownership
-        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+        self.state
+            .sessions
+            .verify_reader_session_ownership(session_id, tenant_id)
+            .await?;
 
-        // We need to get the snapshot path from the session, then read from datastore
-        let datastore = self.state.default_datastore();
-        let path = format!("{}", name); // Simplified - in real code get from session
-        let index = datastore.read_fixed_index(&path).await
-            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+        let index = self
+            .state
+            .sessions
+            .with_reader_session_async(session_id, |session| async move {
+                session.read_fixed_index(name).await
+            })
+            .await?;
         Ok(index.to_bytes())
     }
 
@@ -400,12 +407,18 @@ impl ReaderProtocolHandler {
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
         // Verify reader session ownership
-        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+        self.state
+            .sessions
+            .verify_reader_session_ownership(session_id, tenant_id)
+            .await?;
 
-        let datastore = self.state.default_datastore();
-        let path = format!("{}", name);
-        let index = datastore.read_dynamic_index(&path).await
-            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+        let index = self
+            .state
+            .sessions
+            .with_reader_session_async(session_id, |session| async move {
+                session.read_dynamic_index(name).await
+            })
+            .await?;
         Ok(index.to_bytes())
     }
 
@@ -417,12 +430,17 @@ impl ReaderProtocolHandler {
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
         // Verify reader session ownership
-        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+        self.state
+            .sessions
+            .verify_reader_session_ownership(session_id, tenant_id)
+            .await?;
 
-        let datastore = self.state.default_datastore();
-        let path = format!("{}", name);
-        datastore.read_blob(&path).await
-            .map_err(|e| ApiError::not_found(&e.to_string()))
+        self.state
+            .sessions
+            .with_reader_session_async(session_id, |session| async move {
+                session.read_blob(name).await
+            })
+            .await
     }
 
     /// Read the manifest
@@ -432,10 +450,20 @@ impl ReaderProtocolHandler {
         tenant_id: &str,
     ) -> Result<String, ApiError> {
         // Verify reader session ownership
-        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
-        // For now, return a stub - in real implementation, read from session's snapshot path
-        let manifest = pbs_core::BackupManifest::new("vm", "backup-1");
-        manifest.to_json()
+        self.state
+            .sessions
+            .verify_reader_session_ownership(session_id, tenant_id)
+            .await?;
+
+        let manifest = self
+            .state
+            .sessions
+            .with_reader_session_async(session_id, |session| async move {
+                session.load_manifest().await.map(|m| m.clone())
+            })
+            .await?;
+        manifest
+            .to_json()
             .map_err(|e| ApiError::internal(&e.to_string()))
     }
 

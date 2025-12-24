@@ -62,6 +62,8 @@ pub struct ServerState {
     pub persistence: Arc<PersistenceManager>,
     /// TLS acceptor (None if TLS disabled)
     pub tls_acceptor: Option<TlsAcceptor>,
+    /// Server start time
+    pub start_time: Instant,
 }
 
 impl ServerState {
@@ -91,7 +93,12 @@ impl ServerState {
         let mut datastores = HashMap::new();
         datastores.insert("default".to_string(), default_ds);
 
-        let (billing, _rx) = BillingManager::new();
+        let (billing, billing_rx) = BillingManager::new();
+        let billing = Arc::new(billing);
+        let billing_dispatch = billing.clone();
+        tokio::spawn(async move {
+            billing_dispatch.run_dispatcher(billing_rx).await;
+        });
 
         // Initialize persistence
         let persistence_config = PersistenceConfig::new(
@@ -143,11 +150,12 @@ impl ServerState {
             sessions: Arc::new(SessionManager::default()),
             auth,
             tenants,
-            billing: Arc::new(billing),
+            billing,
             rate_limiter,
             metrics,
             persistence,
             tls_acceptor,
+            start_time: Instant::now(),
         })
     }
 
@@ -757,8 +765,7 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
         Err(_) => return bad_request("Invalid JSON"),
     };
 
-    // For now, we only support token-based auth
-    // Password field would contain the API token
+    // Token-based auth: password field contains the API token
     match state.auth.authenticate_token(&params.password).await {
         Ok(ctx) => {
             let response = serde_json::json!({
@@ -844,7 +851,38 @@ async fn handle_datastore_api(
             json_response(StatusCode::OK, &serde_json::json!({"data": group_info}))
         }
         "snapshots" => {
-            json_response(StatusCode::OK, &serde_json::json!({"data": []}))
+            let groups = datastore.list_backup_groups().await.unwrap_or_default();
+            let mut snapshots = Vec::new();
+
+            for group in groups {
+                let times = datastore
+                    .list_snapshots(&group.backup_type, &group.backup_id)
+                    .await
+                    .unwrap_or_default();
+
+                for time in times {
+                    let manifest_path = format!(
+                        "{}/{}/{}/index.json",
+                        group.backup_type, group.backup_id, time
+                    );
+                    let size = datastore
+                        .read_manifest(&manifest_path)
+                        .await
+                        .map(|m| m.files.iter().map(|f| f.size).sum())
+                        .unwrap_or(0);
+
+                    snapshots.push(serde_json::json!({
+                        "backup-type": group.backup_type,
+                        "backup-id": group.backup_id,
+                        "backup-time": time,
+                        "size": size,
+                        "protected": false,
+                        "comment": null
+                    }));
+                }
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": snapshots}))
         }
         _ => not_found(),
     }
@@ -854,7 +892,7 @@ async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
     let status = serde_json::json!({
         "data": {
-            "uptime": 0,
+            "uptime": state.start_time.elapsed().as_secs(),
             "tasks": {
                 "running": backup_sessions + reader_sessions,
                 "scheduled": 0
@@ -1215,7 +1253,10 @@ async fn handle_known_chunks(
     };
 
     let handler = BackupProtocolHandler::new(state.clone());
-    match handler.check_known_chunks(&session_id, &digests).await {
+    match handler
+        .check_known_chunks(&session_id, &ctx.user.tenant_id, &digests)
+        .await
+    {
         Ok(known) => json_response(StatusCode::OK, &serde_json::json!({"data": {"known": known}})),
         Err(e) => error_response(e),
     }

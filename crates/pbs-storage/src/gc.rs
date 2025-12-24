@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use pbs_core::ChunkDigest;
+use chrono::Datelike;
 use tracing::{info, warn, instrument};
 
 use crate::backend::StorageBackend;
@@ -100,11 +101,13 @@ impl GarbageCollector {
         } else {
             info!("Phase 4: Deleting {} orphaned chunks...", orphaned_chunks.len());
             for digest in &orphaned_chunks {
+                let size = self.backend.chunk_size(digest).await.ok();
                 match self.backend.delete_chunk(digest).await {
                     Ok(()) => {
                         result.chunks_deleted += 1;
-                        // We don't know the size without reading, so we estimate
-                        result.bytes_freed += 1; // Placeholder
+                        if let Some(size) = size {
+                            result.bytes_freed = result.bytes_freed.saturating_add(size);
+                        }
                     }
                     Err(e) => {
                         result.errors.push(format!("Failed to delete {}: {}", digest, e));
@@ -272,29 +275,29 @@ impl Pruner {
             }
         }
 
-        // Keep daily (simplified - just keep first per day)
+        // Keep daily (first snapshot per day)
         if let Some(n) = options.keep_daily {
             let mut days_seen = HashSet::new();
             for snapshot in &snapshots {
-                // Extract date part (YYYY-MM-DD)
-                if let Some(date) = snapshot.split('T').next() {
-                    if days_seen.len() < n && !days_seen.contains(date) {
-                        days_seen.insert(date.to_string());
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(snapshot) {
+                    let date = dt.date_naive();
+                    if days_seen.len() < n && !days_seen.contains(&date) {
+                        days_seen.insert(date);
                         keep_set.insert(snapshot.clone());
                     }
                 }
             }
         }
 
-        // Keep weekly (simplified)
+        // Keep weekly (ISO week, first snapshot per week)
         if let Some(n) = options.keep_weekly {
             let mut weeks_seen = HashSet::new();
             for snapshot in &snapshots {
-                // Use first 7 chars of date as week approximation
-                if snapshot.len() >= 10 {
-                    let week_key = &snapshot[..7]; // YYYY-WW approximation
-                    if weeks_seen.len() < n && !weeks_seen.contains(week_key) {
-                        weeks_seen.insert(week_key.to_string());
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(snapshot) {
+                    let week = dt.iso_week();
+                    let week_key = (week.year(), week.week());
+                    if weeks_seen.len() < n && !weeks_seen.contains(&week_key) {
+                        weeks_seen.insert(week_key);
                         keep_set.insert(snapshot.clone());
                     }
                 }
@@ -305,10 +308,10 @@ impl Pruner {
         if let Some(n) = options.keep_monthly {
             let mut months_seen = HashSet::new();
             for snapshot in &snapshots {
-                if snapshot.len() >= 7 {
-                    let month_key = &snapshot[..7]; // YYYY-MM
-                    if months_seen.len() < n && !months_seen.contains(month_key) {
-                        months_seen.insert(month_key.to_string());
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(snapshot) {
+                    let month_key = (dt.year(), dt.month());
+                    if months_seen.len() < n && !months_seen.contains(&month_key) {
+                        months_seen.insert(month_key);
                         keep_set.insert(snapshot.clone());
                     }
                 }
@@ -319,10 +322,10 @@ impl Pruner {
         if let Some(n) = options.keep_yearly {
             let mut years_seen = HashSet::new();
             for snapshot in &snapshots {
-                if snapshot.len() >= 4 {
-                    let year_key = &snapshot[..4]; // YYYY
-                    if years_seen.len() < n && !years_seen.contains(year_key) {
-                        years_seen.insert(year_key.to_string());
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(snapshot) {
+                    let year_key = dt.year();
+                    if years_seen.len() < n && !years_seen.contains(&year_key) {
+                        years_seen.insert(year_key);
                         keep_set.insert(snapshot.clone());
                     }
                 }

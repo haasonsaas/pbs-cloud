@@ -39,6 +39,7 @@ zstd = "0.13"
 sha2 = "0.10"
 crc32fast = "1.4"
 rand = "0.8"
+scrypt = "0.11"
 
 # Storage backends
 aws-sdk-s3 = "1.61"

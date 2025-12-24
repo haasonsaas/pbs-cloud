@@ -3,6 +3,7 @@
 //! Tracks usage and sends events to billing systems via webhooks.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -184,9 +185,13 @@ impl BillingManager {
         if let Err(e) = self.event_tx.send(event.clone()).await {
             warn!("Failed to queue usage event: {}", e);
         }
+    }
 
-        // Also dispatch to webhooks synchronously for now
-        self.dispatch_webhooks(&event).await;
+    /// Run the webhook dispatcher loop
+    pub async fn run_dispatcher(self: Arc<Self>, mut rx: mpsc::Receiver<UsageEvent>) {
+        while let Some(event) = rx.recv().await {
+            self.dispatch_webhooks(&event).await;
+        }
     }
 
     /// Get usage for a tenant
@@ -335,12 +340,21 @@ pub struct UsageReport {
 }
 
 impl UsageReport {
-    /// Calculate estimated cost (simplified)
+    /// Calculate estimated cost for the report period (storage prorated by time)
     pub fn estimate_cost(&self, rates: &BillingRates) -> f64 {
         let storage_gb = self.storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let egress_gb = self.download_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let period_secs = (self.period_end - self.period_start)
+            .num_seconds()
+            .max(0) as f64;
+        let month_secs = 30.0 * 24.0 * 3600.0;
+        let month_fraction = if month_secs > 0.0 {
+            period_secs / month_secs
+        } else {
+            0.0
+        };
 
-        storage_gb * rates.storage_per_gb
+        storage_gb * rates.storage_per_gb * month_fraction
             + egress_gb * rates.egress_per_gb
             + (self.api_requests as f64 / 1000.0) * rates.api_per_1k
     }

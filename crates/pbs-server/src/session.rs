@@ -25,6 +25,7 @@ pub enum SessionState {
 }
 
 /// A backup session
+#[derive(Clone)]
 pub struct BackupSession {
     /// Session ID
     pub id: String,
@@ -229,6 +230,7 @@ impl BackupSession {
 }
 
 /// Builder for fixed indexes
+#[derive(Clone)]
 pub struct FixedIndexBuilder {
     index: FixedIndex,
 }
@@ -250,6 +252,7 @@ impl FixedIndexBuilder {
 }
 
 /// Builder for dynamic indexes
+#[derive(Clone)]
 pub struct DynamicIndexBuilder {
     index: DynamicIndex,
 }
@@ -277,6 +280,7 @@ impl Default for DynamicIndexBuilder {
 }
 
 /// A restore/reader session
+#[derive(Clone)]
 pub struct ReaderSession {
     /// Session ID
     pub id: String,
@@ -425,11 +429,9 @@ impl SessionManager {
     }
 
     /// Get a backup session
-    pub async fn get_backup_session(&self, _id: &str) -> Option<BackupSession> {
-        let _sessions = self.backup_sessions.read().await;
-        // We can't return a reference due to RwLock, so we need a different approach
-        // For now, return None - we'll refactor this
-        None
+    pub async fn get_backup_session(&self, id: &str) -> Option<BackupSession> {
+        let sessions = self.backup_sessions.read().await;
+        sessions.get(id).cloned()
     }
 
     /// Execute an operation on a backup session

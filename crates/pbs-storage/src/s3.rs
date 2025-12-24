@@ -221,6 +221,50 @@ impl S3Backend {
 
         Ok(keys)
     }
+
+    /// List objects with sizes for a prefix
+    async fn list_object_sizes(&self, prefix: &str) -> StorageResult<(u64, u64)> {
+        let full_prefix = self.with_prefix(prefix);
+        let mut continuation_token: Option<String> = None;
+        let mut count: u64 = 0;
+        let mut bytes: u64 = 0;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&full_prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| StorageError::S3(e.to_string()))?;
+
+            if let Some(contents) = response.contents {
+                for object in contents {
+                    count += 1;
+                    if let Some(size) = object.size {
+                        if size > 0 {
+                            bytes = bytes.saturating_add(size as u64);
+                        }
+                    }
+                }
+            }
+
+            if response.is_truncated.unwrap_or(false) {
+                continuation_token = response.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        Ok((count, bytes))
+    }
 }
 
 #[async_trait]
@@ -291,8 +335,38 @@ impl StorageBackend for S3Backend {
     }
 
     async fn stats(&self) -> StorageResult<BackendStats> {
-        // TODO: Implement proper stats collection
-        Ok(BackendStats::default())
+        let (chunk_count, chunk_bytes) = self.list_object_sizes("chunks/").await?;
+        let (file_count, file_bytes) = self.list_object_sizes("data/").await?;
+
+        Ok(BackendStats {
+            chunk_count,
+            chunk_bytes,
+            file_count,
+            file_bytes,
+            dedup_bytes: 0,
+        })
+    }
+
+    async fn chunk_size(&self, digest: &ChunkDigest) -> StorageResult<u64> {
+        let key = self.chunk_key(digest);
+        match self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.content_length.unwrap_or(0) as u64),
+            Err(e) => {
+                let service_error = e.into_service_error();
+                if service_error.is_not_found() {
+                    Err(StorageError::ChunkNotFound(digest.to_hex()))
+                } else {
+                    Err(StorageError::S3(service_error.to_string()))
+                }
+            }
+        }
     }
 
     #[instrument(skip(self))]
