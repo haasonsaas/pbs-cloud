@@ -14,11 +14,12 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use pbs_core::{ChunkDigest, CryptoConfig};
+use pbs_core::{BackupManifest, ChunkDigest, CryptoConfig};
 use pbs_storage::{
     Datastore, GarbageCollector, GcOptions, LocalBackend, PruneOptions, Pruner, S3Backend,
     StorageBackend,
 };
+use pbs_storage::error::StorageError;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, instrument, warn};
@@ -536,11 +537,10 @@ async fn handle_request(
             })
             .await
         }
-        (Method::GET, p) if p.starts_with("/api2/json/admin/datastore") => {
+        (_, p) if p.starts_with("/api2/json/admin/datastore") => {
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
-                let path = p.to_string();
-                async move { handle_datastore_api(state, &ctx, &path).await }
+                async move { handle_datastore_api(state, &ctx, req).await }
             })
             .await
         }
@@ -926,6 +926,124 @@ fn snapshot_to_epoch(snapshot: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+fn build_snapshot_path(
+    namespace: Option<&str>,
+    backup_type: &str,
+    backup_id: &str,
+    backup_time: &str,
+) -> String {
+    let base = format!("{}/{}/{}", backup_type, backup_id, backup_time);
+    let prefix = namespace_prefix(namespace);
+    if prefix.is_empty() {
+        base
+    } else {
+        format!("{}{}", prefix, base)
+    }
+}
+
+fn parse_backup_time_param(value: &str) -> Result<String, ApiError> {
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        let epoch: i64 = value
+            .parse()
+            .map_err(|_| ApiError::bad_request("Invalid backup-time"))?;
+        return epoch_to_rfc3339(epoch);
+    }
+    if chrono::DateTime::parse_from_rfc3339(value).is_ok() {
+        return Ok(value.to_string());
+    }
+    Err(ApiError::bad_request("Invalid backup-time"))
+}
+
+fn parse_bool_param(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+fn manifest_note_line(manifest: &BackupManifest) -> Option<String> {
+    manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("notes"))
+        .and_then(|v| v.as_str())
+        .and_then(|notes| notes.lines().next().map(|s| s.to_string()))
+}
+
+fn manifest_notes(manifest: &BackupManifest) -> Option<String> {
+    manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("notes"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn manifest_protected(manifest: &BackupManifest) -> bool {
+    let protected = manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("protected"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if protected {
+        return true;
+    }
+    manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("worm_retain_until"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt > chrono::Utc::now())
+        .unwrap_or(false)
+}
+
+fn update_manifest_unprotected(
+    manifest: &mut BackupManifest,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let mut unprotected = manifest
+        .unprotected
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = unprotected.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    } else {
+        let mut map = serde_json::Map::new();
+        map.insert(key.to_string(), value);
+        unprotected = serde_json::Value::Object(map);
+    }
+    manifest.unprotected = Some(unprotected);
+}
+
+fn namespace_depth(ns: &str) -> usize {
+    if ns.is_empty() {
+        0
+    } else {
+        ns.split('/').count()
+    }
+}
+
+fn namespace_matches(filter: &str, ns: Option<&str>) -> bool {
+    let value = ns.unwrap_or("");
+    if filter.is_empty() {
+        value.is_empty()
+    } else {
+        value == filter
+    }
+}
+
+fn namespace_is_descendant(root: &str, ns: Option<&str>) -> bool {
+    let value = ns.unwrap_or("");
+    if root.is_empty() {
+        return true;
+    }
+    value == root || value.starts_with(&format!("{}/", root))
+}
+
 fn namespace_prefix(namespace: Option<&str>) -> String {
     let ns = match namespace {
         Some(ns) if !ns.is_empty() => ns,
@@ -1208,11 +1326,58 @@ async fn handle_nodes() -> Response<Full<Bytes>> {
     json_response(StatusCode::OK, &nodes)
 }
 
+async fn collect_namespaces(datastore: Arc<Datastore>) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut namespaces = HashSet::new();
+    namespaces.insert(String::new()); // root
+
+    if let Ok(groups) = datastore.list_backup_groups().await {
+        for group in groups {
+            if let Some(ns) = group.namespace {
+                namespaces.insert(ns);
+            }
+        }
+    }
+
+    if let Ok(files) = datastore.backend().list_files("").await {
+        for file in files {
+            let Some(prefix) = file.strip_suffix("/.namespace") else {
+                continue;
+            };
+            if prefix.is_empty() {
+                namespaces.insert(String::new());
+                continue;
+            }
+            let parts: Vec<&str> = prefix.split('/').collect();
+            let mut idx = 0;
+            let mut ns_parts = Vec::new();
+            while idx + 1 < parts.len() && parts[idx] == "ns" {
+                let part = parts[idx + 1];
+                if part.is_empty() {
+                    ns_parts.clear();
+                    break;
+                }
+                ns_parts.push(part.to_string());
+                idx += 2;
+            }
+            if idx == parts.len() && !ns_parts.is_empty() {
+                namespaces.insert(ns_parts.join("/"));
+            }
+        }
+    }
+
+    let mut list: Vec<String> = namespaces.into_iter().collect();
+    list.sort();
+    list
+}
+
 async fn handle_datastore_api(
     state: Arc<ServerState>,
-    _ctx: &AuthContext,
-    path: &str,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let path = uri.path();
     let parts: Vec<&str> = path
         .trim_start_matches("/api2/json/admin/datastore/")
         .split('/')
@@ -1229,81 +1394,777 @@ async fn handle_datastore_api(
     }
 
     let ds_name = parts[0];
+    if let Err(e) = validate_datastore_name(ds_name) {
+        return error_response(e);
+    }
     let datastore = match state.get_datastore(ds_name) {
         Some(ds) => ds,
         None => return not_found(),
     };
 
-    // Route based on sub-path
-    if parts.len() == 1 {
-        // Datastore info
-        let stats = datastore.backend().stats().await.unwrap_or_default();
-        let info = serde_json::json!({
-            "data": {
-                "store": ds_name,
-                "total": stats.chunk_bytes + stats.file_bytes,
-                "used": stats.chunk_bytes + stats.file_bytes,
-                "avail": 0
-            }
-        });
-        return json_response(StatusCode::OK, &info);
-    }
+    let subpath = parts.get(1).copied().unwrap_or("");
+    let method = req.method().clone();
 
-    match parts[1] {
-        "groups" => {
+    match (method, subpath) {
+        (Method::GET, "") => {
+            let stats = datastore.backend().stats().await.unwrap_or_default();
+            let used = stats.chunk_bytes + stats.file_bytes;
+            let total = used.max(1);
+            let info = serde_json::json!({
+                "data": {
+                    "store": ds_name,
+                    "total": total,
+                    "used": used,
+                    "avail": total.saturating_sub(used),
+                }
+            });
+            json_response(StatusCode::OK, &info)
+        }
+        (Method::GET, "status") => {
+            let stats = datastore.backend().stats().await.unwrap_or_default();
+            let used = stats.chunk_bytes + stats.file_bytes;
+            let total = used.max(1);
+            let info = serde_json::json!({
+                "data": {
+                    "total": total,
+                    "used": used,
+                    "avail": total.saturating_sub(used),
+                }
+            });
+            json_response(StatusCode::OK, &info)
+        }
+        (Method::GET, "groups") => {
+            let namespace = get_query_param(&uri, "ns").unwrap_or_default();
+            if !namespace.is_empty() {
+                if let Err(e) = validate_backup_namespace(&namespace) {
+                    return error_response(e);
+                }
+            }
+
             let groups = datastore.list_backup_groups().await.unwrap_or_default();
-            let group_info: Vec<_> = groups
-                .iter()
-                .map(|g| {
-                    serde_json::json!({
-                        "ns": g.namespace,
-                        "backup-type": g.backup_type,
-                        "backup-id": g.backup_id
-                    })
-                })
-                .collect();
+            let mut group_info = Vec::new();
+
+            for group in groups {
+                if !namespace_matches(&namespace, group.namespace.as_deref()) {
+                    continue;
+                }
+                let snapshots = datastore
+                    .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                    .await
+                    .unwrap_or_default();
+                if snapshots.is_empty() {
+                    continue;
+                }
+                let mut last_epoch: i64 = 0;
+                let mut latest_snapshot: Option<String> = None;
+                for snapshot in &snapshots {
+                    if let Some(epoch) = snapshot_to_epoch(snapshot) {
+                        if epoch >= last_epoch {
+                            last_epoch = epoch;
+                            latest_snapshot = Some(snapshot.clone());
+                        }
+                    }
+                }
+
+                let mut files = Vec::new();
+                let mut comment = None;
+                if let Some(snapshot) = latest_snapshot {
+                    let snapshot_path = format!("{}/{}", group.path(), snapshot);
+                    if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
+                        files = manifest.files.iter().map(|f| f.filename.clone()).collect();
+                        comment = manifest_note_line(&manifest);
+                    }
+                }
+
+                let owner = datastore.read_group_owner(&group).await.ok().flatten();
+
+                group_info.push(serde_json::json!({
+                    "backup-type": group.backup_type,
+                    "backup-id": group.backup_id,
+                    "last-backup": last_epoch,
+                    "backup-count": snapshots.len() as u64,
+                    "files": files,
+                    "owner": owner,
+                    "comment": comment,
+                }));
+            }
+
             json_response(StatusCode::OK, &serde_json::json!({"data": group_info}))
         }
-        "snapshots" => {
+        (Method::GET, "snapshots") => {
+            let namespace = get_query_param(&uri, "ns").unwrap_or_default();
+            if !namespace.is_empty() {
+                if let Err(e) = validate_backup_namespace(&namespace) {
+                    return error_response(e);
+                }
+            }
+            let backup_type = get_query_param(&uri, "backup-type");
+            let backup_id = get_query_param(&uri, "backup-id");
+            if let Some(bt) = backup_type.as_deref() {
+                if let Err(e) = validate_backup_type(bt) {
+                    return error_response(e);
+                }
+            }
+            if let Some(bi) = backup_id.as_deref() {
+                if let Err(e) = validate_backup_id(bi) {
+                    return error_response(e);
+                }
+            }
+
             let groups = datastore.list_backup_groups().await.unwrap_or_default();
             let mut snapshots = Vec::new();
 
             for group in groups {
+                if !namespace_matches(&namespace, group.namespace.as_deref()) {
+                    continue;
+                }
+                if let Some(bt) = backup_type.as_deref() {
+                    if group.backup_type != bt {
+                        continue;
+                    }
+                }
+                if let Some(bi) = backup_id.as_deref() {
+                    if group.backup_id != bi {
+                        continue;
+                    }
+                }
+                let owner = datastore.read_group_owner(&group).await.ok().flatten();
                 let times = datastore
                     .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
                     .await
                     .unwrap_or_default();
 
                 for time in times {
+                    let backup_time = match snapshot_to_epoch(&time) {
+                        Some(epoch) => epoch,
+                        None => continue,
+                    };
                     let snapshot_path = format!("{}/{}", group.path(), time);
-                    let (size, protected) = datastore
-                        .read_manifest_any(&snapshot_path)
-                        .await
-                        .map(|m| {
-                            let size = m.files.iter().map(|f| f.size).sum();
-                            let protected = m.unprotected.as_ref().and_then(|v| {
-                                v.get("worm_retain_until")
-                                    .and_then(|s| s.as_str())
-                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                    .map(|dt| dt > chrono::Utc::now())
-                            }).unwrap_or(false);
-                            (size, protected)
-                        })
-                        .unwrap_or((0, false));
+                    let mut files = Vec::new();
+                    let mut size: Option<u64> = None;
+                    let mut comment = None;
+                    let mut protected = false;
+                    if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
+                        files = manifest
+                            .files
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "filename": f.filename,
+                                    "size": f.size,
+                                })
+                            })
+                            .collect();
+                        size = Some(manifest.files.iter().map(|f| f.size).sum());
+                        comment = manifest_note_line(&manifest);
+                        protected = manifest_protected(&manifest);
+                    }
 
                     snapshots.push(serde_json::json!({
-                        "ns": group.namespace,
                         "backup-type": group.backup_type,
                         "backup-id": group.backup_id,
-                        "backup-time": time,
+                        "backup-time": backup_time,
+                        "files": files,
                         "size": size,
+                        "comment": comment,
                         "protected": protected,
-                        "comment": null
+                        "owner": owner,
                     }));
                 }
             }
 
             json_response(StatusCode::OK, &serde_json::json!({"data": snapshots}))
+        }
+        (Method::DELETE, "snapshots") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+
+            match datastore
+                .delete_snapshot(namespace.as_deref(), &backup_type, &backup_id, &backup_time)
+                .await
+            {
+                Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"data": null})),
+                Err(StorageError::SnapshotProtected(reason)) => {
+                    bad_request(&format!("Snapshot is protected until {}", reason))
+                }
+                Err(StorageError::SnapshotNotFound(_)) => not_found(),
+                Err(e) => error_response(ApiError::internal(&e.to_string())),
+            }
+        }
+        (Method::GET, "files") => {
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            let mut files = Vec::new();
+
+            if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
+                files.extend(manifest.files.iter().map(|f| {
+                    serde_json::json!({
+                        "filename": f.filename,
+                        "size": f.size,
+                    })
+                }));
+            }
+
+            let log_path = format!("{}/client.log.blob", snapshot_path);
+            if let Ok(data) = datastore.backend().read_file(&log_path).await {
+                files.push(serde_json::json!({
+                    "filename": "client.log.blob",
+                    "size": data.len() as u64,
+                }));
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": files}))
+        }
+        (Method::POST, "upload-backup-log") => {
+            if !ctx.allows(Permission::Backup) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            let log_path = format!("{}/client.log.blob", snapshot_path);
+            if datastore.backend().read_file(&log_path).await.is_ok() {
+                return bad_request("Backup log already exists");
+            }
+
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(_) => return bad_request("Failed to read log data"),
+            };
+            if let Err(e) = pbs_core::DataBlob::from_bytes(&body) {
+                return bad_request(&format!("Invalid data blob: {}", e));
+            }
+
+            match datastore.store_blob(&log_path, &body).await {
+                Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"data": null})),
+                Err(e) => error_response(ApiError::internal(&e.to_string())),
+            }
+        }
+        (Method::GET, "notes") => {
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            match datastore.read_manifest_any(&snapshot_path).await {
+                Ok(manifest) => {
+                    let notes = manifest_notes(&manifest).unwrap_or_default();
+                    json_response(StatusCode::OK, &serde_json::json!({"data": notes}))
+                }
+                Err(e) => error_response(ApiError::not_found(&e.to_string())),
+            }
+        }
+        (Method::PUT, "notes") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let notes = match get_query_param(&uri, "notes") {
+                Some(v) => v,
+                None => return bad_request("Missing notes"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            match datastore.read_manifest_any(&snapshot_path).await {
+                Ok(mut manifest) => {
+                    update_manifest_unprotected(&mut manifest, "notes", notes.into());
+                    if let Err(e) = datastore.store_manifest_at(&snapshot_path, &manifest).await {
+                        return error_response(ApiError::internal(&e.to_string()));
+                    }
+                    json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+                }
+                Err(e) => error_response(ApiError::not_found(&e.to_string())),
+            }
+        }
+        (Method::GET, "protected") => {
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            match datastore.read_manifest_any(&snapshot_path).await {
+                Ok(manifest) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"data": manifest_protected(&manifest)}),
+                ),
+                Err(e) => error_response(ApiError::not_found(&e.to_string())),
+            }
+        }
+        (Method::PUT, "protected") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let backup_type = match get_query_param(&uri, "backup-type") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-type"),
+            };
+            let backup_id = match get_query_param(&uri, "backup-id") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-id"),
+            };
+            let backup_time = match get_query_param(&uri, "backup-time") {
+                Some(v) => v,
+                None => return bad_request("Missing backup-time"),
+            };
+            let protected = match get_query_param(&uri, "protected")
+                .as_deref()
+                .and_then(parse_bool_param)
+            {
+                Some(value) => value,
+                None => return bad_request("Missing protected"),
+            };
+            let namespace = get_query_param(&uri, "ns");
+            if let Err(e) = validate_backup_params_with_ns(
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.as_deref(),
+                None,
+            ) {
+                return error_response(e);
+            }
+            let backup_time = match parse_backup_time_param(&backup_time) {
+                Ok(t) => t,
+                Err(e) => return error_response(e),
+            };
+            let snapshot_path = build_snapshot_path(
+                namespace.as_deref(),
+                &backup_type,
+                &backup_id,
+                &backup_time,
+            );
+            match datastore.read_manifest_any(&snapshot_path).await {
+                Ok(mut manifest) => {
+                    update_manifest_unprotected(
+                        &mut manifest,
+                        "protected",
+                        serde_json::Value::Bool(protected),
+                    );
+                    if let Err(e) = datastore.store_manifest_at(&snapshot_path, &manifest).await {
+                        return error_response(ApiError::internal(&e.to_string()));
+                    }
+                    json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+                }
+                Err(e) => error_response(ApiError::not_found(&e.to_string())),
+            }
+        }
+        (Method::GET, "namespace") => {
+            let parent = get_query_param(&uri, "parent").unwrap_or_default();
+            if !parent.is_empty() {
+                if let Err(e) = validate_backup_namespace(&parent) {
+                    return error_response(e);
+                }
+            }
+            let max_depth = get_query_param(&uri, "max-depth")
+                .and_then(|v| v.parse::<usize>().ok());
+            let parent_depth = namespace_depth(&parent);
+
+            let namespaces = collect_namespaces(datastore.clone()).await;
+            let mut list = Vec::new();
+            for ns in namespaces {
+                if !parent.is_empty() {
+                    if ns != parent && !ns.starts_with(&format!("{}/", parent)) {
+                        continue;
+                    }
+                    let depth = namespace_depth(&ns);
+                    if let Some(max) = max_depth {
+                        if depth.saturating_sub(parent_depth) > max {
+                            continue;
+                        }
+                    }
+                } else if let Some(max) = max_depth {
+                    if namespace_depth(&ns) > max {
+                        continue;
+                    }
+                }
+                list.push(serde_json::json!({
+                    "ns": ns,
+                    "comment": null,
+                }));
+            }
+            json_response(StatusCode::OK, &serde_json::json!({"data": list}))
+        }
+        (Method::POST, "namespace") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+            #[derive(serde::Deserialize)]
+            struct NamespaceCreate {
+                #[serde(default)]
+                parent: Option<String>,
+                name: String,
+            }
+            let params: NamespaceCreate = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(_) => return bad_request("Invalid JSON"),
+            };
+            let parent = params.parent.unwrap_or_default();
+            if !parent.is_empty() {
+                if let Err(e) = validate_backup_namespace(&parent) {
+                    return error_response(e);
+                }
+            }
+            if let Err(e) = validate_backup_namespace(&params.name) {
+                return error_response(e);
+            }
+            let namespace = if parent.is_empty() {
+                params.name
+            } else {
+                format!("{}/{}", parent, params.name)
+            };
+            if let Err(e) = validate_backup_namespace(&namespace) {
+                return error_response(e);
+            }
+            let marker_path = format!("{}{}.namespace", namespace_prefix(Some(&namespace)), "");
+            if let Err(e) = datastore
+                .backend()
+                .write_file(&marker_path, Bytes::from_static(b"{}"))
+                .await
+            {
+                return error_response(ApiError::internal(&e.to_string()));
+            }
+            json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+        }
+        (Method::DELETE, "namespace") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let namespace = match get_query_param(&uri, "ns") {
+                Some(ns) => ns,
+                None => return bad_request("Missing ns"),
+            };
+            if namespace.is_empty() {
+                return bad_request("Root namespace cannot be deleted");
+            }
+            if let Err(e) = validate_backup_namespace(&namespace) {
+                return error_response(e);
+            }
+            let delete_groups = get_query_param(&uri, "delete-groups")
+                .as_deref()
+                .and_then(parse_bool_param)
+                .unwrap_or(false);
+
+            let groups = datastore.list_backup_groups().await.unwrap_or_default();
+            let mut target_groups = Vec::new();
+            for group in groups {
+                if namespace_is_descendant(&namespace, group.namespace.as_deref()) {
+                    target_groups.push(group);
+                }
+            }
+
+            if !delete_groups && !target_groups.is_empty() {
+                return bad_request("Namespace contains backup groups");
+            }
+
+            let marker_prefix = namespace_prefix(Some(&namespace));
+
+            if delete_groups {
+                for group in target_groups {
+                    let snapshots = datastore
+                        .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                        .await
+                        .unwrap_or_default();
+                    for snapshot in snapshots {
+                        if let Err(e) = datastore
+                            .delete_snapshot(group.namespace.as_deref(), &group.backup_type, &group.backup_id, &snapshot)
+                            .await
+                        {
+                            return error_response(ApiError::internal(&e.to_string()));
+                        }
+                    }
+                }
+                if let Ok(files) = datastore.backend().list_files(&marker_prefix).await {
+                    for file in files {
+                        if file.ends_with("/.namespace") {
+                            let _ = datastore.backend().delete_file(&file).await;
+                        }
+                    }
+                }
+            }
+
+            let marker_path = format!("{}{}.namespace", marker_prefix, "");
+            let _ = datastore.backend().delete_file(&marker_path).await;
+
+            json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+        }
+        (Method::POST, "change-owner") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+            #[derive(serde::Deserialize)]
+            struct ChangeOwnerRequest {
+                #[serde(rename = "backup-type")]
+                backup_type: String,
+                #[serde(rename = "backup-id")]
+                backup_id: String,
+                #[serde(rename = "new-owner")]
+                new_owner: String,
+                #[serde(default)]
+                ns: Option<String>,
+            }
+            let params: ChangeOwnerRequest = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(_) => return bad_request("Invalid JSON"),
+            };
+            if let Err(e) = validate_backup_type(&params.backup_type) {
+                return error_response(e);
+            }
+            if let Err(e) = validate_backup_id(&params.backup_id) {
+                return error_response(e);
+            }
+            if let Some(ns) = params.ns.as_deref() {
+                if let Err(e) = validate_backup_namespace(ns) {
+                    return error_response(e);
+                }
+            }
+            let group = pbs_storage::datastore::BackupGroup {
+                namespace: params.ns.clone(),
+                backup_type: params.backup_type.clone(),
+                backup_id: params.backup_id.clone(),
+            };
+            let snapshots = datastore
+                .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
+                .await
+                .unwrap_or_default();
+            if snapshots.is_empty() {
+                return not_found();
+            }
+            if let Err(e) = datastore.store_group_owner(&group, &params.new_owner).await {
+                return error_response(ApiError::internal(&e.to_string()));
+            }
+            json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+        }
+        (Method::POST, "gc") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+            #[derive(serde::Deserialize, Default)]
+            struct GcRequest {
+                #[serde(default)]
+                dry_run: bool,
+                max_delete: Option<usize>,
+            }
+            let params: GcRequest = if body.is_empty() {
+                GcRequest::default()
+            } else {
+                match serde_json::from_slice(&body) {
+                    Ok(p) => p,
+                    Err(_) => return bad_request("Invalid JSON"),
+                }
+            };
+            let backend = datastore.backend();
+            let gc = GarbageCollector::new(datastore, backend);
+            let options = GcOptions {
+                dry_run: params.dry_run,
+                max_delete: params.max_delete,
+            };
+            match gc.run(options).await {
+                Ok(result) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "data": {
+                            "chunks_scanned": result.chunks_scanned,
+                            "chunks_referenced": result.chunks_referenced,
+                            "chunks_orphaned": result.chunks_orphaned,
+                            "chunks_deleted": result.chunks_deleted,
+                            "bytes_freed": result.bytes_freed,
+                            "errors": result.errors
+                        }
+                    }),
+                ),
+                Err(e) => error_response(ApiError::internal(&e.to_string())),
+            }
+        }
+        (Method::POST, "prune") => {
+            if !ctx.allows(Permission::DatastoreAdmin) {
+                return error_response(ApiError::unauthorized("Insufficient permissions"));
+            }
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+            return handle_prune_body(state, ctx, ds_name, body).await;
         }
         _ => not_found(),
     }
@@ -2928,33 +3789,29 @@ async fn handle_gc_status(
     }
 }
 
-async fn handle_prune(
+#[derive(serde::Deserialize)]
+struct PruneRequest {
+    backup_type: String,
+    backup_id: String,
+    #[serde(default)]
+    ns: Option<String>,
+    #[serde(default)]
+    store: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    keep_last: Option<usize>,
+    keep_daily: Option<usize>,
+    keep_weekly: Option<usize>,
+    keep_monthly: Option<usize>,
+    keep_yearly: Option<usize>,
+}
+
+async fn handle_prune_body(
     state: Arc<ServerState>,
     ctx: &AuthContext,
-    req: Request<Incoming>,
+    store: &str,
+    body: Bytes,
 ) -> Response<Full<Bytes>> {
-    let body = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return bad_request("Failed to read request body"),
-    };
-
-    #[derive(serde::Deserialize)]
-    struct PruneRequest {
-        backup_type: String,
-        backup_id: String,
-        #[serde(default)]
-        ns: Option<String>,
-        #[serde(default)]
-        store: Option<String>,
-        #[serde(default)]
-        dry_run: bool,
-        keep_last: Option<usize>,
-        keep_daily: Option<usize>,
-        keep_weekly: Option<usize>,
-        keep_monthly: Option<usize>,
-        keep_yearly: Option<usize>,
-    }
-
     let params: PruneRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(_) => return bad_request("Invalid JSON"),
@@ -2974,15 +3831,14 @@ async fn handle_prune(
         }
     }
 
-    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
-    if let Err(e) = validate_datastore_name(&store) {
+    if let Err(e) = validate_datastore_name(store) {
         return error_response(e);
     }
-    let datastore = match state.get_datastore(&store) {
+    let datastore = match state.get_datastore(store) {
         Some(ds) => ds,
         None => return not_found(),
     };
-    let pruner = Pruner::new(datastore);
+    let pruner = Pruner::new(datastore.clone());
 
     let options = PruneOptions {
         keep_last: params.keep_last.or(Some(1)),
@@ -2999,7 +3855,7 @@ async fn handle_prune(
         params.backup_type, params.backup_id, params.dry_run
     );
 
-    match pruner
+    let result = match pruner
         .prune(
             &params.backup_type,
             &params.backup_id,
@@ -3008,29 +3864,71 @@ async fn handle_prune(
         )
         .await
     {
-        Ok(result) => {
-            // Audit log: prune completed
-            if !params.dry_run {
-                audit::log_prune_executed(
-                    &ctx.user.username,
-                    &ctx.user.tenant_id,
-                    result.pruned.len(),
-                );
-            }
+        Ok(result) => result,
+        Err(e) => return error_response(ApiError::internal(&e.to_string())),
+    };
 
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "data": {
-                        "kept": result.kept,
-                        "pruned": result.pruned,
-                        "errors": result.errors
-                    }
-                }),
-            )
-        }
-        Err(e) => error_response(ApiError::internal(&e.to_string())),
+    if !params.dry_run {
+        audit::log_prune_executed(&ctx.user.username, &ctx.user.tenant_id, result.pruned.len());
     }
+
+    let mut items = Vec::new();
+    let ns = params.ns.clone().unwrap_or_default();
+    let backup_type = params.backup_type.clone();
+    let backup_id = params.backup_id.clone();
+
+    for snapshot in result.kept.iter().chain(result.pruned.iter()) {
+        let keep = result.kept.contains(snapshot);
+        let backup_time = match snapshot_to_epoch(snapshot) {
+            Some(epoch) => epoch,
+            None => continue,
+        };
+        let snapshot_path = build_snapshot_path(
+            if ns.is_empty() { None } else { Some(ns.as_str()) },
+            &backup_type,
+            &backup_id,
+            snapshot,
+        );
+        let protected = datastore
+            .read_manifest_any(&snapshot_path)
+            .await
+            .map(|m| manifest_protected(&m))
+            .unwrap_or(false);
+        let mut item = serde_json::json!({
+            "backup-type": backup_type.clone(),
+            "backup-id": backup_id.clone(),
+            "backup-time": backup_time,
+            "keep": keep,
+            "protected": protected,
+        });
+        if !ns.is_empty() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("ns".to_string(), serde_json::Value::String(ns.clone()));
+            }
+        }
+        items.push(item);
+    }
+
+    json_response(StatusCode::OK, &serde_json::json!({"data": items}))
+}
+
+async fn handle_prune(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    let params: PruneRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return bad_request("Invalid JSON"),
+    };
+    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
+
+    handle_prune_body(state, ctx, &store, body).await
 }
 
 // === Response helpers ===

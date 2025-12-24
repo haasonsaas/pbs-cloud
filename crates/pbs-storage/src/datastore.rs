@@ -15,6 +15,9 @@ use tracing::{info, instrument};
 use crate::backend::StorageBackend;
 use crate::error::{StorageError, StorageResult};
 
+const GROUP_OWNER_FILE: &str = "owner";
+const LEGACY_GROUP_OWNER_FILE: &str = "owner.json";
+
 /// A datastore managing backups
 pub struct Datastore {
     /// Datastore name/ID
@@ -248,10 +251,11 @@ impl Datastore {
             timestamp
         );
         if let Ok(manifest) = self.read_manifest_any(&snapshot_path).await {
-            if let Some(until) = retention_until(&manifest) {
-                if until > Utc::now() {
+            if manifest_protected(&manifest) {
+                if let Some(until) = retention_until(&manifest) {
                     return Err(StorageError::SnapshotProtected(until.to_rfc3339()));
                 }
+                return Err(StorageError::SnapshotProtected("protected".to_string()));
             }
         }
 
@@ -268,6 +272,47 @@ impl Datastore {
         );
         Ok(())
     }
+
+    /// Read the owner for a backup group (if stored).
+    pub async fn read_group_owner(&self, group: &BackupGroup) -> StorageResult<Option<String>> {
+        let path = format!("{}/{}", group.path(), GROUP_OWNER_FILE);
+        let legacy_path = format!("{}/{}", group.path(), LEGACY_GROUP_OWNER_FILE);
+        match self.backend.read_file(&path).await {
+            Ok(data) => {
+                let text = String::from_utf8(data.to_vec())
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+                let owner = text.trim().to_string();
+                if owner.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(owner))
+                }
+            }
+            Err(StorageError::BlobNotFound(_)) => match self.backend.read_file(&legacy_path).await {
+                Ok(data) => {
+                    let text = String::from_utf8(data.to_vec())
+                        .map_err(|e| StorageError::Backend(e.to_string()))?;
+                    let owner = text.trim().to_string();
+                    if owner.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(owner))
+                    }
+                }
+                Err(StorageError::BlobNotFound(_)) => Ok(None),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Store the owner for a backup group.
+    pub async fn store_group_owner(&self, group: &BackupGroup, owner: &str) -> StorageResult<()> {
+        let path = format!("{}/{}", group.path(), GROUP_OWNER_FILE);
+        self.backend
+            .write_file(&path, Bytes::from(owner.to_string().into_bytes()))
+            .await
+    }
 }
 
 fn retention_until(manifest: &BackupManifest) -> Option<DateTime<Utc>> {
@@ -277,6 +322,22 @@ fn retention_until(manifest: &BackupManifest) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(until)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn manifest_protected(manifest: &BackupManifest) -> bool {
+    let protected = manifest
+        .unprotected
+        .as_ref()
+        .and_then(|v| v.get("protected"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if protected {
+        return true;
+    }
+    if let Some(until) = retention_until(manifest) {
+        return until > Utc::now();
+    }
+    false
 }
 
 /// A backup group (type + ID)

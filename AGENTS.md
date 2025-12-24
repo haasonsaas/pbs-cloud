@@ -4,6 +4,25 @@
 - PBS Cloud is a PBS-compatible backup server (Proxmox Backup Server protocol) with local/S3 backends, multi-tenancy, billing hooks, WORM retention, and compliance reporting.
 - Primary compatibility target: `proxmox-backup-client` over the HTTP/2 upgrade protocol.
 
+## Agent do / don't
+### Do
+- Keep changes small and focused; prefer minimal diffs over repo-wide rewrites.
+- Validate compatibility against upstream `proxmox/proxmox-backup` using `gh api` when touching protocol or admin endpoints.
+- Align response payloads with upstream `pbs-api-types` (field names and optional fields matter).
+- Update AGENTS.md when you change APIs, compatibility, or operational behavior.
+- Run `cargo test` and `helm lint ./charts/pbs-cloud` before pushing.
+
+### Don't
+- Do not change manifest format or storage layout without a migration plan.
+- Do not add heavy dependencies or new services without explicit approval.
+- Do not change auth semantics or API paths unless it is required for compatibility.
+
+## Compatibility checklist
+- Cross-check HTTP paths used by `proxmox-backup-client` (main.rs, snapshot.rs, namespace.rs).
+- Keep query params consistent: `backup-type`, `backup-id`, `backup-time`, `ns`, `store`.
+- Preserve DataBlob validation semantics for uploaded blobs and logs.
+- Prefer epoch timestamps in API responses (PBS expects Unix epoch for `backup-time`).
+
 ## Repo layout
 - `crates/pbs-core`: PBS formats (chunks, blobs, indexes, manifests, crypto).
 - `crates/pbs-storage`: datastore + backends (local, S3), GC + prune.
@@ -49,16 +68,34 @@
 - Query params supported on upgrade: `backup-type`, `backup-id`, `backup-time`, `ns` (namespace), `store` (datastore).
 - `backup-time` on upgrade is a Unix epoch; stored internally as RFC3339.
 
+## Admin/REST compatibility (proxmox-backup-client)
+- `/api2/json/admin/datastore` (GET) list datastores.
+- `/api2/json/admin/datastore/<store>` (GET) datastore stats.
+- `/api2/json/admin/datastore/<store>/status` (GET) datastore stats.
+- `/api2/json/admin/datastore/<store>/groups` (GET) group listing.
+- `/api2/json/admin/datastore/<store>/snapshots` (GET, DELETE) snapshot listing and deletion.
+- `/api2/json/admin/datastore/<store>/files` (GET) snapshot file list.
+- `/api2/json/admin/datastore/<store>/upload-backup-log` (POST) upload `client.log.blob`.
+- `/api2/json/admin/datastore/<store>/notes` (GET, PUT) snapshot notes.
+- `/api2/json/admin/datastore/<store>/protected` (GET, PUT) snapshot protection.
+- `/api2/json/admin/datastore/<store>/namespace` (GET, POST, DELETE) namespace operations.
+- `/api2/json/admin/datastore/<store>/change-owner` (POST) group ownership.
+- `/api2/json/admin/datastore/<store>/gc` (POST) GC.
+- `/api2/json/admin/datastore/<store>/prune` (POST) prune.
+
 ## Storage layout
 - Manifests: `index.json.blob` (DataBlob-encoded JSON), with legacy fallback to `index.json`.
 - Indexes: raw `.fidx`/`.didx` bytes (no DataBlob wrapper).
 - Chunks: DataBlob bytes (client-encoded for H2 uploads).
 - Namespace prefixes: `ns/<segment>/` repeated per namespace level.
+- Group owner file: `owner` (first line is `Authid`).
 
 ## Shortcuts / compatibility gaps
 - Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
 - If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
 - Admin/REST surface is a focused subset of PBS APIs (no task scheduler or UI-specific endpoints).
+- Namespace comments are not stored (API always returns `comment: null`).
+- Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.
