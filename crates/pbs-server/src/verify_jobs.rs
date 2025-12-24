@@ -43,6 +43,9 @@ pub struct VerificationJobState {
     pub last_run_upid: Option<String>,
     pub last_run_state: Option<String>,
     pub last_run_endtime: Option<i64>,
+    pub last_run_time: Option<i64>,
+    pub next_run: Option<i64>,
+    pub last_schedule: Option<String>,
 }
 
 impl VerificationJobState {
@@ -52,6 +55,9 @@ impl VerificationJobState {
             last_run_upid: None,
             last_run_state: None,
             last_run_endtime: None,
+            last_run_time: None,
+            next_run: None,
+            last_schedule: None,
         }
     }
 }

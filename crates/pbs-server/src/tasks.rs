@@ -345,6 +345,43 @@ impl TaskRegistry {
         (list, total)
     }
 
+    pub async fn list_by_worker(
+        &self,
+        worker_type: &str,
+        worker_id: &str,
+        start: usize,
+        limit: usize,
+        newest_first: bool,
+    ) -> (Vec<TaskSnapshot>, usize) {
+        let tasks = self.tasks.read().await;
+        let order = self.order.read().await;
+        let mut data = Vec::new();
+        let mut matched = 0usize;
+        let mut collected = 0usize;
+
+        let iter: Box<dyn Iterator<Item = &String>> = if newest_first {
+            Box::new(order.iter().rev())
+        } else {
+            Box::new(order.iter())
+        };
+
+        for upid in iter {
+            let Some(task) = tasks.get(upid) else {
+                continue;
+            };
+            if task.worker_type != worker_type || task.worker_id.as_deref() != Some(worker_id) {
+                continue;
+            }
+            if matched >= start && collected < limit {
+                data.push(TaskSnapshot::from(task.clone()));
+                collected += 1;
+            }
+            matched += 1;
+        }
+
+        (data, matched)
+    }
+
     pub async fn log_entries(
         &self,
         upid: &str,
@@ -460,5 +497,44 @@ mod tests {
             .last()
             .expect("log has entries")
             .ends_with("line 1199"));
+    }
+
+    #[tokio::test]
+    async fn test_list_by_worker() {
+        let registry = TaskRegistry::new("node");
+        let upid_a = registry
+            .create(
+                "user@pam",
+                "verificationjob",
+                Some("store:job1"),
+                Some("store"),
+            )
+            .await;
+        let _upid_b = registry
+            .create("user@pam", "backup", Some("store"), Some("store"))
+            .await;
+        let upid_c = registry
+            .create(
+                "user@pam",
+                "verificationjob",
+                Some("store:job1"),
+                Some("store"),
+            )
+            .await;
+
+        let (items, total) = registry
+            .list_by_worker("verificationjob", "store:job1", 0, 10, true)
+            .await;
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].upid, upid_c);
+        assert_eq!(items[1].upid, upid_a);
+
+        let (items, total) = registry
+            .list_by_worker("verificationjob", "store:job1", 1, 1, true)
+            .await;
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upid, upid_a);
     }
 }

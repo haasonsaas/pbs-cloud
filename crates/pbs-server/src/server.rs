@@ -578,10 +578,6 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                         .await;
                     }
                 } else {
-                    let job_states = {
-                        let guard = state_for_verify.verify_job_state.read().await;
-                        guard.clone()
-                    };
                     for job in jobs {
                         let worker_id = format!("{}:{}", job.store, job.id);
                         if running_workers.contains(&worker_id) {
@@ -598,25 +594,12 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                             }
                         };
 
-                        let last_run = job_last_run_time(job_states.get(&job.id));
-                        let next_run = if let Some(schedule) = job.schedule.as_deref() {
-                            let spec = match parse_calendar_event(schedule) {
-                                Ok(spec) => spec,
-                                Err(err) => {
-                                    warn!(
-                                        "Skipping verification job {} (invalid schedule): {}",
-                                        job.id, err.message
-                                    );
-                                    continue;
-                                }
-                            };
-                            let base = last_run.unwrap_or(now);
-                            let base_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0);
-                            base_dt
-                                .and_then(|dt| next_calendar_run(&spec, dt))
-                                .map(|dt| dt.timestamp())
-                        } else {
-                            compute_next_run(None, last_run, now, interval_secs)
+                        let next_run = {
+                            let mut guard = state_for_verify.verify_job_state.write().await;
+                            let entry = guard
+                                .entry(job.id.clone())
+                                .or_insert_with(|| VerificationJobState::new(&job.id));
+                            compute_next_run_cached(&job, entry, now, interval_secs)
                         };
                         let Some(next_run) = next_run else {
                             continue;
@@ -1565,6 +1548,7 @@ enum FieldItem {
     Single(u32),
     Range(u32, u32),
     Step { start: u32, step: u32 },
+    LastDay,
 }
 
 #[derive(Clone, Debug)]
@@ -1677,10 +1661,10 @@ fn parse_timezone_token(token: &str) -> Result<Option<CalendarTimezone>, ApiErro
         return parse_fixed_offset(trimmed).map(|offset| Some(CalendarTimezone::Fixed(offset)));
     }
     if trimmed.contains('/') && trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
-        let tz = trimmed
-            .parse::<Tz>()
-            .map_err(|_| ApiError::bad_request("Invalid schedule timezone"))?;
-        return Ok(Some(CalendarTimezone::Named(tz)));
+        if let Ok(tz) = trimmed.parse::<Tz>() {
+            return Ok(Some(CalendarTimezone::Named(tz)));
+        }
+        return Ok(None);
     }
     Ok(None)
 }
@@ -1693,6 +1677,29 @@ fn parse_numeric_value(value: &str, min: u32, max: u32) -> Result<u32, ApiError>
         return Err(ApiError::bad_request("Schedule value out of range"));
     }
     Ok(parsed)
+}
+
+fn parse_month_value(value: &str) -> Result<u32, ApiError> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    let month = match trimmed.as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    };
+    if let Some(value) = month {
+        return Ok(value);
+    }
+    parse_numeric_value(value, 1, 12)
 }
 
 fn parse_field_items<T>(
@@ -1803,19 +1810,71 @@ fn parse_weekday_field(value: &str) -> Result<FieldMatch, ApiError> {
     Ok(FieldMatch::Items(items))
 }
 
+fn parse_day_field(value: &str) -> Result<FieldMatch, ApiError> {
+    let mut items = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim().to_ascii_lowercase();
+        if part.is_empty() {
+            continue;
+        }
+        if part == "*" {
+            return Ok(FieldMatch::Any);
+        }
+        if part == "last" || part == "l" {
+            items.push(FieldItem::LastDay);
+            continue;
+        }
+        if let Some((left, right)) = part.split_once('/') {
+            if left.contains("..") || left == "last" || left == "l" {
+                return Err(ApiError::bad_request("Invalid schedule day"));
+            }
+            let start = if left == "*" {
+                1
+            } else {
+                parse_numeric_value(left, 1, 31)?
+            };
+            let step = parse_numeric_value(right, 1, 31)?;
+            items.push(FieldItem::Step { start, step });
+            continue;
+        }
+        if let Some((start, end)) = part.split_once("..") {
+            let start = if start == "*" {
+                1
+            } else {
+                parse_numeric_value(start, 1, 31)?
+            };
+            let end = if end == "*" {
+                31
+            } else {
+                parse_numeric_value(end, 1, 31)?
+            };
+            if start > end {
+                return Err(ApiError::bad_request("Invalid schedule day range"));
+            }
+            items.push(FieldItem::Range(start, end));
+            continue;
+        }
+        items.push(FieldItem::Single(parse_numeric_value(&part, 1, 31)?));
+    }
+    if items.is_empty() {
+        return Err(ApiError::bad_request("Invalid schedule day"));
+    }
+    Ok(FieldMatch::Items(items))
+}
+
 fn parse_date_field(value: &str) -> Result<(FieldMatch, FieldMatch, FieldMatch), ApiError> {
     let parts: Vec<&str> = value.split('-').collect();
     match parts.len() {
         2 => {
-            let months = parse_field_items(parts[0], 1, 12, |v| parse_numeric_value(v, 1, 12))?;
-            let days = parse_field_items(parts[1], 1, 31, |v| parse_numeric_value(v, 1, 31))?;
+            let months = parse_field_items(parts[0], 1, 12, parse_month_value)?;
+            let days = parse_day_field(parts[1])?;
             Ok((FieldMatch::Any, months, days))
         }
         3 => {
             let years =
                 parse_field_items(parts[0], 1970, 9999, |v| parse_numeric_value(v, 1970, 9999))?;
-            let months = parse_field_items(parts[1], 1, 12, |v| parse_numeric_value(v, 1, 12))?;
-            let days = parse_field_items(parts[2], 1, 31, |v| parse_numeric_value(v, 1, 31))?;
+            let months = parse_field_items(parts[1], 1, 12, parse_month_value)?;
+            let days = parse_day_field(parts[2])?;
             Ok((years, months, days))
         }
         _ => Err(ApiError::bad_request("Invalid schedule date")),
@@ -1863,6 +1922,7 @@ fn expand_field(field: &FieldMatch, min: u32, max: u32) -> Vec<u32> {
                             value = value.saturating_add(*step);
                         }
                     }
+                    FieldItem::LastDay => {}
                 }
             }
             values.sort_unstable();
@@ -1879,6 +1939,30 @@ fn field_matches(field: &FieldMatch, value: u32) -> bool {
             FieldItem::Single(v) => *v == value,
             FieldItem::Range(start, end) => value >= *start && value <= *end,
             FieldItem::Step { start, step } => value >= *start && (value - *start) % *step == 0,
+            FieldItem::LastDay => false,
+        }),
+    }
+}
+
+fn last_day_of_month(year: i32, month: u32) -> Option<u32> {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_next = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)?;
+    let last_day = first_next - chrono::Duration::days(1);
+    Some(last_day.day())
+}
+
+fn day_matches(field: &FieldMatch, day: u32, year: i32, month: u32) -> bool {
+    match field {
+        FieldMatch::Any => true,
+        FieldMatch::Items(items) => items.iter().any(|item| match item {
+            FieldItem::Single(value) => *value == day,
+            FieldItem::Range(start, end) => day >= *start && day <= *end,
+            FieldItem::Step { start, step } => day >= *start && (day - *start) % *step == 0,
+            FieldItem::LastDay => last_day_of_month(year, month) == Some(day),
         }),
     }
 }
@@ -1941,11 +2025,17 @@ fn parse_calendar_event(value: &str) -> Result<CalendarSpec, ApiError> {
             tokens.pop();
         }
     }
-    for token in tokens.clone() {
-        if let Some(parsed) = parse_timezone_token(token)? {
-            timezone = Some(parsed);
-            tokens.retain(|t| *t != token);
-            break;
+    if timezone.is_none() {
+        let mut tz_index = None;
+        for (idx, token) in tokens.iter().enumerate() {
+            if let Some(parsed) = parse_timezone_token(token)? {
+                timezone = Some(parsed);
+                tz_index = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = tz_index {
+            tokens.remove(idx);
         }
     }
 
@@ -1959,12 +2049,21 @@ fn parse_calendar_event(value: &str) -> Result<CalendarSpec, ApiError> {
                 return Err(ApiError::bad_request("Invalid schedule time"));
             }
             time = Some(token);
-        } else if token.chars().any(|c| c.is_ascii_alphabetic()) {
+        } else if token.contains('-') {
+            if date.is_some() {
+                return Err(ApiError::bad_request("Invalid schedule date"));
+            }
+            date = Some(token);
+        } else if token == "*"
+            || token.contains("..")
+            || token.contains(',')
+            || token.chars().any(|c| c.is_ascii_alphabetic())
+        {
             if weekday.is_some() {
                 return Err(ApiError::bad_request("Invalid schedule weekday"));
             }
             weekday = Some(token);
-        } else if token.contains('-') || token.contains('*') || token.contains('.') {
+        } else if token.contains('*') || token.contains('.') {
             if date.is_some() {
                 return Err(ApiError::bad_request("Invalid schedule date"));
             }
@@ -2074,7 +2173,7 @@ fn next_calendar_run(
 
         if !field_matches(&spec.years, year)
             || !field_matches(&spec.months, month)
-            || !field_matches(&spec.days, day)
+            || !day_matches(&spec.days, day, date.year(), month)
             || !field_matches(&spec.weekdays, weekday)
         {
             continue;
@@ -2113,7 +2212,7 @@ fn next_calendar_run(
 
 fn job_last_run_time(state: Option<&VerificationJobState>) -> Option<i64> {
     state.and_then(|entry| {
-        entry.last_run_endtime.or_else(|| {
+        entry.last_run_time.or(entry.last_run_endtime).or_else(|| {
             entry
                 .last_run_upid
                 .as_deref()
@@ -2139,6 +2238,27 @@ fn compute_next_run(
         let base = last_run.unwrap_or(now);
         base + interval
     })
+}
+
+fn compute_next_run_cached(
+    job: &VerificationJobConfig,
+    entry: &mut VerificationJobState,
+    now: i64,
+    interval: Option<i64>,
+) -> Option<i64> {
+    let schedule = job.schedule.as_deref();
+    let last_run_time = job_last_run_time(Some(entry));
+    let schedule_changed = entry.last_schedule.as_deref() != schedule;
+    let last_run_changed = entry.last_run_time != last_run_time;
+    let cached_next = entry.next_run;
+
+    if schedule_changed || last_run_changed || cached_next.is_none() || cached_next <= Some(now) {
+        entry.next_run = compute_next_run(schedule, last_run_time, now, interval);
+        entry.last_schedule = schedule.map(|value| value.to_string());
+        entry.last_run_time = last_run_time;
+    }
+
+    entry.next_run
 }
 
 fn compute_verify_job_status(
@@ -2177,8 +2297,9 @@ fn compute_verify_job_status(
     let last_run_endtime = state_entry
         .and_then(|entry| entry.last_run_endtime)
         .or_else(|| last_task.as_ref().and_then(|task| task.endtime));
-    let last_run_time =
-        last_run_endtime.or_else(|| last_run_upid.as_deref().and_then(parse_upid_starttime));
+    let last_run_time = job_last_run_time(state_entry)
+        .or(last_run_endtime)
+        .or_else(|| last_run_upid.as_deref().and_then(parse_upid_starttime));
 
     let next_run = if enabled {
         compute_next_run(job.schedule.as_deref(), last_run_time, now, interval)
@@ -5567,6 +5688,8 @@ async fn spawn_verify_task(
             entry.last_run_upid = Some(upid_clone.clone());
             entry.last_run_state = Some("running".to_string());
             entry.last_run_endtime = None;
+            entry.last_run_time = None;
+            entry.next_run = None;
         }
 
         let mut start_message = format!("Verification started for {}", store_name_clone);
@@ -5946,8 +6069,11 @@ async fn spawn_verify_task(
             let mut guard = state_clone.verify_job_state.write().await;
             if let Some(entry) = guard.get_mut(job_id) {
                 entry.last_run_state = Some(exit_status.clone());
-                entry.last_run_endtime = Some(chrono::Utc::now().timestamp());
+                let endtime = chrono::Utc::now().timestamp();
+                entry.last_run_endtime = Some(endtime);
+                entry.last_run_time = Some(endtime);
                 entry.last_run_upid = Some(upid_clone.clone());
+                entry.next_run = None;
             }
         }
 
@@ -6093,9 +6219,11 @@ async fn handle_verify_config_api(
                 drop(guard);
 
                 let mut state_guard = state.verify_job_state.write().await;
-                state_guard
+                let entry = state_guard
                     .entry(config.id.clone())
                     .or_insert_with(|| VerificationJobState::new(&config.id));
+                entry.last_schedule = config.schedule.clone();
+                entry.next_run = None;
                 drop(state_guard);
 
                 if let Err(e) = state.save_state().await {
@@ -6173,6 +6301,14 @@ async fn handle_verify_config_api(
             *existing = updated.clone();
             let digest = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
             drop(guard);
+
+            let mut state_guard = state.verify_job_state.write().await;
+            let entry = state_guard
+                .entry(updated.id.clone())
+                .or_insert_with(|| VerificationJobState::new(&updated.id));
+            entry.last_schedule = updated.schedule.clone();
+            entry.next_run = None;
+            drop(state_guard);
 
             if let Err(e) = state.save_state().await {
                 warn!("Failed to save state after verify job update: {}", e);
@@ -6392,24 +6528,11 @@ async fn handle_verify_api(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(50);
             let worker_id = format!("{}:{}", job.store, job.id);
-            let mut items = state
+            let (items, total) = state
                 .tasks
-                .snapshot()
-                .await
-                .into_iter()
-                .filter(|task| {
-                    task.worker_type == "verificationjob"
-                        && task.worker_id.as_deref() == Some(worker_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            items.sort_by(|a, b| b.starttime.cmp(&a.starttime));
-            let total = items.len();
-            let start_idx = start.min(total);
-            let end_idx = total.min(start_idx.saturating_add(limit));
-            let data = items[start_idx..end_idx]
-                .iter()
-                .map(task_snapshot_value)
-                .collect::<Vec<_>>();
+                .list_by_worker("verificationjob", &worker_id, start, limit, true)
+                .await;
+            let data = items.iter().map(task_snapshot_value).collect::<Vec<_>>();
 
             json_response(
                 StatusCode::OK,
@@ -6578,5 +6701,29 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let next = next_calendar_run(&spec, base).expect("next");
         assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 5, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_month_name_last_day() {
+        let spec = parse_calendar_event("feb-last 00:00 UTC").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 2, 29, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_month_name_with_year() {
+        let spec = parse_calendar_event("2024-jan-02 03:00 UTC").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 2, 3, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_weekday_step_token() {
+        let spec = parse_calendar_event("mon/2 03:00 UTC").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap());
     }
 }

@@ -11,6 +11,7 @@ env:
   RUST_BACKTRACE: 1
   CARGO_HOME: ${{ github.workspace }}/target/cargo-home
   TMPDIR: ${{ github.workspace }}/target/tmp
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
   check:
