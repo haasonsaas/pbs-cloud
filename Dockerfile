@@ -32,7 +32,7 @@ RUN mkdir -p /data/state /data/storage /tmp && \
     chown -R pbs:nogroup /data /tmp
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/pbs-server /usr/local/bin/pbs-server
+COPY --from=builder /build/target/release/pbs-cloud-server /usr/local/bin/pbs-cloud-server
 
 # Use non-root user
 USER pbs
@@ -50,4 +50,4 @@ EXPOSE 8007
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -kfs https://localhost:8007/health || exit 1
 
-ENTRYPOINT ["/usr/local/bin/pbs-server"]
+ENTRYPOINT ["/usr/local/bin/pbs-cloud-server"]
