@@ -185,4 +185,31 @@ mod tests {
         assert_eq!(with_quota.remaining_quota(), Some(1000));
         assert!(!with_quota.is_over_quota());
     }
+
+    #[tokio::test]
+    async fn test_quota_enforcement() {
+        let manager = TenantManager::new();
+
+        // Create tenant with quota
+        let tenant = manager.create_tenant("Quota Test").await;
+        manager.set_quota(&tenant.id, Some(1000)).await;
+
+        // Initially not over quota
+        let t = manager.get_tenant(&tenant.id).await.unwrap();
+        assert!(!t.is_over_quota());
+        assert_eq!(t.remaining_quota(), Some(1000));
+
+        // Update usage to exactly quota
+        manager.update_usage(&tenant.id, 1000).await;
+        let t = manager.get_tenant(&tenant.id).await.unwrap();
+        assert!(t.is_over_quota());
+        assert_eq!(t.remaining_quota(), Some(0));
+
+        // Unlimited quota (None) is never over quota
+        let unlimited = manager.create_tenant("Unlimited").await;
+        manager.update_usage(&unlimited.id, 999999999).await;
+        let u = manager.get_tenant(&unlimited.id).await.unwrap();
+        assert!(!u.is_over_quota());
+        assert_eq!(u.remaining_quota(), None);
+    }
 }

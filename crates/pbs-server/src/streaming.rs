@@ -41,6 +41,18 @@ impl BackupProtocolHandler {
             return Err(ApiError::new(403, "Tenant is not active"));
         }
 
+        // Check quota - reject new backups if tenant is over quota
+        if tenant.is_over_quota() {
+            return Err(ApiError::new(
+                507, // HTTP 507 Insufficient Storage
+                &format!(
+                    "Quota exceeded: {} bytes used of {} bytes allowed",
+                    tenant.used_bytes,
+                    tenant.quota_bytes.unwrap_or(0)
+                ),
+            ));
+        }
+
         let datastore = self.state.default_datastore();
         let session_id = self.state.sessions.create_backup_session(
             &ctx.user.tenant_id,

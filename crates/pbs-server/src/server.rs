@@ -1480,6 +1480,7 @@ fn error_response(error: ApiError) -> Response<Full<Bytes>> {
         403 => StatusCode::FORBIDDEN,
         404 => StatusCode::NOT_FOUND,
         429 => StatusCode::TOO_MANY_REQUESTS,
+        507 => StatusCode::INSUFFICIENT_STORAGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let body = serde_json::json!({"error": error.message});
