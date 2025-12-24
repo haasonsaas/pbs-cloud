@@ -25,6 +25,8 @@ PBS Cloud is a clean-room implementation of a backup server compatible with [Pro
 - [x] AES-256-GCM encryption + zstd compression
 - [x] S3 storage backend
 - [x] Local filesystem storage backend
+- [x] Namespaces (`ns/` prefixes)
+- [x] Multiple datastores per backend (`store` parameter)
 - [x] Full HTTP/2 streaming backup protocol
 - [x] TLS/HTTPS with rustls (self-signed or custom certs)
 - [x] Multi-tenant management with usage tracking
@@ -238,6 +240,9 @@ INFO Save this token - it won't be shown again!
 # Set the repository (adjust hostname as needed)
 export PBS_REPOSITORY="root@pam!root-token@localhost:8007:default"
 
+# Use a non-default datastore
+# export PBS_REPOSITORY="root@pam!root-token@localhost:8007:archive"
+
 # Create a backup
 proxmox-backup-client backup root.pxar:/
 
@@ -263,6 +268,7 @@ proxmox-backup-client restore host/hostname/2024-01-01T00:00:00Z root.pxar /rest
 | `PBS_S3_REGION` | AWS region | - |
 | `PBS_S3_ENDPOINT` | S3 endpoint URL (for MinIO, R2, etc.) | - |
 | `PBS_S3_PREFIX` | Key prefix in bucket | - |
+| `PBS_DATASTORES` | Comma-separated additional datastore names | - |
 | **Tenants** | | |
 | `PBS_DEFAULT_TENANT` | Default tenant ID | `default` |
 | **TLS** | | |

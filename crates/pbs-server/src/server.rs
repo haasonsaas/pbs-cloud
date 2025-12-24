@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,8 +36,9 @@ use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtoc
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
-    validate_backup_params, validate_digest, validate_filename, validate_tenant_name,
-    validate_username, validate_backup_type, validate_backup_id,
+    validate_backup_params, validate_backup_params_with_ns, validate_backup_namespace,
+    validate_backup_type, validate_backup_id, validate_datastore_name, validate_digest,
+    validate_filename, validate_tenant_name, validate_username,
 };
 
 /// Server state
@@ -105,10 +107,55 @@ impl ServerState {
         } else {
             CryptoConfig::default()
         };
-        let default_ds = Arc::new(Datastore::new("default", backend.clone(), crypto));
+        let default_ds = Arc::new(Datastore::new("default", backend.clone(), crypto.clone()));
 
         let mut datastores = HashMap::new();
         datastores.insert("default".to_string(), default_ds);
+
+        for store in &config.datastores {
+            if store == "default" || datastores.contains_key(store) {
+                continue;
+            }
+            validate_datastore_name(store)
+                .map_err(|e| anyhow::anyhow!("Invalid datastore name {}: {}", store, e))?;
+
+            let store_backend: Arc<dyn StorageBackend> = match &config.storage {
+                StorageConfig::Local { path } => {
+                    let mut store_path = PathBuf::from(path);
+                    store_path.push(store);
+                    Arc::new(LocalBackend::new(store_path).await?)
+                }
+                StorageConfig::S3 {
+                    bucket,
+                    region,
+                    endpoint,
+                    prefix,
+                } => {
+                    let mut s3_config = match endpoint {
+                        Some(ep) => pbs_storage::S3Config::compatible(bucket, ep),
+                        None => pbs_storage::S3Config::aws(
+                            bucket,
+                            region.as_deref().unwrap_or("us-east-1"),
+                        ),
+                    };
+                    let base_prefix = prefix
+                        .as_deref()
+                        .map(|p| p.trim_end_matches('/'))
+                        .filter(|p| !p.is_empty());
+                    let store_prefix = match base_prefix {
+                        Some(p) => format!("{}/{}", p, store),
+                        None => store.to_string(),
+                    };
+                    s3_config = s3_config.with_prefix(&store_prefix);
+                    Arc::new(S3Backend::new(s3_config).await?)
+                }
+            };
+
+            datastores.insert(
+                store.clone(),
+                Arc::new(Datastore::new(store, store_backend, crypto.clone())),
+            );
+        }
 
         let (billing, billing_rx) = BillingManager::new();
         let billing = Arc::new(billing);
@@ -291,30 +338,37 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 interval.tick().await;
                 info!("Starting scheduled GC run");
 
-                let datastore = state_for_gc.default_datastore();
-                let backend = datastore.backend();
-                let gc = GarbageCollector::new(datastore, backend);
+                let datastores: Vec<_> = state_for_gc.datastores.values().cloned().collect();
+                for datastore in datastores {
+                    let backend = datastore.backend();
+                    let gc = GarbageCollector::new(datastore.clone(), backend);
 
-                let options = GcOptions {
-                    dry_run: false,
-                    max_delete: None,
-                };
+                    let options = GcOptions {
+                        dry_run: false,
+                        max_delete: None,
+                    };
 
-                match gc.run(options).await {
-                    Ok(result) => {
-                        info!(
-                            "Scheduled GC completed: scanned={}, orphaned={}, deleted={}, freed={}",
-                            result.chunks_scanned,
-                            result.chunks_orphaned,
-                            result.chunks_deleted,
-                            result.bytes_freed
-                        );
-                        if !result.errors.is_empty() {
-                            warn!("GC errors: {:?}", result.errors);
+                    match gc.run(options).await {
+                        Ok(result) => {
+                            info!(
+                                "Scheduled GC completed for {}: scanned={}, orphaned={}, deleted={}, freed={}",
+                                datastore.name(),
+                                result.chunks_scanned,
+                                result.chunks_orphaned,
+                                result.chunks_deleted,
+                                result.bytes_freed
+                            );
+                            if !result.errors.is_empty() {
+                                warn!(
+                                    "GC errors for {}: {:?}",
+                                    datastore.name(),
+                                    result.errors
+                                );
+                            }
                         }
-                    }
-                    Err(e) => {
-                        error!("Scheduled GC failed: {}", e);
+                        Err(e) => {
+                            error!("Scheduled GC failed for {}: {}", datastore.name(), e);
+                        }
                     }
                 }
             }
@@ -727,7 +781,7 @@ async fn handle_request(
         (Method::GET, "/api2/json/compliance/report") => {
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
-                async move { handle_compliance_report(state).await }
+                async move { handle_compliance_report(state, req).await }
             }).await
         }
 
@@ -751,7 +805,7 @@ async fn handle_request(
         (Method::GET, "/api2/json/admin/gc/status") => {
             with_auth(auth_ctx, Permission::Admin, |_| {
                 let state = state.clone();
-                async move { handle_gc_status(state).await }
+                async move { handle_gc_status(state, req).await }
             })
             .await
         }
@@ -872,6 +926,23 @@ fn snapshot_to_epoch(snapshot: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+fn namespace_prefix(namespace: Option<&str>) -> String {
+    let ns = match namespace {
+        Some(ns) if !ns.is_empty() => ns,
+        _ => return String::new(),
+    };
+    let mut prefix = String::new();
+    for part in ns.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        prefix.push_str("ns/");
+        prefix.push_str(part);
+        prefix.push('/');
+    }
+    prefix
+}
+
 enum H2Context {
     Backup(H2BackupContext),
     Reader(H2ReaderContext),
@@ -881,6 +952,8 @@ struct H2BackupContext {
     state: Arc<ServerState>,
     tenant_id: String,
     session_id: String,
+    namespace: Option<String>,
+    store: String,
     backup_type: String,
     backup_id: String,
     backup_time_epoch: i64,
@@ -890,6 +963,8 @@ struct H2ReaderContext {
     state: Arc<ServerState>,
     tenant_id: String,
     session_id: String,
+    namespace: Option<String>,
+    store: String,
     backup_type: String,
     backup_id: String,
     backup_time: String,
@@ -1018,24 +1093,31 @@ fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
     mac.verify_slice(&sig_bytes).is_ok()
 }
 
-async fn handle_compliance_report(state: Arc<ServerState>) -> Response<Full<Bytes>> {
-    let datastore = state.default_datastore();
+async fn handle_compliance_report(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let store = get_query_param(req.uri(), "store").unwrap_or_else(|| "default".to_string());
+    if let Err(e) = validate_datastore_name(&store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(&store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
     let groups = datastore.list_backup_groups().await.unwrap_or_default();
     let mut snapshots = Vec::new();
     let mut total_bytes: u64 = 0;
 
     for group in groups {
         let times = datastore
-            .list_snapshots(&group.backup_type, &group.backup_id)
+            .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
             .await
             .unwrap_or_default();
 
         for time in times {
-            let manifest_path = format!(
-                "{}/{}/{}/index.json.blob",
-                group.backup_type, group.backup_id, time
-            );
-            if let Ok(manifest) = datastore.read_manifest(&manifest_path).await {
+            let snapshot_path = format!("{}/{}", group.path(), time);
+            if let Ok(manifest) = datastore.read_manifest_any(&snapshot_path).await {
                 let size: u64 = manifest.files.iter().map(|f| f.size).sum();
                 total_bytes = total_bytes.saturating_add(size);
                 let retain_until = manifest
@@ -1051,6 +1133,7 @@ async fn handle_compliance_report(state: Arc<ServerState>) -> Response<Full<Byte
                     .unwrap_or(false);
 
                 snapshots.push(serde_json::json!({
+                    "ns": group.namespace,
                     "backup-type": group.backup_type,
                     "backup-id": group.backup_id,
                     "backup-time": time,
@@ -1154,7 +1237,7 @@ async fn handle_datastore_api(
     // Route based on sub-path
     if parts.len() == 1 {
         // Datastore info
-        let stats = state.backend.stats().await.unwrap_or_default();
+        let stats = datastore.backend().stats().await.unwrap_or_default();
         let info = serde_json::json!({
             "data": {
                 "store": ds_name,
@@ -1173,6 +1256,7 @@ async fn handle_datastore_api(
                 .iter()
                 .map(|g| {
                     serde_json::json!({
+                        "ns": g.namespace,
                         "backup-type": g.backup_type,
                         "backup-id": g.backup_id
                     })
@@ -1186,17 +1270,14 @@ async fn handle_datastore_api(
 
             for group in groups {
                 let times = datastore
-                    .list_snapshots(&group.backup_type, &group.backup_id)
+                    .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
                     .await
                     .unwrap_or_default();
 
                 for time in times {
-                    let manifest_path = format!(
-                        "{}/{}/{}/index.json.blob",
-                        group.backup_type, group.backup_id, time
-                    );
+                    let snapshot_path = format!("{}/{}", group.path(), time);
                     let (size, protected) = datastore
-                        .read_manifest(&manifest_path)
+                        .read_manifest_any(&snapshot_path)
                         .await
                         .map(|m| {
                             let size = m.files.iter().map(|f| f.size).sum();
@@ -1211,6 +1292,7 @@ async fn handle_datastore_api(
                         .unwrap_or((0, false));
 
                     snapshots.push(serde_json::json!({
+                        "ns": group.namespace,
                         "backup-type": group.backup_type,
                         "backup-id": group.backup_id,
                         "backup-time": time,
@@ -1304,11 +1386,19 @@ async fn handle_protocol_upgrade(
     if let Err(e) = validate_backup_id(&backup_id) {
         return error_response(e);
     }
-
-    if let Some(store) = get_query_param(&uri, "store") {
-        if store != "default" {
-            return bad_request("Only default datastore is supported");
+    let namespace = get_query_param(&uri, "ns");
+    if let Some(ns) = namespace.as_deref() {
+        if let Err(e) = validate_backup_namespace(ns) {
+            return error_response(e);
         }
+    }
+
+    let store = get_query_param(&uri, "store").unwrap_or_else(|| "default".to_string());
+    if let Err(e) = validate_datastore_name(&store) {
+        return error_response(e);
+    }
+    if state.get_datastore(&store).is_none() {
+        return not_found();
     }
 
     if mode == "backup" {
@@ -1322,6 +1412,8 @@ async fn handle_protocol_upgrade(
             backup_type: backup_type.clone(),
             backup_id: backup_id.clone(),
             backup_time: backup_time.clone(),
+            namespace: namespace.clone(),
+            store: Some(store.clone()),
             encrypt,
             retain_until,
             retention_days,
@@ -1337,6 +1429,8 @@ async fn handle_protocol_upgrade(
             state: state_for_upgrade,
             tenant_id,
             session_id,
+            namespace,
+            store,
             backup_type,
             backup_id,
             backup_time_epoch,
@@ -1356,7 +1450,14 @@ async fn handle_protocol_upgrade(
     } else {
         let handler = ReaderProtocolHandler::new(state.clone());
         let session_id = match handler
-            .start_reader(&auth_ctx, &backup_type, &backup_id, &backup_time)
+            .start_reader(
+                &auth_ctx,
+                &backup_type,
+                &backup_id,
+                &backup_time,
+                namespace.clone(),
+                Some(store.clone()),
+            )
             .await
         {
             Ok(id) => id,
@@ -1367,6 +1468,8 @@ async fn handle_protocol_upgrade(
             state: state_for_upgrade,
             tenant_id,
             session_id,
+            namespace,
+            store,
             backup_type,
             backup_id,
             backup_time,
@@ -1409,11 +1512,26 @@ async fn handle_h2_backup(
             if let Err(e) = validate_filename(&name) {
                 return error_response(e);
             }
+            if !name.ends_with(".blob") {
+                return bad_request("Blob filename must end with .blob");
+            }
+            let encoded_size: usize = match get_query_param(req.uri(), "encoded-size")
+                .and_then(|v| v.parse().ok())
+            {
+                Some(v) => v,
+                None => return bad_request("Missing encoded-size"),
+            };
 
             let body = match req.collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
                 Err(_) => return bad_request("Failed to read blob data"),
             };
+            if body.len() != encoded_size {
+                return bad_request("encoded-size mismatch");
+            }
+            if let Err(e) = pbs_core::DataBlob::from_bytes(&body) {
+                return bad_request(&format!("Invalid data blob: {}", e));
+            }
 
             let handler = BackupProtocolHandler::new(ctx.state.clone());
             match handler
@@ -1431,6 +1549,9 @@ async fn handle_h2_backup(
             };
             if let Err(e) = validate_filename(&name) {
                 return error_response(e);
+            }
+            if !name.ends_with(".fidx") {
+                return bad_request("Fixed index filename must end with .fidx");
             }
             let chunk_size = get_query_param(req.uri(), "size")
                 .and_then(|s| s.parse().ok())
@@ -1454,6 +1575,9 @@ async fn handle_h2_backup(
             };
             if let Err(e) = validate_filename(&name) {
                 return error_response(e);
+            }
+            if !name.ends_with(".didx") {
+                return bad_request("Dynamic index filename must end with .didx");
             }
 
             let result = ctx.state.sessions.with_backup_session_verified(
@@ -1515,6 +1639,10 @@ async fn handle_h2_backup(
             }
         }
         (Method::POST, "fixed_chunk") | (Method::POST, "dynamic_chunk") => {
+            let wid: u64 = match get_query_param(req.uri(), "wid").and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return bad_request("Missing wid"),
+            };
             let digest_str = match get_query_param(req.uri(), "digest") {
                 Some(d) => d,
                 None => return bad_request("Missing digest"),
@@ -1526,11 +1654,65 @@ async fn handle_h2_backup(
                 Ok(d) => d,
                 Err(_) => return bad_request("Invalid digest format"),
             };
+            let raw_size: u64 = match get_query_param(req.uri(), "size").and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return bad_request("Missing size"),
+            };
+            let encoded_size: usize = match get_query_param(req.uri(), "encoded-size")
+                .and_then(|v| v.parse().ok())
+            {
+                Some(v) => v,
+                None => return bad_request("Missing encoded-size"),
+            };
 
             let body = match req.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => return bad_request("Failed to read chunk data"),
             };
+            if body.len() != encoded_size {
+                return bad_request("encoded-size mismatch");
+            }
+
+            let blob = match pbs_core::DataBlob::from_bytes(&body) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("Invalid data blob: {}", e)),
+            };
+            let datastore = match ctx.state.get_datastore(&ctx.store) {
+                Some(ds) => ds,
+                None => return not_found(),
+            };
+            let crypto = datastore.crypto_config();
+            match blob.decode(&crypto) {
+                Ok(raw) => {
+                    if raw.len() as u64 != raw_size {
+                        return bad_request("Chunk size mismatch");
+                    }
+                    let computed = ChunkDigest::from_data(&raw);
+                    if computed != digest {
+                        return bad_request("Chunk digest mismatch");
+                    }
+                }
+                Err(pbs_core::Error::Decryption(_)) if crypto.key.is_none() => {
+                    // Encrypted payload with unknown key; accept but cannot verify digest/size.
+                }
+                Err(e) => {
+                    return bad_request(&format!("Invalid data blob: {}", e));
+                }
+            }
+
+            let writer_check = ctx
+                .state
+                .sessions
+                .with_backup_session_verified(&ctx.session_id, &ctx.tenant_id, |session| {
+                    if !session.writers.contains_key(&wid) {
+                        return Err(ApiError::not_found("Writer not found"));
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(e) = writer_check {
+                return error_response(e);
+            }
 
             let handler = BackupProtocolHandler::new(ctx.state.clone());
             match handler
@@ -1550,16 +1732,40 @@ async fn handle_h2_backup(
                 Some(v) => v,
                 None => return bad_request("Missing size"),
             };
+            let chunk_count: usize = match get_query_param(req.uri(), "chunk-count")
+                .and_then(|v| v.parse().ok())
+            {
+                Some(v) => v,
+                None => return bad_request("Missing chunk-count"),
+            };
+            let csum = match get_query_param(req.uri(), "csum") {
+                Some(v) => v,
+                None => return bad_request("Missing csum"),
+            };
+            if csum.len() != 64 || !csum.chars().all(|c| c.is_ascii_hexdigit()) {
+                return bad_request("Invalid csum");
+            }
+            let expected_csum = match hex::decode(&csum) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    arr
+                }
+                _ => return bad_request("Invalid csum"),
+            };
 
-            let result = ctx.state.sessions.with_backup_session_verified(
-                &ctx.session_id,
-                &ctx.tenant_id,
-                |session| {
-                    session.set_index_total_size(wid, size)?;
-                    let _ = session.close_index_by_id(wid)?;
-                    Ok(())
-                },
-            ).await;
+            let result = ctx
+                .state
+                .sessions
+                .with_backup_session_async(&ctx.session_id, |session| {
+                    Box::pin(session.finalize_index_by_id(
+                        wid,
+                        size,
+                        chunk_count,
+                        expected_csum,
+                    ))
+                })
+                .await;
 
             match result {
                 Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
@@ -1577,9 +1783,12 @@ async fn handle_h2_backup(
             }
         }
         (Method::GET, "previous_backup_time") => {
-            let datastore = ctx.state.default_datastore();
+            let datastore = match ctx.state.get_datastore(&ctx.store) {
+                Some(ds) => ds,
+                None => return not_found(),
+            };
             let snapshots = datastore
-                .list_snapshots(&ctx.backup_type, &ctx.backup_id)
+                .list_snapshots(ctx.namespace.as_deref(), &ctx.backup_type, &ctx.backup_id)
                 .await
                 .unwrap_or_default();
             let mut times: Vec<i64> = snapshots
@@ -1601,9 +1810,12 @@ async fn handle_h2_backup(
                 return error_response(e);
             }
 
-            let datastore = ctx.state.default_datastore();
+            let datastore = match ctx.state.get_datastore(&ctx.store) {
+                Some(ds) => ds,
+                None => return not_found(),
+            };
             let snapshots = datastore
-                .list_snapshots(&ctx.backup_type, &ctx.backup_id)
+                .list_snapshots(ctx.namespace.as_deref(), &ctx.backup_type, &ctx.backup_id)
                 .await
                 .unwrap_or_default();
             let mut times: Vec<i64> = snapshots
@@ -1621,10 +1833,14 @@ async fn handle_h2_backup(
                 Err(e) => return error_response(e),
             };
             let path = format!(
-                "{}/{}/{}/{}",
-                ctx.backup_type, ctx.backup_id, snapshot, archive
+                "{}{}/{}/{}/{}",
+                namespace_prefix(ctx.namespace.as_deref()),
+                ctx.backup_type,
+                ctx.backup_id,
+                snapshot,
+                archive
             );
-            let data = match ctx.state.backend.read_file(&path).await {
+            let data = match datastore.backend().read_file(&path).await {
                 Ok(d) => d,
                 Err(_) => return not_found(),
             };
@@ -1663,10 +1879,18 @@ async fn handle_h2_reader(
                 return error_response(e);
             }
             let file_path = format!(
-                "{}/{}/{}/{}",
-                ctx.backup_type, ctx.backup_id, ctx.backup_time, name
+                "{}{}/{}/{}/{}",
+                namespace_prefix(ctx.namespace.as_deref()),
+                ctx.backup_type,
+                ctx.backup_id,
+                ctx.backup_time,
+                name
             );
-            let data = match ctx.state.backend.read_file(&file_path).await {
+            let datastore = match ctx.state.get_datastore(&ctx.store) {
+                Some(ds) => ds,
+                None => return not_found(),
+            };
+            let data = match datastore.backend().read_file(&file_path).await {
                 Ok(d) => d,
                 Err(_) => return not_found(),
             };
@@ -1687,7 +1911,10 @@ async fn handle_h2_reader(
                 Ok(d) => d,
                 Err(_) => return bad_request("Invalid digest format"),
             };
-            let datastore = ctx.state.default_datastore();
+            let datastore = match ctx.state.get_datastore(&ctx.store) {
+                Some(ds) => ds,
+                None => return not_found(),
+            };
             let data = match datastore.read_chunk_blob(&digest).await {
                 Ok(d) => d,
                 Err(_) => return not_found(),
@@ -1724,9 +1951,13 @@ async fn handle_start_backup(
     };
 
     // Validate backup parameters
-    if let Err(e) =
-        validate_backup_params(&params.backup_type, &params.backup_id, &params.backup_time)
-    {
+    if let Err(e) = validate_backup_params_with_ns(
+        &params.backup_type,
+        &params.backup_id,
+        &params.backup_time,
+        params.namespace.as_deref(),
+        params.store.as_deref(),
+    ) {
         return error_response(e);
     }
 
@@ -1755,6 +1986,10 @@ async fn handle_start_reader(
         backup_type: String,
         backup_id: String,
         backup_time: String,
+        #[serde(default)]
+        ns: Option<String>,
+        #[serde(default)]
+        store: Option<String>,
     }
 
     let params: ReaderParams = match serde_json::from_slice(&body) {
@@ -1763,9 +1998,13 @@ async fn handle_start_reader(
     };
 
     // Validate backup parameters
-    if let Err(e) =
-        validate_backup_params(&params.backup_type, &params.backup_id, &params.backup_time)
-    {
+    if let Err(e) = validate_backup_params_with_ns(
+        &params.backup_type,
+        &params.backup_id,
+        &params.backup_time,
+        params.ns.as_deref(),
+        params.store.as_deref(),
+    ) {
         return error_response(e);
     }
 
@@ -1776,6 +2015,8 @@ async fn handle_start_reader(
             &params.backup_type,
             &params.backup_id,
             &params.backup_time,
+            params.ns,
+            params.store,
         )
         .await
     {
@@ -2601,6 +2842,8 @@ async fn handle_run_gc(
         #[serde(default)]
         dry_run: bool,
         max_delete: Option<usize>,
+        #[serde(default)]
+        store: Option<String>,
     }
 
     let params: GcRequest = if body.is_empty() {
@@ -2612,7 +2855,14 @@ async fn handle_run_gc(
         }
     };
 
-    let datastore = state.default_datastore();
+    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
+    if let Err(e) = validate_datastore_name(&store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(&store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
     let backend = datastore.backend();
     let gc = GarbageCollector::new(datastore, backend);
 
@@ -2650,9 +2900,18 @@ async fn handle_run_gc(
     }
 }
 
-async fn handle_gc_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
-    // For now, just return datastore stats - could be extended to track ongoing GC
-    let datastore = state.default_datastore();
+async fn handle_gc_status(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let store = get_query_param(req.uri(), "store").unwrap_or_else(|| "default".to_string());
+    if let Err(e) = validate_datastore_name(&store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(&store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
     let backend = datastore.backend();
 
     match backend.list_chunks().await {
@@ -2684,6 +2943,10 @@ async fn handle_prune(
         backup_type: String,
         backup_id: String,
         #[serde(default)]
+        ns: Option<String>,
+        #[serde(default)]
+        store: Option<String>,
+        #[serde(default)]
         dry_run: bool,
         keep_last: Option<usize>,
         keep_daily: Option<usize>,
@@ -2705,8 +2968,20 @@ async fn handle_prune(
     ) {
         return error_response(e);
     }
+    if let Some(ns) = params.ns.as_deref() {
+        if let Err(e) = validate_backup_namespace(ns) {
+            return error_response(e);
+        }
+    }
 
-    let datastore = state.default_datastore();
+    let store = params.store.clone().unwrap_or_else(|| "default".to_string());
+    if let Err(e) = validate_datastore_name(&store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(&store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
     let pruner = Pruner::new(datastore);
 
     let options = PruneOptions {
@@ -2725,7 +3000,12 @@ async fn handle_prune(
     );
 
     match pruner
-        .prune(&params.backup_type, &params.backup_id, options)
+        .prune(
+            &params.backup_type,
+            &params.backup_id,
+            params.ns.as_deref(),
+            options,
+        )
         .await
     {
         Ok(result) => {

@@ -58,7 +58,11 @@ impl BackupProtocolHandler {
             ));
         }
 
-        let datastore = self.state.default_datastore();
+        let store = params.store.as_deref().unwrap_or("default");
+        let datastore = self
+            .state
+            .get_datastore(store)
+            .ok_or_else(|| ApiError::not_found("Datastore not found"))?;
         let session_id = self
             .state
             .sessions
@@ -99,13 +103,13 @@ impl BackupProtocolHandler {
         digest: ChunkDigest,
         data: Vec<u8>,
     ) -> Result<bool, ApiError> {
-        // Verify session ownership
-        self.state
+        let datastore = self
+            .state
             .sessions
-            .verify_session_ownership(session_id, tenant_id)
+            .with_backup_session_verified(session_id, tenant_id, |session| {
+                Ok(session.datastore())
+            })
             .await?;
-
-        let datastore = self.state.default_datastore();
 
         // Check if chunk already exists (deduplication)
         let exists = datastore
@@ -152,9 +156,13 @@ impl BackupProtocolHandler {
         digest: ChunkDigest,
         data: bytes::Bytes,
     ) -> Result<bool, ApiError> {
-        self.state.sessions.verify_session_ownership(session_id, tenant_id).await?;
-
-        let datastore = self.state.default_datastore();
+        let datastore = self
+            .state
+            .sessions
+            .with_backup_session_verified(session_id, tenant_id, |session| {
+                Ok(session.datastore())
+            })
+            .await?;
         let stored = datastore
             .store_chunk_blob(&digest, data)
             .await
@@ -223,15 +231,25 @@ impl BackupProtocolHandler {
         tenant_id: &str,
         name: &str,
     ) -> Result<(u64, ChunkDigest), ApiError> {
-        self.state
+        let (datastore, path, index, size, digest) = self
+            .state
             .sessions
             .with_backup_session_verified(session_id, tenant_id, |session| {
                 let index = session.close_fixed_index(name)?;
                 let data = index.to_bytes();
                 let digest = ChunkDigest::from_data(&data);
-                Ok((data.len() as u64, digest))
+                let path = format!("{}/{}", session.snapshot_path(), name);
+                session.closed_indexes.insert(name.to_string());
+                Ok((session.datastore(), path, index, data.len() as u64, digest))
             })
+            .await?;
+
+        datastore
+            .store_fixed_index(&path, &index)
             .await
+            .map_err(|e| ApiError::internal(&e.to_string()))?;
+
+        Ok((size, digest))
     }
 
     /// Create a dynamic index
@@ -275,15 +293,25 @@ impl BackupProtocolHandler {
         tenant_id: &str,
         name: &str,
     ) -> Result<(u64, ChunkDigest), ApiError> {
-        self.state
+        let (datastore, path, index, size, digest) = self
+            .state
             .sessions
             .with_backup_session_verified(session_id, tenant_id, |session| {
                 let index = session.close_dynamic_index(name)?;
                 let data = index.to_bytes();
                 let digest = ChunkDigest::from_data(&data);
-                Ok((data.len() as u64, digest))
+                let path = format!("{}/{}", session.snapshot_path(), name);
+                session.closed_indexes.insert(name.to_string());
+                Ok((session.datastore(), path, index, data.len() as u64, digest))
             })
+            .await?;
+
+        datastore
+            .store_dynamic_index(&path, &index)
             .await
+            .map_err(|e| ApiError::internal(&e.to_string()))?;
+
+        Ok((size, digest))
     }
 
     /// Upload a blob
@@ -373,12 +401,13 @@ impl BackupProtocolHandler {
         tenant_id: &str,
         digests: &[ChunkDigest],
     ) -> Result<Vec<bool>, ApiError> {
-        // Verify session ownership
-        self.state
+        let datastore = self
+            .state
             .sessions
-            .verify_session_ownership(session_id, tenant_id)
+            .with_backup_session_verified(session_id, tenant_id, |session| {
+                Ok(session.datastore())
+            })
             .await?;
-        let datastore = self.state.default_datastore();
         let mut results = Vec::with_capacity(digests.len());
 
         for digest in digests {
@@ -450,6 +479,8 @@ impl ReaderProtocolHandler {
         backup_type: &str,
         backup_id: &str,
         backup_time: &str,
+        namespace: Option<String>,
+        store: Option<String>,
     ) -> Result<String, ApiError> {
         info!(
             "Starting reader session: {}/{}/{}",
@@ -468,7 +499,11 @@ impl ReaderProtocolHandler {
             return Err(ApiError::new(403, "Tenant is not active"));
         }
 
-        let datastore = self.state.default_datastore();
+        let store_name = store.as_deref().unwrap_or("default");
+        let datastore = self
+            .state
+            .get_datastore(store_name)
+            .ok_or_else(|| ApiError::not_found("Datastore not found"))?;
         let session_id = self
             .state
             .sessions
@@ -477,6 +512,7 @@ impl ReaderProtocolHandler {
                 backup_type,
                 backup_id,
                 backup_time,
+                namespace,
                 datastore,
             )
             .await;
@@ -500,7 +536,13 @@ impl ReaderProtocolHandler {
             .await?;
 
         // Read chunk directly from datastore
-        let datastore = self.state.default_datastore();
+        let datastore = self
+            .state
+            .sessions
+            .with_reader_session_async(session_id, |session| {
+                std::future::ready(Ok(session.datastore()))
+            })
+            .await?;
         let chunk = datastore
             .read_chunk(digest)
             .await

@@ -134,24 +134,19 @@ impl GarbageCollector {
             // List snapshots in this group
             let snapshots = self
                 .datastore
-                .list_snapshots(&group.backup_type, &group.backup_id)
+                .list_snapshots(group.namespace.as_deref(), &group.backup_type, &group.backup_id)
                 .await?;
 
             for timestamp in snapshots {
                 // Read the manifest
-                let manifest_path = format!(
-                    "{}/{}/{}/index.json.blob",
-                    group.backup_type, group.backup_id, timestamp
-                );
+                let snapshot_path = format!("{}/{}", group.path(), timestamp);
 
-                match self.datastore.read_manifest(&manifest_path).await {
+                match self.datastore.read_manifest_any(&snapshot_path).await {
                     Ok(manifest) => {
                         // Process each index file
                         for file in manifest.files {
-                            let file_path = format!(
-                                "{}/{}/{}/{}",
-                                group.backup_type, group.backup_id, timestamp, file.filename
-                            );
+                            let file_path =
+                                format!("{}/{}/{}", group.path(), timestamp, file.filename);
 
                             match file.file_type {
                                 pbs_core::FileType::Fidx => {
@@ -193,7 +188,7 @@ impl GarbageCollector {
                     Err(e) => {
                         result
                             .errors
-                            .push(format!("Failed to read manifest {}: {}", manifest_path, e));
+                            .push(format!("Failed to read manifest {}: {}", snapshot_path, e));
                     }
                 }
             }
@@ -264,6 +259,7 @@ impl Pruner {
         &self,
         backup_type: &str,
         backup_id: &str,
+        namespace: Option<&str>,
         options: PruneOptions,
     ) -> StorageResult<PruneResult> {
         let mut result = PruneResult::default();
@@ -271,7 +267,7 @@ impl Pruner {
         // List all snapshots
         let mut snapshots = self
             .datastore
-            .list_snapshots(backup_type, backup_id)
+            .list_snapshots(namespace, backup_type, backup_id)
             .await?;
 
         if snapshots.is_empty() {
@@ -365,7 +361,7 @@ impl Pruner {
             for snapshot in &result.pruned {
                 match self
                     .datastore
-                    .delete_snapshot(backup_type, backup_id, snapshot)
+                    .delete_snapshot(namespace, backup_type, backup_id, snapshot)
                     .await
                 {
                     Ok(()) => {

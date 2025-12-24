@@ -84,6 +84,9 @@ config:
   # Default tenant name
   defaultTenant: "default"
 
+  # Comma-separated additional datastore names
+  datastores: ""
+
   # Garbage collection
   gc:
     enabled: true

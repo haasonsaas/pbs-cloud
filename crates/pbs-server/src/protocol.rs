@@ -20,6 +20,12 @@ pub struct BackupParams {
     pub backup_id: String,
     /// Backup timestamp (ISO 8601)
     pub backup_time: String,
+    /// Optional namespace (slash-separated)
+    #[serde(rename = "ns", default)]
+    pub namespace: Option<String>,
+    /// Optional datastore/store name
+    #[serde(default)]
+    pub store: Option<String>,
     /// Whether to use encrypted chunks
     pub encrypt: bool,
     /// Optional retention override (RFC3339)
@@ -61,11 +67,34 @@ impl BackupSession {
 
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
-        format!(
+        let ns_prefix = namespace_prefix(self.params.namespace.as_deref());
+        let base = format!(
             "{}/{}/{}",
             self.params.backup_type, self.params.backup_id, self.params.backup_time
-        )
+        );
+        if ns_prefix.is_empty() {
+            base
+        } else {
+            format!("{}{}", ns_prefix, base)
+        }
     }
+}
+
+fn namespace_prefix(namespace: Option<&str>) -> String {
+    let ns = match namespace {
+        Some(ns) if !ns.is_empty() => ns,
+        _ => return String::new(),
+    };
+    let mut prefix = String::new();
+    for part in ns.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        prefix.push_str("ns/");
+        prefix.push_str(part);
+        prefix.push('/');
+    }
+    prefix
 }
 
 /// Reader session state (for restores)

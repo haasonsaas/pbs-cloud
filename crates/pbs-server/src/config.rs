@@ -22,6 +22,9 @@ pub struct ServerConfig {
     pub storage: StorageConfig,
     /// Tenant configuration
     pub tenants: TenantsConfig,
+    /// Additional datastores (besides default)
+    #[serde(default)]
+    pub datastores: Vec<String>,
     /// Garbage collection configuration
     #[serde(default)]
     pub gc: GcConfig,
@@ -43,6 +46,7 @@ impl Default for ServerConfig {
             rate_limit: Some(RateLimitConfig::default()),
             storage: StorageConfig::default(),
             tenants: TenantsConfig::default(),
+            datastores: Vec::new(),
             gc: GcConfig::default(),
             worm: WormConfig::default(),
             webhook_receiver_secret: None,

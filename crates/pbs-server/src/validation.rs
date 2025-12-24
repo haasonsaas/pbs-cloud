@@ -31,9 +31,15 @@ lazy_static! {
     /// Valid datastore name
     static ref DATASTORE_NAME_RE: Regex = Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$").unwrap();
 
+    /// Valid namespace segment: same as backup IDs
+    static ref NAMESPACE_SEGMENT_RE: Regex = Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$").unwrap();
+
     /// Valid chunk digest: 64 hex characters (SHA-256)
     static ref DIGEST_RE: Regex = Regex::new(r"^[a-fA-F0-9]{64}$").unwrap();
 }
+
+const MAX_NAMESPACE_DEPTH: usize = 7;
+const MAX_NAMESPACE_LENGTH: usize = 256;
 
 /// Reserved names that cannot be used
 const RESERVED_NAMES: &[&str] = &[
@@ -185,6 +191,34 @@ pub fn validate_datastore_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validate backup namespace (slash-separated)
+pub fn validate_backup_namespace(namespace: &str) -> Result<(), ApiError> {
+    if namespace.is_empty() {
+        return Ok(());
+    }
+    if namespace.len() > MAX_NAMESPACE_LENGTH {
+        return Err(ApiError::bad_request("Namespace is too long"));
+    }
+    let parts: Vec<&str> = namespace.split('/').collect();
+    if parts.len() > MAX_NAMESPACE_DEPTH {
+        return Err(ApiError::bad_request("Namespace is too deep"));
+    }
+    for part in parts {
+        if part.is_empty() {
+            return Err(ApiError::bad_request("Namespace contains empty path segment"));
+        }
+        if !NAMESPACE_SEGMENT_RE.is_match(part) {
+            return Err(ApiError::bad_request(
+                "Invalid namespace segment: must be alphanumeric with dots, underscores, or hyphens",
+            ));
+        }
+        if is_reserved_name(part) {
+            return Err(ApiError::bad_request("Namespace uses a reserved name"));
+        }
+    }
+    Ok(())
+}
+
 /// Validate chunk digest (hex string)
 pub fn validate_digest(digest: &str) -> Result<(), ApiError> {
     if digest.is_empty() {
@@ -213,6 +247,24 @@ pub fn validate_backup_params(
     validate_backup_type(backup_type)?;
     validate_backup_id(backup_id)?;
     validate_backup_time(backup_time)?;
+    Ok(())
+}
+
+/// Validate backup parameters including optional namespace
+pub fn validate_backup_params_with_ns(
+    backup_type: &str,
+    backup_id: &str,
+    backup_time: &str,
+    namespace: Option<&str>,
+    store: Option<&str>,
+) -> Result<(), ApiError> {
+    validate_backup_params(backup_type, backup_id, backup_time)?;
+    if let Some(ns) = namespace {
+        validate_backup_namespace(ns)?;
+    }
+    if let Some(store) = store {
+        validate_datastore_name(store)?;
+    }
     Ok(())
 }
 

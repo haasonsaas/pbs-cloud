@@ -102,6 +102,18 @@ fn load_config() -> Result<ServerConfig> {
         }
     }
 
+    if let Ok(datastores) = std::env::var("PBS_DATASTORES") {
+        let stores: Vec<String> = datastores
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !stores.is_empty() {
+            config.datastores = stores;
+        }
+    }
+
     // Persistence directory (can be separate from storage)
     if let Ok(dir) = std::env::var("PBS_PERSISTENCE_DIR") {
         config.data_dir = Some(dir);

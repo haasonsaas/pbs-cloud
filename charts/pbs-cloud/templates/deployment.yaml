@@ -46,6 +46,10 @@ spec:
               value: {{ .Values.config.listenAddr | quote }}
             - name: PBS_DEFAULT_TENANT
               value: {{ .Values.config.defaultTenant | quote }}
+            {{- if .Values.config.datastores }}
+            - name: PBS_DATASTORES
+              value: {{ .Values.config.datastores | quote }}
+            {{- end }}
             {{- if .Values.persistence.enabled }}
             - name: PBS_PERSISTENCE_DIR
               value: "/data/state"

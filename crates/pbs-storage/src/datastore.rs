@@ -45,6 +45,11 @@ impl Datastore {
         self.backend.clone()
     }
 
+    /// Get the crypto configuration
+    pub fn crypto_config(&self) -> CryptoConfig {
+        self.crypto.clone()
+    }
+
     /// Store a chunk (with deduplication)
     #[instrument(skip(self, chunk), fields(datastore = %self.name, digest = %chunk.digest()))]
     pub async fn store_chunk(&self, chunk: &Chunk) -> StorageResult<bool> {
@@ -133,10 +138,20 @@ impl Datastore {
     /// Store a backup manifest
     #[instrument(skip(self, manifest), fields(datastore = %self.name))]
     pub async fn store_manifest(&self, manifest: &BackupManifest) -> StorageResult<()> {
-        let path = format!("{}/index.json.blob", manifest.snapshot_path());
+        self.store_manifest_at(&manifest.snapshot_path(), manifest).await
+    }
+
+    /// Store a backup manifest at a specific snapshot path
+    #[instrument(skip(self, manifest), fields(datastore = %self.name, path = %snapshot_path))]
+    pub async fn store_manifest_at(
+        &self,
+        snapshot_path: &str,
+        manifest: &BackupManifest,
+    ) -> StorageResult<()> {
+        let path = format!("{}/index.json.blob", snapshot_path);
         let json = manifest.to_json().map_err(StorageError::Core)?;
-        let blob = DataBlob::encode(json.as_bytes(), &self.crypto, true)
-            .map_err(StorageError::Core)?;
+        let blob =
+            DataBlob::encode(json.as_bytes(), &self.crypto, true).map_err(StorageError::Core)?;
         self.backend
             .write_file(&path, Bytes::from(blob.to_bytes()))
             .await
@@ -146,11 +161,29 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, path = %path))]
     pub async fn read_manifest(&self, path: &str) -> StorageResult<BackupManifest> {
         let data = self.backend.read_file(path).await?;
-        let blob = DataBlob::from_bytes(&data).map_err(StorageError::Core)?;
-        let raw = blob.decode(&self.crypto).map_err(StorageError::Core)?;
+        if let Ok(blob) = DataBlob::from_bytes(&data) {
+            let raw = blob.decode(&self.crypto).map_err(StorageError::Core)?;
+            let json =
+                String::from_utf8(raw).map_err(|e| StorageError::Backend(e.to_string()))?;
+            return BackupManifest::from_json(&json).map_err(StorageError::Core);
+        }
+
         let json =
-            String::from_utf8(raw).map_err(|e| StorageError::Backend(e.to_string()))?;
+            String::from_utf8(data.to_vec()).map_err(|e| StorageError::Backend(e.to_string()))?;
         BackupManifest::from_json(&json).map_err(StorageError::Core)
+    }
+
+    /// Read a backup manifest, trying both blob and legacy JSON filenames
+    pub async fn read_manifest_any(&self, snapshot_path: &str) -> StorageResult<BackupManifest> {
+        let blob_path = format!("{}/index.json.blob", snapshot_path);
+        match self.read_manifest(&blob_path).await {
+            Ok(manifest) => Ok(manifest),
+            Err(StorageError::BlobNotFound(_)) => {
+                let json_path = format!("{}/index.json", snapshot_path);
+                self.read_manifest(&json_path).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// List backup groups (type/id combinations)
@@ -160,28 +193,27 @@ impl Datastore {
 
         for file in files {
             // Parse: {type}/{id}/{timestamp}/...
-            let parts: Vec<&str> = file.split('/').collect();
-            if parts.len() >= 2 {
-                groups.insert((parts[0].to_string(), parts[1].to_string()));
+            if let Some(group) = parse_backup_group(&file) {
+                groups.insert(group);
             }
         }
 
-        Ok(groups
-            .into_iter()
-            .map(|(backup_type, backup_id)| BackupGroup {
-                backup_type,
-                backup_id,
-            })
-            .collect())
+        Ok(groups.into_iter().collect())
     }
 
     /// List snapshots in a backup group
     pub async fn list_snapshots(
         &self,
+        namespace: Option<&str>,
         backup_type: &str,
         backup_id: &str,
     ) -> StorageResult<Vec<String>> {
-        let prefix = format!("{}/{}/", backup_type, backup_id);
+        let prefix = format!(
+            "{}{}/{}/",
+            namespace_prefix(namespace),
+            backup_type,
+            backup_id
+        );
         let files = self.backend.list_files(&prefix).await?;
 
         let mut snapshots = std::collections::HashSet::new();
@@ -203,12 +235,19 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name))]
     pub async fn delete_snapshot(
         &self,
+        namespace: Option<&str>,
         backup_type: &str,
         backup_id: &str,
         timestamp: &str,
     ) -> StorageResult<()> {
-        let manifest_path = format!("{}/{}/{}/index.json.blob", backup_type, backup_id, timestamp);
-        if let Ok(manifest) = self.read_manifest(&manifest_path).await {
+        let snapshot_path = format!(
+            "{}{}/{}/{}",
+            namespace_prefix(namespace),
+            backup_type,
+            backup_id,
+            timestamp
+        );
+        if let Ok(manifest) = self.read_manifest_any(&snapshot_path).await {
             if let Some(until) = retention_until(&manifest) {
                 if until > Utc::now() {
                     return Err(StorageError::SnapshotProtected(until.to_rfc3339()));
@@ -216,7 +255,7 @@ impl Datastore {
             }
         }
 
-        let prefix = format!("{}/{}/{}/", backup_type, backup_id, timestamp);
+        let prefix = format!("{}/", snapshot_path);
         let files = self.backend.list_files(&prefix).await?;
 
         for file in files {
@@ -243,12 +282,69 @@ fn retention_until(manifest: &BackupManifest) -> Option<DateTime<Utc>> {
 /// A backup group (type + ID)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackupGroup {
+    pub namespace: Option<String>,
     pub backup_type: String,
     pub backup_id: String,
 }
 
 impl BackupGroup {
     pub fn path(&self) -> String {
-        format!("{}/{}", self.backup_type, self.backup_id)
+        format!(
+            "{}{}/{}",
+            namespace_prefix(self.namespace.as_deref()),
+            self.backup_type,
+            self.backup_id
+        )
     }
+}
+
+fn namespace_prefix(namespace: Option<&str>) -> String {
+    let ns = match namespace {
+        Some(ns) if !ns.is_empty() => ns,
+        _ => return String::new(),
+    };
+    let mut prefix = String::new();
+    for part in ns.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        prefix.push_str("ns/");
+        prefix.push_str(part);
+        prefix.push('/');
+    }
+    prefix
+}
+
+fn parse_backup_group(path: &str) -> Option<BackupGroup> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut idx = 0;
+    let mut ns_parts = Vec::new();
+
+    while idx + 1 < parts.len() && parts[idx] == "ns" {
+        ns_parts.push(parts[idx + 1].to_string());
+        idx += 2;
+    }
+
+    if parts.len() < idx + 2 {
+        return None;
+    }
+
+    let backup_type = parts[idx];
+    let backup_id = parts[idx + 1];
+
+    if backup_type.is_empty() || backup_id.is_empty() {
+        return None;
+    }
+
+    let namespace = if ns_parts.is_empty() {
+        None
+    } else {
+        Some(ns_parts.join("/"))
+    };
+
+    Some(BackupGroup {
+        namespace,
+        backup_type: backup_type.to_string(),
+        backup_id: backup_id.to_string(),
+    })
 }

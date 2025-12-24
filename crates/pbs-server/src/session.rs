@@ -5,11 +5,31 @@
 use chrono::{DateTime, Utc};
 use pbs_core::{BackupManifest, ChunkDigest, DynamicIndex, FileType, FixedIndex};
 use pbs_storage::Datastore;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::protocol::{ApiError, BackupParams};
+
+fn namespace_prefix(namespace: Option<&str>) -> String {
+    let ns = match namespace {
+        Some(ns) if !ns.is_empty() => ns,
+        _ => return String::new(),
+    };
+    let mut prefix = String::new();
+    for part in ns.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        prefix.push_str("ns/");
+        prefix.push_str(part);
+        prefix.push('/');
+    }
+    prefix
+}
 
 /// Session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +71,8 @@ pub struct BackupSession {
     pub writers: HashMap<u64, IndexWriter>,
     /// Next writer ID
     pub next_writer_id: u64,
+    /// Indexes already persisted at close
+    pub closed_indexes: HashSet<String>,
     /// Uploaded blobs
     pub blobs: HashMap<String, Vec<u8>>,
     /// Retention timestamp (RFC3339)
@@ -82,6 +104,7 @@ impl BackupSession {
             blobs: HashMap::new(),
             writers: HashMap::new(),
             next_writer_id: 1,
+            closed_indexes: HashSet::new(),
             retain_until: None,
             datastore,
         }
@@ -89,6 +112,7 @@ impl BackupSession {
 
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
+        let ns_prefix = namespace_prefix(self.params.namespace.as_deref());
         let time = if self.params.backup_time.chars().all(|c| c.is_ascii_digit()) {
             self.params.backup_time.parse::<i64>()
                 .ok()
@@ -98,10 +122,19 @@ impl BackupSession {
         } else {
             self.params.backup_time.clone()
         };
-        format!(
+        let base = format!(
             "{}/{}/{}",
             self.params.backup_type, self.params.backup_id, time
-        )
+        );
+        if ns_prefix.is_empty() {
+            base
+        } else {
+            format!("{}{}", ns_prefix, base)
+        }
+    }
+
+    pub fn datastore(&self) -> Arc<Datastore> {
+        self.datastore.clone()
     }
 
     /// Update last activity
@@ -280,6 +313,68 @@ impl BackupSession {
         Ok((writer.name, writer.kind))
     }
 
+    pub async fn finalize_index_by_id(
+        &mut self,
+        wid: u64,
+        total_size: u64,
+        chunk_count: usize,
+        expected_csum: [u8; 32],
+    ) -> Result<(), ApiError> {
+        let writer = self
+            .writers
+            .get(&wid)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("Writer not found"))?;
+
+        match writer.kind {
+            IndexKind::Fixed => {
+                let builder = self
+                    .fixed_indexes
+                    .get_mut(&writer.name)
+                    .ok_or_else(|| ApiError::not_found("Fixed index not found"))?;
+                builder.set_total_size(total_size);
+                if builder.chunk_count() != chunk_count {
+                    return Err(ApiError::bad_request("Chunk count mismatch"));
+                }
+                let csum = builder.upload_csum();
+                if csum != expected_csum {
+                    return Err(ApiError::bad_request("Checksum mismatch"));
+                }
+                let index = builder.clone().build();
+                let path = format!("{}/{}", self.snapshot_path(), writer.name);
+                self.datastore
+                    .store_fixed_index(&path, &index)
+                    .await
+                    .map_err(|e| ApiError::internal(&e.to_string()))?;
+            }
+            IndexKind::Dynamic => {
+                let builder = self
+                    .dynamic_indexes
+                    .get_mut(&writer.name)
+                    .ok_or_else(|| ApiError::not_found("Dynamic index not found"))?;
+                builder.set_total_size(total_size);
+                if builder.chunk_count() != chunk_count {
+                    return Err(ApiError::bad_request("Chunk count mismatch"));
+                }
+                let csum = builder.upload_csum()?;
+                if csum != expected_csum {
+                    return Err(ApiError::bad_request("Checksum mismatch"));
+                }
+                let index = builder.clone().build()?;
+                let path = format!("{}/{}", self.snapshot_path(), writer.name);
+                self.datastore
+                    .store_dynamic_index(&path, &index)
+                    .await
+                    .map_err(|e| ApiError::internal(&e.to_string()))?;
+            }
+        }
+
+        self.closed_indexes.insert(writer.name.clone());
+        self.writers.remove(&wid);
+        self.touch();
+        Ok(())
+    }
+
     /// Store a blob
     pub fn store_blob(&mut self, name: &str, data: Vec<u8>) {
         self.blobs.insert(name.to_string(), data);
@@ -318,10 +413,12 @@ impl BackupSession {
             let path = format!("{}/{}", self.snapshot_path(), name);
             let data = index.to_bytes();
 
-            self.datastore
-                .store_fixed_index(&path, &index)
-                .await
-                .map_err(|e| ApiError::internal(&e.to_string()))?;
+            if !self.closed_indexes.contains(&name) {
+                self.datastore
+                    .store_fixed_index(&path, &index)
+                    .await
+                    .map_err(|e| ApiError::internal(&e.to_string()))?;
+            }
 
             manifest.add_file(&name, FileType::Fidx, data.len() as u64, &data);
         }
@@ -332,10 +429,12 @@ impl BackupSession {
             let path = format!("{}/{}", self.snapshot_path(), name);
             let data = index.to_bytes();
 
-            self.datastore
-                .store_dynamic_index(&path, &index)
-                .await
-                .map_err(|e| ApiError::internal(&e.to_string()))?;
+            if !self.closed_indexes.contains(&name) {
+                self.datastore
+                    .store_dynamic_index(&path, &index)
+                    .await
+                    .map_err(|e| ApiError::internal(&e.to_string()))?;
+            }
 
             manifest.add_file(&name, FileType::Didx, data.len() as u64, &data);
         }
@@ -369,7 +468,7 @@ impl BackupSession {
             manifest.unprotected = Some(value);
         }
         self.datastore
-            .store_manifest(&manifest)
+            .store_manifest_at(&self.snapshot_path(), &manifest)
             .await
             .map_err(|e| ApiError::internal(&e.to_string()))?;
 
@@ -433,6 +532,21 @@ impl FixedIndexBuilder {
         index.size = self.total_size.unwrap_or(self.size_accum);
         index
     }
+
+    pub fn chunk_count(&self) -> usize {
+        self.digests.len()
+    }
+
+    pub fn upload_csum(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for digest in &self.digests {
+            hasher.update(digest.as_bytes());
+        }
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    }
 }
 
 /// Builder for dynamic indexes
@@ -484,6 +598,42 @@ impl DynamicIndexBuilder {
 
         Ok(index)
     }
+
+    pub fn chunk_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn upload_csum(&self) -> Result<[u8; 32], ApiError> {
+        let mut entries = self.entries.clone();
+        entries.sort_by_key(|(offset, _, _)| *offset);
+
+        let mut hasher = Sha256::new();
+        for i in 0..entries.len() {
+            let (offset, digest, size_opt) = entries[i];
+            let size = if let Some(size) = size_opt {
+                size
+            } else {
+                let next_offset = entries.get(i + 1).map(|e| e.0);
+                match (next_offset, self.total_size) {
+                    (Some(next), _) => next.saturating_sub(offset),
+                    (None, Some(total)) => total.saturating_sub(offset),
+                    _ => {
+                        return Err(ApiError::bad_request(
+                            "Dynamic index size missing and total size not provided",
+                        ));
+                    }
+                }
+            };
+            let chunk_end = offset.saturating_add(size);
+            hasher.update(chunk_end.to_le_bytes());
+            hasher.update(digest.as_bytes());
+        }
+
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        Ok(out)
+    }
 }
 
 impl Default for DynamicIndexBuilder {
@@ -505,6 +655,8 @@ pub struct ReaderSession {
     pub backup_id: String,
     /// Backup time
     pub backup_time: String,
+    /// Optional namespace
+    pub namespace: Option<String>,
     /// Session state
     pub state: SessionState,
     /// Creation time
@@ -525,6 +677,7 @@ impl ReaderSession {
         backup_type: String,
         backup_id: String,
         backup_time: String,
+        namespace: Option<String>,
         datastore: Arc<Datastore>,
     ) -> Self {
         let now = Utc::now();
@@ -534,6 +687,7 @@ impl ReaderSession {
             backup_type,
             backup_id,
             backup_time,
+            namespace,
             state: SessionState::Active,
             created_at: now,
             last_activity: now,
@@ -544,10 +698,17 @@ impl ReaderSession {
 
     /// Get snapshot path
     pub fn snapshot_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.backup_type, self.backup_id, self.backup_time
-        )
+        let ns_prefix = namespace_prefix(self.namespace.as_deref());
+        let base = format!("{}/{}/{}", self.backup_type, self.backup_id, self.backup_time);
+        if ns_prefix.is_empty() {
+            base
+        } else {
+            format!("{}{}", ns_prefix, base)
+        }
+    }
+
+    pub fn datastore(&self) -> Arc<Datastore> {
+        self.datastore.clone()
     }
 
     /// Update last activity
@@ -558,10 +719,10 @@ impl ReaderSession {
     /// Load the manifest
     pub async fn load_manifest(&mut self) -> Result<&BackupManifest, ApiError> {
         if self.manifest.is_none() {
-            let path = format!("{}/index.json.blob", self.snapshot_path());
+            let snapshot_path = self.snapshot_path();
             let manifest = self
                 .datastore
-                .read_manifest(&path)
+                .read_manifest_any(&snapshot_path)
                 .await
                 .map_err(|e| ApiError::not_found(&e.to_string()))?;
             self.manifest = Some(manifest);
@@ -726,10 +887,12 @@ impl SessionManager {
     }
 
     /// Execute an async operation on a backup session
-    pub async fn with_backup_session_async<F, Fut, R>(&self, id: &str, f: F) -> Result<R, ApiError>
+    pub async fn with_backup_session_async<F, R>(&self, id: &str, f: F) -> Result<R, ApiError>
     where
-        F: FnOnce(&mut BackupSession) -> Fut,
-        Fut: std::future::Future<Output = Result<R, ApiError>>,
+        F: for<'a> FnOnce(
+            &'a mut BackupSession,
+        )
+            -> Pin<Box<dyn Future<Output = Result<R, ApiError>> + Send + 'a>>,
     {
         let mut sessions = self.backup_sessions.write().await;
         let session = sessions
@@ -752,6 +915,7 @@ impl SessionManager {
         backup_type: &str,
         backup_id: &str,
         backup_time: &str,
+        namespace: Option<String>,
         datastore: Arc<Datastore>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
@@ -761,6 +925,7 @@ impl SessionManager {
             backup_type.to_string(),
             backup_id.to_string(),
             backup_time.to_string(),
+            namespace,
             datastore,
         );
 
@@ -937,9 +1102,8 @@ impl SessionManager {
             (session.snapshot_path(), session.datastore.clone())
         };
 
-        let path = format!("{}/index.json.blob", snapshot_path);
         let manifest = datastore
-            .read_manifest(&path)
+            .read_manifest_any(&snapshot_path)
             .await
             .map_err(|e| ApiError::not_found(&e.to_string()))?;
 
@@ -1007,6 +1171,8 @@ mod tests {
             backup_type: "vm".to_string(),
             backup_id: "100".to_string(),
             backup_time: "2024-01-01T00:00:00Z".to_string(),
+            namespace: None,
+            store: None,
             encrypt: false,
             retain_until: None,
             retention_days: None,
@@ -1048,7 +1214,14 @@ mod tests {
 
         // Create a reader session for tenant1
         let session_id = manager
-            .create_reader_session("tenant1", "vm", "100", "2024-01-01T00:00:00Z", datastore)
+            .create_reader_session(
+                "tenant1",
+                "vm",
+                "100",
+                "2024-01-01T00:00:00Z",
+                None,
+                datastore,
+            )
             .await;
 
         // Verify tenant1 can access the session

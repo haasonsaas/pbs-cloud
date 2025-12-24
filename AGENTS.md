@@ -8,10 +8,14 @@
 - `crates/pbs-core`: PBS formats (chunks, blobs, indexes, manifests, crypto).
 - `crates/pbs-storage`: datastore + backends (local, S3), GC + prune.
 - `crates/pbs-server`: HTTP server, auth, sessions, streaming protocol, billing, metrics.
+- `charts/pbs-cloud`: Helm chart for Kubernetes deployment.
 
 ## Build & test
 - Build: `cargo build --release`
 - Test: `cargo test`
+- Format (CI): `cargo fmt --all -- --check`
+- Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
+- Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
 
 ## Run
 - Local storage:
@@ -22,10 +26,13 @@
   - `export PBS_S3_REGION=us-east-1`
   - Optional: `export PBS_S3_ENDPOINT=https://...`
   - Optional: `export PBS_S3_PREFIX=...`
+- Multiple datastores:
+  - `export PBS_DATASTORES=fast,archive`
+  - Default store uses `PBS_DATA_DIR` or `PBS_S3_PREFIX`; additional stores are created under per-store paths/prefixes.
 
 ## Configuration (env vars)
 - Server: `PBS_LISTEN_ADDR`, `PBS_PERSISTENCE_DIR`
-- Storage: `PBS_DATA_DIR`, `PBS_S3_BUCKET`, `PBS_S3_REGION`, `PBS_S3_ENDPOINT`, `PBS_S3_PREFIX`
+- Storage: `PBS_DATA_DIR`, `PBS_S3_BUCKET`, `PBS_S3_REGION`, `PBS_S3_ENDPOINT`, `PBS_S3_PREFIX`, `PBS_DATASTORES`
 - Tenancy: `PBS_DEFAULT_TENANT`
 - TLS: `PBS_TLS_DISABLED`, `PBS_TLS_CERT`, `PBS_TLS_KEY`
 - GC: `PBS_GC_DISABLED`, `PBS_GC_INTERVAL_HOURS`
@@ -39,25 +46,24 @@
 - H2 paths used by PBS clients:
   - Backup: `/blob`, `/fixed_index`, `/dynamic_index`, `/fixed_chunk`, `/dynamic_chunk`, `/fixed_close`, `/dynamic_close`, `/finish`, `/previous_backup_time`, `/previous`.
   - Reader: `/download`, `/chunk`, `/speedtest`.
+- Query params supported on upgrade: `backup-type`, `backup-id`, `backup-time`, `ns` (namespace), `store` (datastore).
 - `backup-time` on upgrade is a Unix epoch; stored internally as RFC3339.
 
 ## Storage layout
-- Manifests: `index.json.blob` (DataBlob-encoded JSON).
+- Manifests: `index.json.blob` (DataBlob-encoded JSON), with legacy fallback to `index.json`.
 - Indexes: raw `.fidx`/`.didx` bytes (no DataBlob wrapper).
 - Chunks: DataBlob bytes (client-encoded for H2 uploads).
+- Namespace prefixes: `ns/<segment>/` repeated per namespace level.
 
 ## Shortcuts / compatibility gaps
-- Namespaces (`ns`) are ignored; only the default datastore (`store=default`) is supported.
-- H2 `fixed_close`/`dynamic_close` ignore `chunk-count` and `csum` (no server-side verification).
-- H2 chunk uploads trust client digests/encoded sizes (no recompute/validation on upload).
-- Indexes are persisted at session finish (not at `*_close`), so partial sessions do not leave index files.
-- Server-managed encryption is global (env-only, no rotation); H2 encrypted chunks are stored as-is.
-- No migration path for legacy manifests stored as `index.json` (non-blob).
+- Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
+- If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
+- Admin/REST surface is a focused subset of PBS APIs (no task scheduler or UI-specific endpoints).
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.
 - Metrics: `/metrics` (public).
-- Compliance report: `GET /api2/json/compliance/report` (Admin).
+- Compliance report: `GET /api2/json/compliance/report` (Admin, optional `store`).
 - Webhook verification: `POST /api2/json/billing/webhook` with `X-Signature-256`.
 
 ## Where to look
