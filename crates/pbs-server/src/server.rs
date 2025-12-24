@@ -35,7 +35,7 @@ use crate::protocol::{ApiError, BackupParams, BACKUP_PROTOCOL_HEADER, READER_PRO
 use crate::rate_limit::{RateLimitResult, RateLimiter_};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtocolHandler};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{TaskRegistry, TaskSnapshot};
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
@@ -225,6 +225,12 @@ impl ServerState {
         let backup_tasks = Arc::new(RwLock::new(HashMap::new()));
         let reader_tasks = Arc::new(RwLock::new(HashMap::new()));
 
+        let task_snapshots = persistence.load_tasks().await.unwrap_or_default();
+        if !task_snapshots.is_empty() {
+            tasks.restore(task_snapshots).await;
+            info!("Restored task history from persistence");
+        }
+
         Ok(Self {
             config,
             backend,
@@ -263,10 +269,12 @@ impl ServerState {
         let users = self.auth.list_users(None).await;
         let tokens = self.auth.list_all_tokens().await;
         let tenants = self.tenants.list_tenants().await;
+        let tasks = self.tasks.snapshot().await;
 
         self.persistence.save_users(&users).await?;
         self.persistence.save_tokens(&tokens).await?;
         self.persistence.save_tenants(&tenants).await?;
+        self.persistence.save_tasks(&tasks).await?;
 
         debug!("Saved state to persistence");
         Ok(())
@@ -411,6 +419,62 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                             error!("Scheduled GC failed for {}: {}", datastore.name(), e);
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Spawn scheduled verification if enabled
+    if state.config.verify.enabled && state.config.verify.interval_hours > 0 {
+        let state_for_verify = state.clone();
+        let verify_interval =
+            tokio::time::Duration::from_secs(state.config.verify.interval_hours * 3600);
+        info!(
+            "Scheduled verification enabled, running every {} hours",
+            state.config.verify.interval_hours
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(verify_interval);
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                info!("Starting scheduled verification run");
+
+                let snapshots = state_for_verify.tasks.snapshot().await;
+                let mut running_stores = std::collections::HashSet::new();
+                for task in snapshots {
+                    if task.worker_type == "verify" && task.running {
+                        if let Some(store) = task.store {
+                            running_stores.insert(store);
+                        }
+                    }
+                }
+
+                let datastores: Vec<_> = state_for_verify
+                    .datastores
+                    .iter()
+                    .map(|(name, ds)| (name.clone(), ds.clone()))
+                    .collect();
+
+                for (store, datastore) in datastores {
+                    if running_stores.contains(&store) {
+                        info!(
+                            "Skipping scheduled verification for {} (already running)",
+                            store
+                        );
+                        continue;
+                    }
+                    let auth_id = "root@pam@pbs".to_string();
+                    let _ = spawn_verify_task(
+                        state_for_verify.clone(),
+                        datastore,
+                        auth_id,
+                        store,
+                        "scheduled",
+                    )
+                    .await;
                 }
             }
         });
@@ -4430,53 +4494,29 @@ async fn handle_prune(
     handle_prune_body(state, ctx, &store, body).await
 }
 
-async fn handle_verify_api(
+async fn spawn_verify_task(
     state: Arc<ServerState>,
-    ctx: &AuthContext,
-    req: Request<Incoming>,
-) -> Response<Full<Bytes>> {
-    let uri = req.uri().clone();
-    let path = uri.path();
-    let rest = path
-        .trim_start_matches("/api2/json/admin/verify")
-        .trim_start_matches('/');
-    if rest.is_empty() {
-        if req.method() != Method::GET {
-            return not_found();
-        }
-        return json_response(StatusCode::OK, &serde_json::json!({ "data": [] }));
-    }
-
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() < 2 || parts[1] != "run" || req.method() != Method::POST {
-        return not_found();
-    }
-    let store = parts[0];
-    if let Err(e) = validate_datastore_name(store) {
-        return error_response(e);
-    }
-    let datastore = match state.get_datastore(store) {
-        Some(ds) => ds,
-        None => return not_found(),
-    };
-
-    let auth_id = task_auth_id(ctx);
+    datastore: Arc<Datastore>,
+    auth_id: String,
+    store_name: String,
+    trigger: &str,
+) -> String {
     let upid = state
         .tasks
-        .create(&auth_id, "verify", Some(store), Some(store))
+        .create(&auth_id, "verify", Some(&store_name), Some(&store_name))
         .await;
     let state_clone = state.clone();
     let datastore_clone = datastore.clone();
     let upid_clone = upid.clone();
-    let store_name = store.to_string();
+    let store_name_clone = store_name.clone();
+    let trigger_label = trigger.to_string();
+
     tokio::spawn(async move {
-        state_clone
-            .tasks
-            .log(
-                &upid_clone,
-                &format!("Verification started for {}", store_name),
-            )
-            .await;
+        let mut start_message = format!("Verification started for {}", store_name_clone);
+        if !trigger_label.is_empty() {
+            start_message.push_str(&format!(" ({})", trigger_label));
+        }
+        state_clone.tasks.log(&upid_clone, &start_message).await;
 
         let groups = match datastore_clone.list_backup_groups().await {
             Ok(groups) => groups,
@@ -4783,6 +4823,107 @@ async fn handle_verify_api(
             state_clone.tasks.finish(&upid_clone, "OK").await;
         }
     });
+
+    upid
+}
+
+async fn handle_verify_api(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let path = uri.path();
+    let rest = path
+        .trim_start_matches("/api2/json/admin/verify")
+        .trim_start_matches('/');
+    if rest.is_empty() {
+        if req.method() != Method::GET {
+            return not_found();
+        }
+        let store_filter = get_query_param(req.uri(), "store");
+        let snapshots = state.tasks.snapshot().await;
+        let now = chrono::Utc::now().timestamp();
+        let interval = state.config.verify.interval_hours as i64 * 3600;
+
+        let mut items = Vec::new();
+        for store in state.datastores.keys() {
+            if let Some(ref filter) = store_filter {
+                if store != filter {
+                    continue;
+                }
+            }
+            let mut last_task: Option<TaskSnapshot> = None;
+            for task in snapshots
+                .iter()
+                .filter(|t| t.worker_type == "verify" && t.store.as_deref() == Some(store.as_str()))
+            {
+                if last_task
+                    .as_ref()
+                    .map(|prev| task.starttime > prev.starttime)
+                    .unwrap_or(true)
+                {
+                    last_task = Some(task.clone());
+                }
+            }
+
+            let (last_run_upid, last_run_state, last_run_endtime) = match last_task.as_ref() {
+                Some(task) => (
+                    Some(task.upid.clone()),
+                    task.exitstatus.clone().or_else(|| task.status.clone()),
+                    task.endtime,
+                ),
+                None => (None, None, None),
+            };
+
+            let next_run = if state.config.verify.enabled && interval > 0 {
+                let base = last_run_endtime.unwrap_or(now);
+                Some(base + interval)
+            } else {
+                None
+            };
+
+            items.push(serde_json::json!({
+                "id": store,
+                "store": store,
+                "schedule": if state.config.verify.enabled { Some(format!("interval-{}h", state.config.verify.interval_hours)) } else { None },
+                "comment": None::<String>,
+                "ignore-verified": None::<bool>,
+                "outdated-after": None::<i64>,
+                "ns": None::<String>,
+                "max-depth": None::<usize>,
+                "next-run": next_run,
+                "last-run-state": last_run_state,
+                "last-run-upid": last_run_upid,
+                "last-run-endtime": last_run_endtime,
+            }));
+        }
+
+        return json_response(StatusCode::OK, &serde_json::json!({ "data": items }));
+    }
+
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 2 || parts[1] != "run" || req.method() != Method::POST {
+        return not_found();
+    }
+    let store = parts[0];
+    if let Err(e) = validate_datastore_name(store) {
+        return error_response(e);
+    }
+    let datastore = match state.get_datastore(store) {
+        Some(ds) => ds,
+        None => return not_found(),
+    };
+
+    let auth_id = task_auth_id(ctx);
+    let upid = spawn_verify_task(
+        state.clone(),
+        datastore,
+        auth_id,
+        store.to_string(),
+        "manual",
+    )
+    .await;
 
     json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
 }

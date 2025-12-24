@@ -28,6 +28,9 @@ pub struct ServerConfig {
     /// Garbage collection configuration
     #[serde(default)]
     pub gc: GcConfig,
+    /// Verification scheduling configuration
+    #[serde(default)]
+    pub verify: VerifyConfig,
     /// WORM/immutability configuration
     #[serde(default)]
     pub worm: WormConfig,
@@ -48,6 +51,7 @@ impl Default for ServerConfig {
             tenants: TenantsConfig::default(),
             datastores: Vec::new(),
             gc: GcConfig::default(),
+            verify: VerifyConfig::default(),
             worm: WormConfig::default(),
             webhook_receiver_secret: None,
             encryption_key: None,
@@ -165,6 +169,24 @@ impl Default for GcConfig {
     }
 }
 
+/// Verification scheduling configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    /// Enable scheduled verification runs (runs every verify_interval_hours)
+    pub enabled: bool,
+    /// Interval in hours between automatic verification runs
+    pub interval_hours: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_hours: 24,
+        }
+    }
+}
+
 /// WORM/immutability configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WormConfig {
@@ -221,6 +243,13 @@ mod tests {
         let gc = GcConfig::default();
         assert!(gc.enabled);
         assert_eq!(gc.interval_hours, 24);
+    }
+
+    #[test]
+    fn test_verify_config_default() {
+        let verify = VerifyConfig::default();
+        assert!(!verify.enabled);
+        assert_eq!(verify.interval_hours, 24);
     }
 
     #[test]

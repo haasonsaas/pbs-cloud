@@ -11,6 +11,7 @@
 - Align response payloads with upstream `pbs-api-types` (field names and optional fields matter).
 - Update AGENTS.md when you change APIs, compatibility, or operational behavior.
 - Run `cargo test` and `helm lint ./charts/pbs-cloud` before pushing.
+- Add nested `AGENTS.md` or `AGENTS.override.md` only when a subdirectory needs stricter or different rules.
 
 ### Don't
 - Do not change manifest format or storage layout without a migration plan.
@@ -59,6 +60,7 @@
 - Tenancy: `PBS_DEFAULT_TENANT`
 - TLS: `PBS_TLS_DISABLED`, `PBS_TLS_CERT`, `PBS_TLS_KEY`
 - GC: `PBS_GC_DISABLED`, `PBS_GC_INTERVAL_HOURS`
+- Verify: `PBS_VERIFY_DISABLED`, `PBS_VERIFY_INTERVAL_HOURS`
 - WORM: `PBS_WORM_ENABLED`, `PBS_WORM_RETENTION_DAYS`, `PBS_WORM_ALLOW_OVERRIDE`
 - Webhook verification: `PBS_WEBHOOK_RECEIVER_SECRET`
 - Server-managed encryption: `PBS_ENCRYPTION_KEY` (hex, 32 bytes), `PBS_ENCRYPTION_KEY_FILE`
@@ -86,7 +88,7 @@
 - `/api2/json/admin/datastore/<store>/change-owner` (POST) group ownership.
 - `/api2/json/admin/datastore/<store>/gc` (POST) GC.
 - `/api2/json/admin/datastore/<store>/prune` (POST) prune.
-- `/api2/json/admin/verify` (GET) verification job list (stubbed).
+- `/api2/json/admin/verify` (GET) verification job list (synthetic per datastore).
 - `/api2/json/admin/verify/<store>/run` (POST) run verification task.
 
 ## Storage layout
@@ -99,7 +101,8 @@
 ## Shortcuts / compatibility gaps
 - Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
 - If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
-- Admin/REST surface is a focused subset of PBS APIs (no task scheduler or UI-specific endpoints).
+- Admin/REST surface is a focused subset of PBS APIs (no full job config endpoints or UI-specific endpoints).
+- Verification jobs are interval-based and not configurable via PBS job config APIs (no per-namespace/outdated filters).
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.

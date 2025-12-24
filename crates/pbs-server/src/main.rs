@@ -143,6 +143,20 @@ fn load_config() -> Result<ServerConfig> {
         }
     }
 
+    // Verification scheduling configuration
+    let verify_disabled = std::env::var("PBS_VERIFY_DISABLED").is_ok();
+    if verify_disabled {
+        config.verify.enabled = false;
+    }
+    if let Ok(hours) = std::env::var("PBS_VERIFY_INTERVAL_HOURS") {
+        if let Ok(h) = hours.parse::<u64>() {
+            config.verify.interval_hours = h;
+            if h > 0 && !verify_disabled {
+                config.verify.enabled = true;
+            }
+        }
+    }
+
     // WORM configuration
     if let Ok(enabled) = std::env::var("PBS_WORM_ENABLED") {
         config.worm.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");

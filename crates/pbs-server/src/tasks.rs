@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ pub struct TaskRegistry {
     max_tasks: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TaskEntry {
     upid: String,
     node: String,
@@ -31,6 +32,66 @@ struct TaskEntry {
     exitstatus: Option<String>,
     log: Vec<String>,
     running: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct TaskSnapshot {
+    pub upid: String,
+    pub node: String,
+    pub pid: i64,
+    pub pstart: u64,
+    pub starttime: i64,
+    pub worker_type: String,
+    pub worker_id: Option<String>,
+    pub user: String,
+    pub store: Option<String>,
+    pub endtime: Option<i64>,
+    pub status: Option<String>,
+    pub exitstatus: Option<String>,
+    pub log: Vec<String>,
+    pub running: bool,
+}
+
+impl From<TaskEntry> for TaskSnapshot {
+    fn from(entry: TaskEntry) -> Self {
+        Self {
+            upid: entry.upid,
+            node: entry.node,
+            pid: entry.pid,
+            pstart: entry.pstart,
+            starttime: entry.starttime,
+            worker_type: entry.worker_type,
+            worker_id: entry.worker_id,
+            user: entry.user,
+            store: entry.store,
+            endtime: entry.endtime,
+            status: entry.status,
+            exitstatus: entry.exitstatus,
+            log: entry.log,
+            running: entry.running,
+        }
+    }
+}
+
+impl From<TaskSnapshot> for TaskEntry {
+    fn from(snapshot: TaskSnapshot) -> Self {
+        Self {
+            upid: snapshot.upid,
+            node: snapshot.node,
+            pid: snapshot.pid,
+            pstart: snapshot.pstart,
+            starttime: snapshot.starttime,
+            worker_type: snapshot.worker_type,
+            worker_id: snapshot.worker_id,
+            user: snapshot.user,
+            store: snapshot.store,
+            endtime: snapshot.endtime,
+            status: snapshot.status,
+            exitstatus: snapshot.exitstatus,
+            log: snapshot.log,
+            running: snapshot.running,
+        }
+    }
 }
 
 impl TaskRegistry {
@@ -226,5 +287,39 @@ impl TaskRegistry {
             "stopped".to_string()
         };
         Some((status, task.exitstatus.clone()))
+    }
+
+    pub async fn snapshot(&self) -> Vec<TaskSnapshot> {
+        let tasks = self.tasks.read().await;
+        let order = self.order.read().await;
+        let mut snapshots = Vec::new();
+        for upid in order.iter() {
+            if let Some(task) = tasks.get(upid) {
+                snapshots.push(TaskSnapshot::from(task.clone()));
+            }
+        }
+        snapshots
+    }
+
+    pub async fn restore(&self, snapshots: Vec<TaskSnapshot>) {
+        let mut tasks = self.tasks.write().await;
+        let mut order = self.order.write().await;
+        tasks.clear();
+        order.clear();
+
+        for mut snapshot in snapshots {
+            if snapshot.running {
+                snapshot.running = false;
+                snapshot.status = Some("stopped".to_string());
+                snapshot.exitstatus = Some("ABORTED".to_string());
+                snapshot.endtime = Some(Utc::now().timestamp());
+                snapshot.log.push(format!(
+                    "{}: task restored from persistence and marked stopped",
+                    Utc::now().format("%Y-%m-%dT%H:%M:%S%:z")
+                ));
+            }
+            order.push_back(snapshot.upid.clone());
+            tasks.insert(snapshot.upid.clone(), TaskEntry::from(snapshot));
+        }
     }
 }

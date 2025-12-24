@@ -8,6 +8,7 @@ use tokio::fs;
 use tracing::info;
 
 use crate::auth::{ApiToken, Permission, User};
+use crate::tasks::TaskSnapshot;
 use crate::tenant::Tenant;
 
 /// Persistence configuration
@@ -34,6 +35,10 @@ impl PersistenceConfig {
 
     fn tenants_file(&self) -> PathBuf {
         self.data_dir.join("tenants.json")
+    }
+
+    fn tasks_file(&self) -> PathBuf {
+        self.data_dir.join("tasks.json")
     }
 }
 
@@ -135,6 +140,22 @@ impl Default for TenantsData {
         Self {
             version: 1,
             tenants: Vec::new(),
+        }
+    }
+}
+
+/// Data format for tasks file
+#[derive(Debug, Serialize, Deserialize)]
+struct TasksData {
+    version: u32,
+    tasks: Vec<TaskSnapshot>,
+}
+
+impl Default for TasksData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            tasks: Vec::new(),
         }
     }
 }
@@ -248,6 +269,38 @@ impl PersistenceManager {
         let path = self.config.tenants_file();
 
         // Write to temp file first, then rename (atomic)
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, &content).await?;
+        fs::rename(&temp_path, &path).await?;
+
+        Ok(())
+    }
+
+    /// Load tasks from disk
+    pub async fn load_tasks(&self) -> anyhow::Result<Vec<TaskSnapshot>> {
+        let path = self.config.tasks_file();
+        if !path.exists() {
+            info!("No tasks file found, starting fresh");
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&path).await?;
+        let data: TasksData = serde_json::from_str(&content)?;
+
+        info!("Loaded {} tasks from disk", data.tasks.len());
+        Ok(data.tasks)
+    }
+
+    /// Save tasks to disk
+    pub async fn save_tasks(&self, tasks: &[TaskSnapshot]) -> anyhow::Result<()> {
+        let data = TasksData {
+            version: 1,
+            tasks: tasks.to_vec(),
+        };
+
+        let content = serde_json::to_string_pretty(&data)?;
+        let path = self.config.tasks_file();
+
         let temp_path = path.with_extension("json.tmp");
         fs::write(&temp_path, &content).await?;
         fs::rename(&temp_path, &path).await?;
