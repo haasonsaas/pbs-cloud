@@ -36,6 +36,26 @@ pub enum DeletableProperty {
     MaxDepth,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerificationJobState {
+    pub id: String,
+    pub last_run_upid: Option<String>,
+    pub last_run_state: Option<String>,
+    pub last_run_endtime: Option<i64>,
+}
+
+impl VerificationJobState {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            last_run_upid: None,
+            last_run_state: None,
+            last_run_endtime: None,
+        }
+    }
+}
+
 impl VerificationJobConfig {
     pub fn apply_update(
         &mut self,

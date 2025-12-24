@@ -108,8 +108,8 @@
 - Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
 - If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
 - Admin/REST surface is a focused subset of PBS APIs (verify jobs supported; other job types/UI endpoints are not).
-- Verification jobs store schedule strings but the scheduler still uses the global interval; no cron parsing yet.
-- Verification job config has no digest/concurrency checks and no notifications.
+- Verification job schedule parsing supports hourly/daily/weekly/monthly/yearly plus weekday lists/ranges; it uses UTC and does not implement full PBS calendar event syntax or time zones yet.
+- Verification jobs do not emit notification events yet.
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.

@@ -10,7 +10,7 @@ use tracing::info;
 use crate::auth::{ApiToken, Permission, User};
 use crate::tasks::TaskSnapshot;
 use crate::tenant::Tenant;
-use crate::verify_jobs::VerificationJobConfig;
+use crate::verify_jobs::{VerificationJobConfig, VerificationJobState};
 
 /// Persistence configuration
 #[derive(Debug, Clone)]
@@ -44,6 +44,10 @@ impl PersistenceConfig {
 
     fn verify_jobs_file(&self) -> PathBuf {
         self.data_dir.join("verify-jobs.json")
+    }
+
+    fn verify_job_state_file(&self) -> PathBuf {
+        self.data_dir.join("verify-job-state.json")
     }
 }
 
@@ -177,6 +181,22 @@ impl Default for VerifyJobsData {
         Self {
             version: 1,
             jobs: Vec::new(),
+        }
+    }
+}
+
+/// Data format for verify job state file
+#[derive(Debug, Serialize, Deserialize)]
+struct VerifyJobStateData {
+    version: u32,
+    states: Vec<VerificationJobState>,
+}
+
+impl Default for VerifyJobStateData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            states: Vec::new(),
         }
     }
 }
@@ -353,6 +373,41 @@ impl PersistenceManager {
 
         let content = serde_json::to_string_pretty(&data)?;
         let path = self.config.verify_jobs_file();
+
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, &content).await?;
+        fs::rename(&temp_path, &path).await?;
+
+        Ok(())
+    }
+
+    /// Load verification job state from disk
+    pub async fn load_verify_job_state(&self) -> anyhow::Result<Vec<VerificationJobState>> {
+        let path = self.config.verify_job_state_file();
+        if !path.exists() {
+            info!("No verify job state file found, starting fresh");
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&path).await?;
+        let data: VerifyJobStateData = serde_json::from_str(&content)?;
+
+        info!("Loaded {} verify job states from disk", data.states.len());
+        Ok(data.states)
+    }
+
+    /// Save verification job state to disk
+    pub async fn save_verify_job_state(
+        &self,
+        states: &[VerificationJobState],
+    ) -> anyhow::Result<()> {
+        let data = VerifyJobStateData {
+            version: 1,
+            states: states.to_vec(),
+        };
+
+        let content = serde_json::to_string_pretty(&data)?;
+        let path = self.config.verify_job_state_file();
 
         let temp_path = path.with_extension("json.tmp");
         fs::write(&temp_path, &content).await?;

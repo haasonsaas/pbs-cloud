@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use chrono::{Datelike, Duration, TimeZone, Timelike, Weekday};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -22,6 +23,7 @@ use pbs_storage::{
     Datastore, GarbageCollector, GcOptions, LocalBackend, PruneOptions, Pruner, S3Backend,
     StorageBackend,
 };
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
@@ -45,7 +47,9 @@ use crate::validation::{
     validate_backup_params_with_ns, validate_backup_type, validate_datastore_name, validate_digest,
     validate_filename, validate_tenant_name, validate_username,
 };
-use crate::verify_jobs::{DeletableProperty, VerificationJobConfig, VerificationJobConfigUpdater};
+use crate::verify_jobs::{
+    DeletableProperty, VerificationJobConfig, VerificationJobConfigUpdater, VerificationJobState,
+};
 
 /// Server state
 pub struct ServerState {
@@ -83,6 +87,8 @@ pub struct ServerState {
     pub reader_tasks: Arc<RwLock<HashMap<String, String>>>,
     /// Verification job configurations
     pub verify_jobs: Arc<RwLock<HashMap<String, VerificationJobConfig>>>,
+    /// Verification job state (last run, status)
+    pub verify_job_state: Arc<RwLock<HashMap<String, VerificationJobState>>>,
 }
 
 impl ServerState {
@@ -234,6 +240,7 @@ impl ServerState {
         let backup_tasks = Arc::new(RwLock::new(HashMap::new()));
         let reader_tasks = Arc::new(RwLock::new(HashMap::new()));
         let verify_jobs = Arc::new(RwLock::new(HashMap::new()));
+        let verify_job_state = Arc::new(RwLock::new(HashMap::new()));
 
         let task_snapshots = persistence.load_tasks().await.unwrap_or_default();
         if !task_snapshots.is_empty() {
@@ -248,6 +255,27 @@ impl ServerState {
                 guard.insert(job.id.clone(), job);
             }
             info!("Loaded verify job configuration from persistence");
+        }
+
+        let job_states = persistence
+            .load_verify_job_state()
+            .await
+            .unwrap_or_default();
+        if !job_states.is_empty() {
+            let job_ids = {
+                let guard = verify_jobs.read().await;
+                guard
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            };
+            let mut guard = verify_job_state.write().await;
+            for state in job_states {
+                if job_ids.is_empty() || job_ids.contains(&state.id) {
+                    guard.insert(state.id.clone(), state);
+                }
+            }
+            info!("Loaded verify job state from persistence");
         }
 
         Ok(Self {
@@ -268,6 +296,7 @@ impl ServerState {
             backup_tasks,
             reader_tasks,
             verify_jobs,
+            verify_job_state,
         })
     }
 
@@ -294,12 +323,19 @@ impl ServerState {
             let guard = self.verify_jobs.read().await;
             guard.values().cloned().collect::<Vec<_>>()
         };
+        let verify_job_state = {
+            let guard = self.verify_job_state.read().await;
+            guard.values().cloned().collect::<Vec<_>>()
+        };
 
         self.persistence.save_users(&users).await?;
         self.persistence.save_tokens(&tokens).await?;
         self.persistence.save_tenants(&tenants).await?;
         self.persistence.save_tasks(&tasks).await?;
         self.persistence.save_verify_jobs(&verify_jobs).await?;
+        self.persistence
+            .save_verify_job_state(&verify_job_state)
+            .await?;
 
         debug!("Saved state to persistence");
         Ok(())
@@ -450,28 +486,28 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
     }
 
     // Spawn scheduled verification if enabled
-    if state.config.verify.enabled && state.config.verify.interval_hours > 0 {
+    if state.config.verify.enabled {
         let state_for_verify = state.clone();
-        let verify_interval =
-            tokio::time::Duration::from_secs(state.config.verify.interval_hours * 3600);
-        info!(
-            "Scheduled verification enabled, running every {} hours",
-            state.config.verify.interval_hours
-        );
+        let interval_secs = if state.config.verify.interval_hours > 0 {
+            Some(state.config.verify.interval_hours as i64 * 3600)
+        } else {
+            None
+        };
+        info!("Scheduled verification enabled");
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(verify_interval);
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             interval.tick().await;
 
             loop {
                 interval.tick().await;
-                info!("Starting scheduled verification run");
+                let now = chrono::Utc::now().timestamp();
 
                 let snapshots = state_for_verify.tasks.snapshot().await;
                 let mut running_workers = std::collections::HashSet::new();
-                for task in snapshots {
+                for task in &snapshots {
                     if task.worker_type == "verificationjob" && task.running {
-                        if let Some(worker_id) = task.worker_id {
+                        if let Some(worker_id) = task.worker_id.clone() {
                             running_workers.insert(worker_id);
                         }
                     }
@@ -483,6 +519,9 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 };
 
                 if jobs.is_empty() {
+                    let Some(interval_secs) = interval_secs else {
+                        continue;
+                    };
                     let datastores: Vec<_> = state_for_verify
                         .datastores
                         .iter()
@@ -491,12 +530,35 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
 
                     for (store, datastore) in datastores {
                         if running_workers.contains(&store) {
-                            info!(
-                                "Skipping scheduled verification for {} (already running)",
-                                store
-                            );
                             continue;
                         }
+                        let mut last_task: Option<TaskSnapshot> = None;
+                        for task in snapshots.iter().filter(|task| {
+                            task.worker_type == "verificationjob"
+                                && task.store.as_deref() == Some(store.as_str())
+                        }) {
+                            if last_task
+                                .as_ref()
+                                .map(|prev| task.starttime > prev.starttime)
+                                .unwrap_or(true)
+                            {
+                                last_task = Some(task.clone());
+                            }
+                        }
+                        let last_run = last_task
+                            .as_ref()
+                            .and_then(|task| task.endtime.or(Some(task.starttime)));
+                        if let Some(next_run) =
+                            compute_next_run(None, last_run, now, Some(interval_secs))
+                        {
+                            if next_run > now {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+
+                        info!("Starting scheduled verification run for {}", store);
                         let auth_id = "root@pam".to_string();
                         let _ = spawn_verify_task(
                             state_for_verify.clone(),
@@ -515,13 +577,13 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                         .await;
                     }
                 } else {
+                    let job_states = {
+                        let guard = state_for_verify.verify_job_state.read().await;
+                        guard.clone()
+                    };
                     for job in jobs {
                         let worker_id = format!("{}:{}", job.store, job.id);
                         if running_workers.contains(&worker_id) {
-                            info!(
-                                "Skipping scheduled verification for {} (already running)",
-                                worker_id
-                            );
                             continue;
                         }
                         let datastore = match state_for_verify.get_datastore(&job.store) {
@@ -534,6 +596,35 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
+
+                        let last_run = job_last_run_time(job_states.get(&job.id));
+                        let next_run = match job.schedule.as_deref() {
+                            Some(schedule) => {
+                                let spec = match parse_schedule_spec(schedule) {
+                                    Ok(spec) => spec,
+                                    Err(err) => {
+                                        warn!(
+                                            "Skipping verification job {} (invalid schedule): {}",
+                                            job.id, err.message
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let base = last_run.unwrap_or(now);
+                                let base_dt =
+                                    chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0);
+                                base_dt.and_then(|dt| next_run_after(&spec, dt))
+                            }
+                            None => compute_next_run(None, last_run, now, interval_secs),
+                        };
+                        let Some(next_run) = next_run else {
+                            continue;
+                        };
+                        if next_run > now {
+                            continue;
+                        }
+
+                        info!("Starting scheduled verification job {}", job.id);
                         let auth_id = "root@pam".to_string();
                         let _ = spawn_verify_task(
                             state_for_verify.clone(),
@@ -1461,6 +1552,326 @@ fn should_verify_snapshot(
     }
 }
 
+#[derive(Clone, Debug)]
+enum ScheduleSpec {
+    Hourly,
+    Daily {
+        hour: u32,
+        minute: u32,
+    },
+    Weekly {
+        days: Vec<Weekday>,
+        hour: u32,
+        minute: u32,
+    },
+    Monthly {
+        day: u32,
+        hour: u32,
+        minute: u32,
+    },
+    Yearly {
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+    },
+}
+
+fn parse_schedule_time(value: &str) -> Result<(u32, u32), ApiError> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ApiError::bad_request("Invalid schedule time"));
+    }
+    let hour: u32 = parts[0]
+        .parse()
+        .map_err(|_| ApiError::bad_request("Invalid schedule hour"))?;
+    let minute: u32 = parts[1]
+        .parse()
+        .map_err(|_| ApiError::bad_request("Invalid schedule minute"))?;
+    if hour > 23 || minute > 59 {
+        return Err(ApiError::bad_request("Invalid schedule time"));
+    }
+    Ok((hour, minute))
+}
+
+fn parse_weekday(value: &str) -> Option<Weekday> {
+    match value {
+        "mon" => Some(Weekday::Mon),
+        "tue" | "tues" => Some(Weekday::Tue),
+        "wed" => Some(Weekday::Wed),
+        "thu" | "thur" | "thurs" => Some(Weekday::Thu),
+        "fri" => Some(Weekday::Fri),
+        "sat" => Some(Weekday::Sat),
+        "sun" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
+fn weekday_index(day: Weekday) -> u32 {
+    match day {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    }
+}
+
+fn parse_weekday_list(value: &str) -> Result<Vec<Weekday>, ApiError> {
+    let mut days = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = token.split_once("..") {
+            let start = parse_weekday(start.trim())
+                .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
+            let end = parse_weekday(end.trim())
+                .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
+            let start_idx = weekday_index(start);
+            let end_idx = weekday_index(end);
+            if start_idx <= end_idx {
+                for idx in start_idx..=end_idx {
+                    days.push(match idx {
+                        0 => Weekday::Mon,
+                        1 => Weekday::Tue,
+                        2 => Weekday::Wed,
+                        3 => Weekday::Thu,
+                        4 => Weekday::Fri,
+                        5 => Weekday::Sat,
+                        _ => Weekday::Sun,
+                    });
+                }
+            } else {
+                for idx in start_idx..=6 {
+                    days.push(match idx {
+                        0 => Weekday::Mon,
+                        1 => Weekday::Tue,
+                        2 => Weekday::Wed,
+                        3 => Weekday::Thu,
+                        4 => Weekday::Fri,
+                        5 => Weekday::Sat,
+                        _ => Weekday::Sun,
+                    });
+                }
+                for idx in 0..=end_idx {
+                    days.push(match idx {
+                        0 => Weekday::Mon,
+                        1 => Weekday::Tue,
+                        2 => Weekday::Wed,
+                        3 => Weekday::Thu,
+                        4 => Weekday::Fri,
+                        5 => Weekday::Sat,
+                        _ => Weekday::Sun,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let day = parse_weekday(token)
+            .ok_or_else(|| ApiError::bad_request("Invalid schedule weekday"))?;
+        days.push(day);
+    }
+    days.sort_by_key(|day| weekday_index(*day));
+    days.dedup();
+    if days.is_empty() {
+        return Err(ApiError::bad_request("Invalid schedule weekday"));
+    }
+    Ok(days)
+}
+
+fn parse_schedule_spec(value: &str) -> Result<ScheduleSpec, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("Invalid schedule"));
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered.split_whitespace().collect();
+    match tokens.as_slice() {
+        ["hourly"] => Ok(ScheduleSpec::Hourly),
+        ["daily"] => Ok(ScheduleSpec::Daily { hour: 0, minute: 0 }),
+        ["weekly"] => Ok(ScheduleSpec::Weekly {
+            days: vec![Weekday::Mon],
+            hour: 0,
+            minute: 0,
+        }),
+        ["monthly"] => Ok(ScheduleSpec::Monthly {
+            day: 1,
+            hour: 0,
+            minute: 0,
+        }),
+        ["yearly"] | ["annually"] => Ok(ScheduleSpec::Yearly {
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+        }),
+        [time] if time.contains(':') => {
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Daily { hour, minute })
+        }
+        [kind, time] if *kind == "daily" => {
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Daily { hour, minute })
+        }
+        [kind, time] if *kind == "weekly" => {
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Weekly {
+                days: vec![Weekday::Mon],
+                hour,
+                minute,
+            })
+        }
+        [kind, time] if *kind == "monthly" => {
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Monthly {
+                day: 1,
+                hour,
+                minute,
+            })
+        }
+        [kind, time] if *kind == "yearly" || *kind == "annually" => {
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Yearly {
+                month: 1,
+                day: 1,
+                hour,
+                minute,
+            })
+        }
+        [days, time] => {
+            let days = parse_weekday_list(days)?;
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Weekly { days, hour, minute })
+        }
+        [kind, days, time] if *kind == "weekly" => {
+            let days = parse_weekday_list(days)?;
+            let (hour, minute) = parse_schedule_time(time)?;
+            Ok(ScheduleSpec::Weekly { days, hour, minute })
+        }
+        _ => Err(ApiError::bad_request("Invalid schedule")),
+    }
+}
+
+fn next_run_after(spec: &ScheduleSpec, after: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    match spec {
+        ScheduleSpec::Hourly => {
+            let base = after
+                .with_minute(0)
+                .and_then(|dt| dt.with_second(0))
+                .and_then(|dt| dt.with_nanosecond(0))?;
+            let next = base + Duration::hours(1);
+            Some(next.timestamp())
+        }
+        ScheduleSpec::Daily { hour, minute } => {
+            for offset in 0..=1 {
+                let date = after.date_naive() + chrono::Duration::days(offset);
+                let candidate = chrono::Utc
+                    .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
+                    .single()?;
+                if candidate > after {
+                    return Some(candidate.timestamp());
+                }
+            }
+            None
+        }
+        ScheduleSpec::Weekly { days, hour, minute } => {
+            for offset in 0..=7 {
+                let date = after.date_naive() + chrono::Duration::days(offset);
+                let day = date.weekday();
+                if !days.contains(&day) {
+                    continue;
+                }
+                let candidate = chrono::Utc
+                    .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
+                    .single()?;
+                if candidate > after {
+                    return Some(candidate.timestamp());
+                }
+            }
+            None
+        }
+        ScheduleSpec::Monthly { day, hour, minute } => {
+            let mut year = after.year();
+            let mut month = after.month();
+            for _ in 0..=12 {
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, *day) {
+                    if let Some(candidate) = chrono::Utc
+                        .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
+                        .single()
+                    {
+                        if candidate > after {
+                            return Some(candidate.timestamp());
+                        }
+                    }
+                }
+                month += 1;
+                if month > 12 {
+                    month = 1;
+                    year += 1;
+                }
+            }
+            None
+        }
+        ScheduleSpec::Yearly {
+            month,
+            day,
+            hour,
+            minute,
+        } => {
+            let mut year = after.year();
+            for _ in 0..=1 {
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, *month, *day) {
+                    if let Some(candidate) = chrono::Utc
+                        .with_ymd_and_hms(date.year(), date.month(), date.day(), *hour, *minute, 0)
+                        .single()
+                    {
+                        if candidate > after {
+                            return Some(candidate.timestamp());
+                        }
+                    }
+                }
+                year += 1;
+            }
+            None
+        }
+    }
+}
+
+fn job_last_run_time(state: Option<&VerificationJobState>) -> Option<i64> {
+    state.and_then(|entry| {
+        entry.last_run_endtime.or_else(|| {
+            entry
+                .last_run_upid
+                .as_deref()
+                .and_then(parse_upid_starttime)
+        })
+    })
+}
+
+fn compute_next_run(
+    schedule: Option<&str>,
+    last_run: Option<i64>,
+    now: i64,
+    interval: Option<i64>,
+) -> Option<i64> {
+    if let Some(schedule) = schedule {
+        let spec = parse_schedule_spec(schedule).ok()?;
+        let base = last_run.unwrap_or(now);
+        let base_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(base, 0)?;
+        return next_run_after(&spec, base_dt);
+    }
+
+    interval.map(|interval| {
+        let base = last_run.unwrap_or(now);
+        base + interval
+    })
+}
+
 enum H2Context {
     Backup(H2BackupContext),
     Reader(H2ReaderContext),
@@ -1599,7 +2010,6 @@ async fn handle_webhook_receive(
 fn verify_webhook_signature(secret: &str, body: &[u8], header: &str) -> bool {
     let signature = header.strip_prefix("sha256=").unwrap_or(header);
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
     let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
@@ -4812,8 +5222,19 @@ async fn spawn_verify_task(
     let ignore_verified_clone = ignore_verified;
     let outdated_after_clone = outdated_after;
     let trigger_label = trigger;
+    let job_id_clone = job_id.clone();
 
     tokio::spawn(async move {
+        if let Some(job_id) = job_id_clone.as_deref() {
+            let mut guard = state_clone.verify_job_state.write().await;
+            let entry = guard
+                .entry(job_id.to_string())
+                .or_insert_with(|| VerificationJobState::new(job_id));
+            entry.last_run_upid = Some(upid_clone.clone());
+            entry.last_run_state = Some("running".to_string());
+            entry.last_run_endtime = None;
+        }
+
         let mut start_message = format!("Verification started for {}", store_name_clone);
         if !trigger_label.is_empty() {
             start_message.push_str(&format!(" ({})", trigger_label));
@@ -5180,13 +5601,24 @@ async fn spawn_verify_task(
                 ),
             )
             .await;
-        if failed > 0 {
-            state_clone
-                .tasks
-                .finish(&upid_clone, &format!("WARNINGS: {}", failed))
-                .await;
+        let exit_status = if failed > 0 {
+            format!("WARNINGS: {}", failed)
         } else {
-            state_clone.tasks.finish(&upid_clone, "OK").await;
+            "OK".to_string()
+        };
+        state_clone.tasks.finish(&upid_clone, &exit_status).await;
+
+        if let Some(job_id) = job_id_clone.as_deref() {
+            let mut guard = state_clone.verify_job_state.write().await;
+            if let Some(entry) = guard.get_mut(job_id) {
+                entry.last_run_state = Some(exit_status.clone());
+                entry.last_run_endtime = Some(chrono::Utc::now().timestamp());
+                entry.last_run_upid = Some(upid_clone.clone());
+            }
+        }
+
+        if let Err(e) = state_clone.save_state().await {
+            warn!("Failed to save state after verification job: {}", e);
         }
     });
 
@@ -5248,7 +5680,25 @@ fn validate_verify_job_config(
             ));
         }
     }
+    if let Some(schedule) = config.schedule.as_ref() {
+        let _ = parse_schedule_spec(schedule)?;
+    }
     Ok(())
+}
+
+fn collect_verify_jobs_sorted(
+    guard: &HashMap<String, VerificationJobConfig>,
+) -> Vec<VerificationJobConfig> {
+    let mut jobs = guard.values().cloned().collect::<Vec<_>>();
+    jobs.sort_by(|a, b| a.id.cmp(&b.id));
+    jobs
+}
+
+fn compute_verify_jobs_digest(jobs: &[VerificationJobConfig]) -> String {
+    let json = serde_json::to_vec(jobs).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&json);
+    hex::encode(hasher.finalize())
 }
 
 async fn handle_verify_config_api(
@@ -5266,15 +5716,19 @@ async fn handle_verify_config_api(
         match *req.method() {
             Method::GET => {
                 let store_filter = get_query_param(&uri, "store");
-                let mut items = {
+                let (mut items, digest) = {
                     let guard = state.verify_jobs.read().await;
-                    guard.values().cloned().collect::<Vec<_>>()
+                    let items = collect_verify_jobs_sorted(&guard);
+                    let digest = compute_verify_jobs_digest(&items);
+                    (items, digest)
                 };
                 if let Some(filter) = store_filter {
                     items.retain(|job| job.store == filter);
                 }
-                items.sort_by(|a, b| a.id.cmp(&b.id));
-                return json_response(StatusCode::OK, &serde_json::json!({ "data": items }));
+                return json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "data": items, "digest": digest }),
+                );
             }
             Method::POST => {
                 if let Err(e) = ctx.require(Permission::DatastoreAdmin) {
@@ -5301,13 +5755,23 @@ async fn handle_verify_config_api(
                     return bad_request("Verification job already exists");
                 }
                 guard.insert(config.id.clone(), config.clone());
+                let digest = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
                 drop(guard);
+
+                let mut state_guard = state.verify_job_state.write().await;
+                state_guard
+                    .entry(config.id.clone())
+                    .or_insert_with(|| VerificationJobState::new(&config.id));
+                drop(state_guard);
 
                 if let Err(e) = state.save_state().await {
                     warn!("Failed to save state after verify job creation: {}", e);
                 }
 
-                return json_response(StatusCode::CREATED, &serde_json::json!({ "data": config }));
+                return json_response(
+                    StatusCode::CREATED,
+                    &serde_json::json!({ "data": config, "digest": digest }),
+                );
             }
             _ => return not_found(),
         }
@@ -5325,8 +5789,12 @@ async fn handle_verify_config_api(
     match *req.method() {
         Method::GET => {
             let guard = state.verify_jobs.read().await;
+            let digest = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
             match guard.get(id) {
-                Some(job) => json_response(StatusCode::OK, &serde_json::json!({ "data": job })),
+                Some(job) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "data": job, "digest": digest }),
+                ),
                 None => not_found(),
             }
         }
@@ -5352,9 +5820,13 @@ async fn handle_verify_config_api(
                 Ok(p) => p,
                 Err(_) => return bad_request("Invalid JSON"),
             };
-            let _ = params.digest;
-
             let mut guard = state.verify_jobs.write().await;
+            if let Some(ref digest) = params.digest {
+                let current = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
+                if digest != &current {
+                    return bad_request("Configuration digest mismatch");
+                }
+            }
             let Some(existing) = guard.get_mut(id) else {
                 return not_found();
             };
@@ -5365,13 +5837,17 @@ async fn handle_verify_config_api(
                 return error_response(e);
             }
             *existing = updated.clone();
+            let digest = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
             drop(guard);
 
             if let Err(e) = state.save_state().await {
                 warn!("Failed to save state after verify job update: {}", e);
             }
 
-            json_response(StatusCode::OK, &serde_json::json!({ "data": updated }))
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "data": updated, "digest": digest }),
+            )
         }
         Method::DELETE => {
             if let Err(e) = ctx.require(Permission::DatastoreAdmin) {
@@ -5379,11 +5855,23 @@ async fn handle_verify_config_api(
             }
 
             let mut guard = state.verify_jobs.write().await;
+            let digest_param = get_query_param(&uri, "digest");
+            if let Some(ref digest) = digest_param {
+                let current = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
+                if digest != &current {
+                    return bad_request("Configuration digest mismatch");
+                }
+            }
             let removed = guard.remove(id);
+            let digest = compute_verify_jobs_digest(&collect_verify_jobs_sorted(&guard));
             drop(guard);
             if removed.is_none() {
                 return not_found();
             }
+
+            let mut state_guard = state.verify_job_state.write().await;
+            state_guard.remove(id);
+            drop(state_guard);
 
             if let Err(e) = state.save_state().await {
                 warn!("Failed to save state after verify job deletion: {}", e);
@@ -5391,7 +5879,7 @@ async fn handle_verify_config_api(
 
             json_response(
                 StatusCode::OK,
-                &serde_json::json!({ "data": { "deleted": true, "id": id } }),
+                &serde_json::json!({ "data": { "deleted": true, "id": id }, "digest": digest }),
             )
         }
         _ => not_found(),
@@ -5421,6 +5909,10 @@ async fn handle_verify_api(
         let jobs = {
             let guard = state.verify_jobs.read().await;
             guard.values().cloned().collect::<Vec<_>>()
+        };
+        let job_states = {
+            let guard = state.verify_job_state.read().await;
+            guard.clone()
         };
 
         if jobs.is_empty() {
@@ -5496,18 +5988,30 @@ async fn handle_verify_api(
                     }
                 }
 
-                let (last_run_upid, last_run_state, last_run_endtime) = match last_task.as_ref() {
-                    Some(task) => (
-                        Some(task.upid.clone()),
-                        task.exitstatus.clone().or_else(|| task.status.clone()),
-                        task.endtime,
-                    ),
-                    None => (None, None, None),
-                };
+                let state_entry = job_states.get(&job.id);
+                let last_run_upid = state_entry
+                    .and_then(|entry| entry.last_run_upid.clone())
+                    .or_else(|| last_task.as_ref().map(|task| task.upid.clone()));
+                let last_run_state = state_entry
+                    .and_then(|entry| entry.last_run_state.clone())
+                    .or_else(|| {
+                        last_task.as_ref().and_then(|task| {
+                            task.exitstatus.clone().or_else(|| task.status.clone())
+                        })
+                    });
+                let last_run_endtime = state_entry
+                    .and_then(|entry| entry.last_run_endtime)
+                    .or_else(|| last_task.as_ref().and_then(|task| task.endtime));
 
-                let next_run = if state.config.verify.enabled && interval > 0 {
-                    let base = last_run_endtime.unwrap_or(now);
-                    Some(base + interval)
+                let last_run_time = last_run_endtime
+                    .or_else(|| last_run_upid.as_deref().and_then(parse_upid_starttime));
+                let next_run = if state.config.verify.enabled {
+                    compute_next_run(
+                        job.schedule.as_deref(),
+                        last_run_time,
+                        now,
+                        if interval > 0 { Some(interval) } else { None },
+                    )
                 } else {
                     None
                 };
