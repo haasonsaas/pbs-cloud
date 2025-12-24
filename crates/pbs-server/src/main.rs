@@ -79,6 +79,7 @@ fn load_config() -> Result<ServerConfig> {
         config.listen_addr = addr;
     }
 
+    // Storage configuration
     if let Ok(bucket) = std::env::var("PBS_S3_BUCKET") {
         let region = std::env::var("PBS_S3_REGION").ok();
         let endpoint = std::env::var("PBS_S3_ENDPOINT").ok();
@@ -91,11 +92,38 @@ fn load_config() -> Result<ServerConfig> {
             prefix,
         };
     } else if let Ok(path) = std::env::var("PBS_DATA_DIR") {
-        config.storage = pbs_server::config::StorageConfig::Local { path };
+        config.storage = pbs_server::config::StorageConfig::Local { path: path.clone() };
+        // Also use as persistence directory if not set separately
+        if config.data_dir.is_none() {
+            config.data_dir = Some(path);
+        }
     }
 
+    // Persistence directory (can be separate from storage)
+    if let Ok(dir) = std::env::var("PBS_PERSISTENCE_DIR") {
+        config.data_dir = Some(dir);
+    }
+
+    // Tenant configuration
     if let Ok(tenant) = std::env::var("PBS_DEFAULT_TENANT") {
         config.tenants.default_tenant = tenant;
+    }
+
+    // TLS configuration
+    if std::env::var("PBS_TLS_DISABLED").is_ok() {
+        config.tls = Some(pbs_server::tls::TlsConfig::disabled());
+    } else if let (Ok(cert), Ok(key)) = (std::env::var("PBS_TLS_CERT"), std::env::var("PBS_TLS_KEY")) {
+        config.tls = Some(pbs_server::tls::TlsConfig::with_certs(&cert, &key));
+    }
+
+    // GC configuration
+    if std::env::var("PBS_GC_DISABLED").is_ok() {
+        config.gc.enabled = false;
+    }
+    if let Ok(hours) = std::env::var("PBS_GC_INTERVAL_HOURS") {
+        if let Ok(h) = hours.parse::<u64>() {
+            config.gc.interval_hours = h;
+        }
     }
 
     Ok(config)

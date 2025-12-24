@@ -250,14 +250,23 @@ proxmox-backup-client restore host/hostname/2024-01-01T00:00:00Z root.pxar /rest
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| **Server** | | |
 | `PBS_LISTEN_ADDR` | Server listen address | `0.0.0.0:8007` |
-| `PBS_DATA_DIR` | Local storage path | `/var/lib/pbs-cloud` |
-| `PBS_S3_BUCKET` | S3 bucket name | - |
-| `PBS_S3_REGION` | AWS region | `us-east-1` |
+| **Storage** | | |
+| `PBS_DATA_DIR` | Local storage path (also used for persistence if not set separately) | `/var/lib/pbs-cloud` |
+| `PBS_PERSISTENCE_DIR` | Directory for persisting users/tokens/tenants | Same as `PBS_DATA_DIR` |
+| `PBS_S3_BUCKET` | S3 bucket name (enables S3 storage) | - |
+| `PBS_S3_REGION` | AWS region | - |
 | `PBS_S3_ENDPOINT` | S3 endpoint URL (for MinIO, R2, etc.) | - |
 | `PBS_S3_PREFIX` | Key prefix in bucket | - |
+| **Tenants** | | |
 | `PBS_DEFAULT_TENANT` | Default tenant ID | `default` |
-| `PBS_GC_ENABLED` | Enable automatic garbage collection | `true` |
+| **TLS** | | |
+| `PBS_TLS_DISABLED` | Disable TLS (set to any value) | - |
+| `PBS_TLS_CERT` | Path to TLS certificate | - (uses self-signed) |
+| `PBS_TLS_KEY` | Path to TLS private key | - (uses self-signed) |
+| **Garbage Collection** | | |
+| `PBS_GC_DISABLED` | Disable automatic GC (set to any value) | - |
 | `PBS_GC_INTERVAL_HOURS` | Hours between GC runs | `24` |
 
 ### TLS Configuration
@@ -268,6 +277,9 @@ By default, PBS Cloud generates a self-signed certificate. For production:
 # Use custom certificates
 export PBS_TLS_CERT=/path/to/cert.pem
 export PBS_TLS_KEY=/path/to/key.pem
+
+# Or disable TLS entirely (not recommended for production)
+export PBS_TLS_DISABLED=1
 ```
 
 ### Rate Limiting
@@ -276,6 +288,23 @@ Rate limiting is enabled by default to protect against abuse:
 
 - **Per-IP**: 100 requests/second burst, 10 requests/second sustained
 - **Per-Tenant**: 1000 requests/second burst, 100 requests/second sustained
+
+### Health Checks
+
+For Kubernetes or load balancer health checks:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` or `GET /healthz` | Liveness probe - returns 200 if server is running |
+| `GET /ready` or `GET /readyz` | Readiness probe - returns 200 if datastores are configured |
+
+```bash
+# Check health
+curl https://localhost:8007/health
+
+# Check readiness
+curl https://localhost:8007/ready
+```
 
 ## API Reference
 
