@@ -383,18 +383,10 @@ impl ReaderProtocolHandler {
         tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
-        // Verify reader session ownership
-        self.state
-            .sessions
-            .verify_reader_session_ownership(session_id, tenant_id)
-            .await?;
-
         let index = self
             .state
             .sessions
-            .with_reader_session_async(session_id, |session| async move {
-                session.read_fixed_index(name).await
-            })
+            .reader_read_fixed_index(session_id, tenant_id, name)
             .await?;
         Ok(index.to_bytes())
     }
@@ -406,18 +398,10 @@ impl ReaderProtocolHandler {
         tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
-        // Verify reader session ownership
-        self.state
-            .sessions
-            .verify_reader_session_ownership(session_id, tenant_id)
-            .await?;
-
         let index = self
             .state
             .sessions
-            .with_reader_session_async(session_id, |session| async move {
-                session.read_dynamic_index(name).await
-            })
+            .reader_read_dynamic_index(session_id, tenant_id, name)
             .await?;
         Ok(index.to_bytes())
     }
@@ -429,17 +413,9 @@ impl ReaderProtocolHandler {
         tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
-        // Verify reader session ownership
         self.state
             .sessions
-            .verify_reader_session_ownership(session_id, tenant_id)
-            .await?;
-
-        self.state
-            .sessions
-            .with_reader_session_async(session_id, |session| async move {
-                session.read_blob(name).await
-            })
+            .reader_read_blob(session_id, tenant_id, name)
             .await
     }
 
@@ -449,18 +425,10 @@ impl ReaderProtocolHandler {
         session_id: &str,
         tenant_id: &str,
     ) -> Result<String, ApiError> {
-        // Verify reader session ownership
-        self.state
-            .sessions
-            .verify_reader_session_ownership(session_id, tenant_id)
-            .await?;
-
         let manifest = self
             .state
             .sessions
-            .with_reader_session_async(session_id, |session| async move {
-                session.load_manifest().await.map(|m| m.clone())
-            })
+            .reader_load_manifest(session_id, tenant_id)
             .await?;
         manifest
             .to_json()

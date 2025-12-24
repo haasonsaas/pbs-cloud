@@ -564,6 +564,108 @@ impl SessionManager {
         sessions.remove(id)
     }
 
+    /// Read a fixed index from a reader session (with ownership verification)
+    pub async fn reader_read_fixed_index(&self, id: &str, tenant_id: &str, name: &str) -> Result<FixedIndex, ApiError> {
+        // Get session info and datastore reference
+        let (snapshot_path, datastore) = {
+            let mut sessions = self.reader_sessions.write().await;
+            let session = sessions.get_mut(id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+            if session.tenant_id != tenant_id {
+                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            }
+
+            session.touch();
+            (session.snapshot_path(), session.datastore.clone())
+        };
+
+        let path = format!("{}/{}", snapshot_path, name);
+        datastore.read_fixed_index(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))
+    }
+
+    /// Read a dynamic index from a reader session (with ownership verification)
+    pub async fn reader_read_dynamic_index(&self, id: &str, tenant_id: &str, name: &str) -> Result<DynamicIndex, ApiError> {
+        let (snapshot_path, datastore) = {
+            let mut sessions = self.reader_sessions.write().await;
+            let session = sessions.get_mut(id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+            if session.tenant_id != tenant_id {
+                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            }
+
+            session.touch();
+            (session.snapshot_path(), session.datastore.clone())
+        };
+
+        let path = format!("{}/{}", snapshot_path, name);
+        datastore.read_dynamic_index(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))
+    }
+
+    /// Read a blob from a reader session (with ownership verification)
+    pub async fn reader_read_blob(&self, id: &str, tenant_id: &str, name: &str) -> Result<Vec<u8>, ApiError> {
+        let (snapshot_path, datastore) = {
+            let mut sessions = self.reader_sessions.write().await;
+            let session = sessions.get_mut(id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+            if session.tenant_id != tenant_id {
+                return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+            }
+
+            session.touch();
+            (session.snapshot_path(), session.datastore.clone())
+        };
+
+        let path = format!("{}/{}", snapshot_path, name);
+        datastore.read_blob(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))
+    }
+
+    /// Load manifest from a reader session (with ownership verification)
+    pub async fn reader_load_manifest(&self, id: &str, tenant_id: &str) -> Result<BackupManifest, ApiError> {
+        // First check if we already have it cached
+        {
+            let sessions = self.reader_sessions.read().await;
+            if let Some(session) = sessions.get(id) {
+                if session.tenant_id != tenant_id {
+                    return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+                }
+                if let Some(manifest) = &session.manifest {
+                    return Ok(manifest.clone());
+                }
+            } else {
+                return Err(ApiError::not_found("Session not found"));
+            }
+        }
+
+        // Need to load it
+        let (snapshot_path, datastore) = {
+            let sessions = self.reader_sessions.read().await;
+            let session = sessions.get(id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?;
+            (session.snapshot_path(), session.datastore.clone())
+        };
+
+        let path = format!("{}/index.json", snapshot_path);
+        let manifest = datastore.read_manifest(&path).await
+            .map_err(|e| ApiError::not_found(&e.to_string()))?;
+
+        // Cache it
+        {
+            let mut sessions = self.reader_sessions.write().await;
+            if let Some(session) = sessions.get_mut(id) {
+                session.touch();
+                session.manifest = Some(manifest.clone());
+            }
+        }
+
+        Ok(manifest)
+    }
+
     /// Clean up expired sessions
     pub async fn cleanup_expired(&self) {
         let now = Utc::now();

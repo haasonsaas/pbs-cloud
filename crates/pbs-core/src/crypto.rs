@@ -31,8 +31,7 @@ impl EncryptionKey {
 
     /// Derive a key from a password using scrypt (PBS-compatible KDF)
     pub fn from_password(password: &str, salt: &[u8]) -> Result<Self> {
-        let params = ScryptParams::recommended()
-            .map_err(|e| Error::Encryption(e.to_string()))?;
+        let params = ScryptParams::recommended();
         let mut key = [0u8; 32];
         scrypt(password.as_bytes(), salt, &params, &mut key)
             .map_err(|e| Error::Encryption(e.to_string()))?;
