@@ -74,6 +74,10 @@ pub struct ServerState {
     pub tasks: Arc<TaskRegistry>,
     /// Last GC status per datastore
     pub gc_status: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    /// Task UPIDs for active backup sessions
+    pub backup_tasks: Arc<RwLock<HashMap<String, String>>>,
+    /// Task UPIDs for active reader sessions
+    pub reader_tasks: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ServerState {
@@ -218,6 +222,8 @@ impl ServerState {
 
         let tasks = Arc::new(TaskRegistry::new("localhost"));
         let gc_status = Arc::new(RwLock::new(HashMap::new()));
+        let backup_tasks = Arc::new(RwLock::new(HashMap::new()));
+        let reader_tasks = Arc::new(RwLock::new(HashMap::new()));
 
         Ok(Self {
             config,
@@ -234,6 +240,8 @@ impl ServerState {
             start_time: Instant::now(),
             tasks,
             gc_status,
+            backup_tasks,
+            reader_tasks,
         })
     }
 
@@ -981,6 +989,23 @@ fn parse_bool_param(value: &str) -> Option<bool> {
 
 fn task_auth_id(ctx: &AuthContext) -> String {
     format!("{}@pbs", ctx.user.username)
+}
+
+async fn store_session_task(
+    map: &Arc<RwLock<HashMap<String, String>>>,
+    session_id: &str,
+    upid: &str,
+) {
+    let mut guard = map.write().await;
+    guard.insert(session_id.to_string(), upid.to_string());
+}
+
+async fn take_session_task(
+    map: &Arc<RwLock<HashMap<String, String>>>,
+    session_id: &str,
+) -> Option<String> {
+    let mut guard = map.write().await;
+    guard.remove(session_id)
 }
 
 fn manifest_note_line(manifest: &BackupManifest) -> Option<String> {
@@ -2519,6 +2544,22 @@ async fn handle_protocol_upgrade(
             Ok(id) => id,
             Err(e) => return error_response(e),
         };
+        let auth_id = task_auth_id(&auth_ctx);
+        let upid = state
+            .tasks
+            .create(&auth_id, "backup", Some(&session_id), Some(&store))
+            .await;
+        state
+            .tasks
+            .log(
+                &upid,
+                &format!(
+                    "Backup started: {}/{} {}",
+                    backup_type, backup_id, backup_time_epoch
+                ),
+            )
+            .await;
+        store_session_task(&state.backup_tasks, &session_id, &upid).await;
 
         let ctx = Arc::new(H2Context::Backup(H2BackupContext {
             state: state_for_upgrade,
@@ -2558,6 +2599,22 @@ async fn handle_protocol_upgrade(
             Ok(id) => id,
             Err(e) => return error_response(e),
         };
+        let auth_id = task_auth_id(&auth_ctx);
+        let upid = state
+            .tasks
+            .create(&auth_id, "reader", Some(&session_id), Some(&store))
+            .await;
+        state
+            .tasks
+            .log(
+                &upid,
+                &format!(
+                    "Reader started: {}/{} {}",
+                    backup_type, backup_id, backup_time
+                ),
+            )
+            .await;
+        store_session_task(&state.reader_tasks, &session_id, &upid).await;
 
         let ctx = Arc::new(H2Context::Reader(H2ReaderContext {
             state: state_for_upgrade,
@@ -3053,12 +3110,38 @@ async fn handle_start_backup(
         return error_response(e);
     }
 
-    let handler = BackupProtocolHandler::new(state);
+    let store = params
+        .store
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let backup_type = params.backup_type.clone();
+    let backup_id = params.backup_id.clone();
+    let backup_time = params.backup_time.clone();
+    let handler = BackupProtocolHandler::new(state.clone());
     match handler.start_backup(ctx, params).await {
-        Ok(session_id) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({"data": {"session_id": session_id}}),
-        ),
+        Ok(session_id) => {
+            let auth_id = task_auth_id(ctx);
+            let upid = state
+                .tasks
+                .create(&auth_id, "backup", Some(&session_id), Some(&store))
+                .await;
+            state
+                .tasks
+                .log(
+                    &upid,
+                    &format!(
+                        "Backup started: {}/{} {}",
+                        backup_type, backup_id, backup_time
+                    ),
+                )
+                .await;
+            store_session_task(&state.backup_tasks, &session_id, &upid).await;
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"data": {"session_id": session_id}}),
+            )
+        }
         Err(e) => error_response(e),
     }
 }
@@ -3100,6 +3183,13 @@ async fn handle_start_reader(
         return error_response(e);
     }
 
+    let store = params
+        .store
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let backup_type = params.backup_type.clone();
+    let backup_id = params.backup_id.clone();
+    let backup_time = params.backup_time.clone();
     let handler = ReaderProtocolHandler::new(state.clone());
     match handler
         .start_reader(
@@ -3112,10 +3202,29 @@ async fn handle_start_reader(
         )
         .await
     {
-        Ok(session_id) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({"data": {"session_id": session_id}}),
-        ),
+        Ok(session_id) => {
+            let auth_id = task_auth_id(ctx);
+            let upid = state
+                .tasks
+                .create(&auth_id, "reader", Some(&session_id), Some(&store))
+                .await;
+            state
+                .tasks
+                .log(
+                    &upid,
+                    &format!(
+                        "Reader started: {}/{} {}",
+                        backup_type, backup_id, backup_time
+                    ),
+                )
+                .await;
+            store_session_task(&state.reader_tasks, &session_id, &upid).await;
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"data": {"session_id": session_id}}),
+            )
+        }
         Err(e) => error_response(e),
     }
 }
@@ -3385,6 +3494,19 @@ async fn handle_finish_backup(
             state
                 .metrics
                 .record_backup(&ctx.user.tenant_id, "backup", result.total_bytes);
+            if let Some(upid) = take_session_task(&state.backup_tasks, &session_id).await {
+                state
+                    .tasks
+                    .log(
+                        &upid,
+                        &format!(
+                            "Backup finished: {} bytes, {} chunks",
+                            result.total_bytes, result.chunk_count
+                        ),
+                    )
+                    .await;
+                state.tasks.finish(&upid, "OK").await;
+            }
             let response: FinishBackupResponse = result.into();
             json_response(StatusCode::OK, &serde_json::json!({"data": response}))
         }
@@ -3603,7 +3725,13 @@ async fn handle_close_reader(
 
     let handler = ReaderProtocolHandler::new(state.clone());
     match handler.close_reader(&session_id).await {
-        Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
+        Ok(_) => {
+            if let Some(upid) = take_session_task(&state.reader_tasks, &session_id).await {
+                state.tasks.log(&upid, "Reader session closed").await;
+                state.tasks.finish(&upid, "OK").await;
+            }
+            json_response(StatusCode::OK, &serde_json::json!({"data": {}}))
+        }
         Err(e) => error_response(e),
     }
 }
@@ -4090,6 +4218,23 @@ async fn handle_prune_body(
         dry_run: params.dry_run,
     };
 
+    let auth_id = task_auth_id(ctx);
+    let worker_id = format!("{}/{}", params.backup_type, params.backup_id);
+    let upid = state
+        .tasks
+        .create(&auth_id, "prune", Some(&worker_id), Some(store))
+        .await;
+    state
+        .tasks
+        .log(
+            &upid,
+            &format!(
+                "Prune started (dry_run={}): {}/{}",
+                params.dry_run, params.backup_type, params.backup_id
+            ),
+        )
+        .await;
+
     info!(
         "Pruning {}/{} (dry_run={})",
         params.backup_type, params.backup_id, params.dry_run
@@ -4105,12 +4250,31 @@ async fn handle_prune_body(
         .await
     {
         Ok(result) => result,
-        Err(e) => return error_response(ApiError::internal(&e.to_string())),
+        Err(e) => {
+            state
+                .tasks
+                .log(&upid, &format!("Prune failed: {}", e))
+                .await;
+            state.tasks.finish(&upid, "ERROR").await;
+            return error_response(ApiError::internal(&e.to_string()));
+        }
     };
 
     if !params.dry_run {
         audit::log_prune_executed(&ctx.user.username, &ctx.user.tenant_id, result.pruned.len());
     }
+    state
+        .tasks
+        .log(
+            &upid,
+            &format!(
+                "Prune complete: kept={}, pruned={}",
+                result.kept.len(),
+                result.pruned.len()
+            ),
+        )
+        .await;
+    state.tasks.finish(&upid, "OK").await;
 
     let mut items = Vec::new();
     let ns = params.ns.clone().unwrap_or_default();
