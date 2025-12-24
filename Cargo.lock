@@ -1965,6 +1965,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "lazy_static",
+ "libc",
  "parking_lot",
  "pbs-core",
  "pbs-storage",

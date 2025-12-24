@@ -7,6 +7,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::system_info::cert_fingerprint_sha256;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -131,19 +132,17 @@ fn generate_self_signed_cert(
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {:?}", e))?;
 
     warn!("Using self-signed certificate - not suitable for production!");
-    info!(
-        "Certificate fingerprint: {}",
-        hex::encode(&cert.der()[..20])
-    );
 
     Ok((vec![cert_der], key_der))
 }
 
 /// Create a TLS acceptor from configuration
-pub fn create_tls_acceptor(config: &TlsConfig) -> anyhow::Result<Option<TlsAcceptor>> {
+pub fn create_tls_acceptor(
+    config: &TlsConfig,
+) -> anyhow::Result<(Option<TlsAcceptor>, Option<String>)> {
     if !config.is_enabled() {
         info!("TLS disabled - running in insecure mode");
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let (certs, key) =
@@ -158,14 +157,21 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> anyhow::Result<Option<TlsAccep
             anyhow::bail!("TLS enabled but no certificates configured");
         };
 
+    let fingerprint = certs
+        .first()
+        .map(|cert| cert_fingerprint_sha256(cert.as_ref()));
+
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
+    if let Some(fp) = fingerprint.as_deref() {
+        info!("TLS certificate fingerprint (sha256): {}", fp);
+    }
     info!("TLS acceptor initialized");
-    Ok(Some(acceptor))
+    Ok((Some(acceptor), fingerprint))
 }
 
 /// Save generated certificate to files (for debugging/inspection)
@@ -228,14 +234,16 @@ mod tests {
     #[test]
     fn test_create_acceptor_self_signed() {
         let config = TlsConfig::self_signed();
-        let acceptor = create_tls_acceptor(&config).unwrap();
+        let (acceptor, fingerprint) = create_tls_acceptor(&config).unwrap();
         assert!(acceptor.is_some());
+        assert!(fingerprint.is_some());
     }
 
     #[test]
     fn test_create_acceptor_disabled() {
         let config = TlsConfig::disabled();
-        let acceptor = create_tls_acceptor(&config).unwrap();
+        let (acceptor, fingerprint) = create_tls_acceptor(&config).unwrap();
         assert!(acceptor.is_none());
+        assert!(fingerprint.is_none());
     }
 }

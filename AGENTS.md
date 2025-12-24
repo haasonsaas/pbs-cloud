@@ -36,6 +36,7 @@
 - Build: `cargo build --release`
 - Test: `./scripts/test.sh` (sets TMPDIR/CARGO_HOME to `target/` for low-space environments)
 - CI/local full check: `./scripts/ci.sh` (also uses repo-scoped TMPDIR/CARGO_HOME)
+- Optional client smoke test: `./scripts/pbs_client_smoke.sh` (skips if `proxmox-backup-client` missing)
 - Format (CI): `cargo fmt --all -- --check`
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
@@ -125,7 +126,7 @@
 - Verification jobs do not emit notification events yet.
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
-- `/api2/json/nodes/localhost/status` returns placeholder node stats (no real system probes yet).
+- `/api2/json/nodes/localhost/status` uses best-effort `/proc` data and may return zeros on non-Linux hosts.
 - `/api2/json/status/datastore-usage` omits RRD history/forecast fields.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
 - Task logs are capped to the most recent 1000 lines per task to limit persistence growth.
@@ -145,3 +146,4 @@
 - Streaming protocol: `crates/pbs-server/src/streaming.rs`
 - Session state: `crates/pbs-server/src/session.rs`
 - Datastore/backends: `crates/pbs-storage/src/datastore.rs`, `crates/pbs-storage/src/local.rs`, `crates/pbs-storage/src/s3.rs`
+- Durability notes: `docs/durability.md`

@@ -15,6 +15,13 @@ PBS Cloud is a clean-room implementation of a backup server compatible with [Pro
 - **Multi-Tenancy**: Isolated datastores per tenant with usage tracking and billing hooks
 - **Drop-in Compatibility**: Works with the stock `proxmox-backup-client`
 
+## Terminology
+
+- **Backend**: The physical storage provider (local filesystem, S3-compatible object storage).
+- **Datastore**: A named PBS store within a backend (`store` parameter in API/CLI).
+- **Namespace**: A logical sub-tree under a datastore (`ns/` prefixes on disk).
+- **Repository**: The client URL `user@host:store` (set via `PBS_REPOSITORY`).
+
 ## Features
 
 ### Core
@@ -53,9 +60,12 @@ PBS Cloud targets **PBS protocol compatibility** and is focused on the APIs used
 `proxmox-backup-client`. It is not a full PBS clone.
 
 **What’s verified today**
-- Unit and integration tests for protocol/data formats and server APIs (no automated
-  end-to-end `proxmox-backup-client` tests yet).
-- Manual sanity checks for backup/restore flow are recommended before production use.
+- Unit and integration tests for protocol/data formats and server APIs.
+- Optional end-to-end smoke test (`scripts/pbs_client_smoke.sh`) runs `proxmox-backup-client`
+  backup → list → restore when the client binary is available (CI skips if missing).
+
+**Tested client versions**
+- Reported by the smoke test (`proxmox-backup-client --version`) when run in CI or locally.
 
 **Compatibility matrix**
 
@@ -107,6 +117,9 @@ prevent races with in-flight writes.
 
 Recommendation: schedule GC during low-traffic windows and avoid running it concurrently with
 large ingest jobs until an explicit lease mechanism is implemented.
+
+For more detail on crash behavior, partial uploads, and object storage semantics, see
+`docs/durability.md`.
 
 ## Architecture
 
@@ -307,6 +320,9 @@ to a file and/or `PBS_PRINT_ROOT_TOKEN=0` to avoid long-lived log exposure.
 # Set the repository (adjust hostname as needed)
 export PBS_REPOSITORY="root@pam!root-token@localhost:8007:default"
 
+# If using self-signed TLS, set the fingerprint (sha256, colon-separated)
+# export PBS_FINGERPRINT="aa:bb:cc:..."
+
 # Use a non-default datastore
 # export PBS_REPOSITORY="root@pam!root-token@localhost:8007:archive"
 
@@ -495,6 +511,12 @@ curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
   https://localhost:8007/api2/json/compliance/report
 ```
 
+## Compliance scope
+
+- The compliance report is a **retention summary**, not a certified audit or regulatory attestation.
+- WORM enforcement prevents deletion within the configured retention window but does **not** provide
+  legal-hold guarantees unless your backend provides object lock or versioning.
+
 ### Prometheus Metrics
 
 Metrics are **disabled by default** for unauthenticated access. Enable public metrics with
@@ -649,6 +671,9 @@ Protects against:
 # Full local CI-style check (fmt + clippy + build + tests + helm lint)
 ./scripts/ci.sh
 
+# Optional: proxmox-backup-client end-to-end smoke test (skips if client missing)
+./scripts/pbs_client_smoke.sh
+
 # Run with output
 ./scripts/test.sh -- --nocapture
 
@@ -665,6 +690,8 @@ PBS Cloud includes a lightweight CLI for common API interactions.
 ```bash
 # Build
 cargo build -p pbs-cli
+
+# Binary name: pbs-cloud (server binary is pbs-cloud-server)
 
 # Ping (no auth required)
 ./target/debug/pbs-cloud --url https://localhost:8007 ping

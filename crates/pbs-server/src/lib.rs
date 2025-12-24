@@ -24,6 +24,7 @@ pub mod rate_limit;
 pub mod server;
 pub mod session;
 pub mod streaming;
+mod system_info;
 pub mod tasks;
 pub mod tenant;
 pub mod tls;

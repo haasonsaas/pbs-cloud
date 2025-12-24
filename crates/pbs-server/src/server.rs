@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +17,7 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use parking_lot::Mutex;
 use pbs_core::{
     BackupManifest, Chunk, ChunkDigest, CryptoConfig, DataBlob, DynamicIndex, FileType, FixedIndex,
 };
@@ -41,6 +42,7 @@ use crate::protocol::{ApiError, BackupParams, BACKUP_PROTOCOL_HEADER, READER_PRO
 use crate::rate_limit::{RateLimitResult, RateLimiter_};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtocolHandler};
+use crate::system_info::{collect_system_snapshot, CpuTracker};
 use crate::tasks::{TaskListFilter, TaskListRequest, TaskRegistry, TaskSnapshot};
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
@@ -77,8 +79,12 @@ pub struct ServerState {
     pub persistence: Arc<PersistenceManager>,
     /// TLS acceptor (None if TLS disabled)
     pub tls_acceptor: Option<TlsAcceptor>,
+    /// TLS certificate fingerprint (sha256)
+    pub tls_fingerprint: Option<String>,
     /// Server start time
     pub start_time: Instant,
+    /// CPU usage tracking
+    pub cpu_tracker: Mutex<CpuTracker>,
     /// Task registry for PBS task APIs
     pub tasks: Arc<TaskRegistry>,
     /// Last GC status per datastore
@@ -204,7 +210,8 @@ impl ServerState {
         ));
 
         // Initialize TLS
-        let tls_acceptor = create_tls_acceptor(&config.tls.clone().unwrap_or_default())?;
+        let (tls_acceptor, tls_fingerprint) =
+            create_tls_acceptor(&config.tls.clone().unwrap_or_default())?;
 
         // Create auth and tenant managers
         let auth = Arc::new(AuthManager::default());
@@ -292,7 +299,9 @@ impl ServerState {
             metrics,
             persistence,
             tls_acceptor,
+            tls_fingerprint,
             start_time: Instant::now(),
+            cpu_tracker: Mutex::new(CpuTracker::default()),
             tasks,
             gc_status,
             backup_tasks,
@@ -2865,36 +2874,84 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
 }
 
 async fn handle_nodes(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let data_dir = state
+        .config
+        .data_dir
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("/"));
+    let snapshot = {
+        let mut tracker = state.cpu_tracker.lock();
+        collect_system_snapshot(Some(data_dir), state.tls_fingerprint.as_deref(), &mut tracker)
+    };
     let nodes = serde_json::json!({
         "data": [{
             "node": "localhost",
             "status": "online",
-            "cpu": 0.0,
-            "maxcpu": 1,
-            "mem": 0,
-            "maxmem": 0,
-            "uptime": state.start_time.elapsed().as_secs(),
+            "cpu": snapshot.cpu_usage,
+            "maxcpu": snapshot.cpuinfo.cpus,
+            "mem": snapshot.memory.used,
+            "maxmem": snapshot.memory.total,
+            "uptime": snapshot.uptime,
         }]
     });
     json_response(StatusCode::OK, &nodes)
 }
 
 async fn handle_node_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
-    let uptime = state.start_time.elapsed().as_secs();
+    let data_dir = state
+        .config
+        .data_dir
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("/"));
+    let snapshot = {
+        let mut tracker = state.cpu_tracker.lock();
+        collect_system_snapshot(Some(data_dir), state.tls_fingerprint.as_deref(), &mut tracker)
+    };
     let data = serde_json::json!({
         "data": {
-            "memory": { "total": 0, "used": 0, "free": 0 },
-            "swap": { "total": 0, "used": 0, "free": 0 },
-            "root": { "total": 0, "used": 0, "avail": 0 },
-            "uptime": uptime,
-            "loadavg": [0.0, 0.0, 0.0],
-            "current-kernel": { "sysname": "", "release": "", "version": "", "machine": "" },
-            "kversion": "",
-            "cpu": 0.0,
-            "wait": 0.0,
-            "cpuinfo": { "model": "", "sockets": 0, "cpus": 0 },
-            "info": { "fingerprint": "" },
-            "boot-info": { "mode": "efi", "secureboot": false }
+            "memory": {
+                "total": snapshot.memory.total,
+                "used": snapshot.memory.used,
+                "free": snapshot.memory.free
+            },
+            "swap": {
+                "total": snapshot.swap.total,
+                "used": snapshot.swap.used,
+                "free": snapshot.swap.free
+            },
+            "root": {
+                "total": snapshot.root.total,
+                "used": snapshot.root.used,
+                "avail": snapshot.root.avail
+            },
+            "uptime": snapshot.uptime,
+            "loadavg": snapshot.loadavg,
+            "current-kernel": {
+                "sysname": snapshot.kernel.sysname,
+                "release": snapshot.kernel.release,
+                "version": snapshot.kernel.version,
+                "machine": snapshot.kernel.machine
+            },
+            "kversion": format!(
+                "{} {} {}",
+                snapshot.kernel.sysname,
+                snapshot.kernel.release,
+                snapshot.kernel.version
+            ).trim().to_string(),
+            "cpu": snapshot.cpu_usage,
+            "wait": snapshot.cpu_wait,
+            "cpuinfo": {
+                "model": snapshot.cpuinfo.model,
+                "sockets": snapshot.cpuinfo.sockets,
+                "cpus": snapshot.cpuinfo.cpus
+            },
+            "info": { "fingerprint": snapshot.fingerprint },
+            "boot-info": {
+                "mode": snapshot.boot.mode,
+                "secureboot": snapshot.boot.secure_boot
+            }
         }
     });
     json_response(StatusCode::OK, &data)

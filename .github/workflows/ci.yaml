@@ -45,6 +45,9 @@ jobs:
       - name: Run tests
         run: ./scripts/test.sh
 
+      - name: PBS client smoke test
+        run: ./scripts/pbs_client_smoke.sh
+
   helm-lint:
     name: Helm Lint
     runs-on: ubuntu-latest
