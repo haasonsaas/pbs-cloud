@@ -4512,6 +4512,7 @@ async fn handle_verify_api(
                         let mut size_mismatch = Vec::new();
                         let mut index_errors = Vec::new();
                         let mut missing_chunks = Vec::new();
+                        let mut digest_mismatch = Vec::new();
                         let mut chunk_checked = 0usize;
                         let mut chunk_missing = 0usize;
                         let existing = match datastore_clone.backend().list_files(&prefix).await {
@@ -4561,6 +4562,8 @@ async fn handle_verify_api(
                             }
                         }
 
+                        let mut chunk_expectations = std::collections::HashMap::new();
+
                         for file in &manifest.files {
                             if matches!(file.file_type, FileType::Fidx | FileType::Didx)
                                 && !missing.contains(&file.filename)
@@ -4576,50 +4579,67 @@ async fn handle_verify_api(
                                         continue;
                                     }
                                 };
-                                let digests = match file.file_type {
+                                match file.file_type {
                                     FileType::Fidx => match FixedIndex::from_bytes(&data) {
-                                        Ok(index) => index.unique_digests(),
+                                        Ok(index) => {
+                                            for digest in index.unique_digests() {
+                                                chunk_expectations.entry(digest).or_insert(None);
+                                            }
+                                        }
                                         Err(e) => {
                                             index_errors.push(format!(
                                                 "{}: parse failed ({})",
                                                 file.filename, e
                                             ));
-                                            continue;
                                         }
                                     },
                                     FileType::Didx => match DynamicIndex::from_bytes(&data) {
-                                        Ok(index) => index.unique_digests(),
+                                        Ok(index) => {
+                                            for entry in index.entries {
+                                                chunk_expectations
+                                                    .entry(entry.digest)
+                                                    .or_insert(Some(entry.size));
+                                            }
+                                        }
                                         Err(e) => {
                                             index_errors.push(format!(
                                                 "{}: parse failed ({})",
                                                 file.filename, e
                                             ));
-                                            continue;
                                         }
                                     },
-                                    FileType::Blob => Vec::new(),
-                                };
+                                    FileType::Blob => {}
+                                }
+                            }
+                        }
 
-                                for digest in digests {
-                                    chunk_checked = chunk_checked.saturating_add(1);
-                                    match datastore_clone.backend().chunk_exists(&digest).await {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            chunk_missing = chunk_missing.saturating_add(1);
-                                            if missing_chunks.len() < 10 {
-                                                missing_chunks.push(digest.to_hex());
-                                            }
+                        for (digest, expected_size) in chunk_expectations {
+                            chunk_checked = chunk_checked.saturating_add(1);
+                            match datastore_clone.read_chunk(&digest).await {
+                                Ok(chunk) => {
+                                    if chunk.digest() != &digest && digest_mismatch.len() < 10 {
+                                        digest_mismatch.push(digest.to_hex());
+                                    }
+                                    if let Some(size) = expected_size {
+                                        if chunk.size() as u64 != size && digest_mismatch.len() < 10
+                                        {
+                                            digest_mismatch.push(format!(
+                                                "{} (size {} != {})",
+                                                digest.to_hex(),
+                                                chunk.size(),
+                                                size
+                                            ));
                                         }
-                                        Err(e) => {
-                                            chunk_missing = chunk_missing.saturating_add(1);
-                                            if missing_chunks.len() < 10 {
-                                                missing_chunks.push(format!(
-                                                    "{} (error: {})",
-                                                    digest.to_hex(),
-                                                    e
-                                                ));
-                                            }
-                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    chunk_missing = chunk_missing.saturating_add(1);
+                                    if missing_chunks.len() < 10 {
+                                        missing_chunks.push(format!(
+                                            "{} (error: {})",
+                                            digest.to_hex(),
+                                            e
+                                        ));
                                     }
                                 }
                             }
@@ -4629,6 +4649,7 @@ async fn handle_verify_api(
                             && size_mismatch.is_empty()
                             && chunk_missing == 0
                             && index_errors.is_empty()
+                            && digest_mismatch.is_empty()
                         {
                             serde_json::json!({
                                 "upid": upid_clone.clone(),
@@ -4657,6 +4678,7 @@ async fn handle_verify_api(
                             && size_mismatch.is_empty()
                             && chunk_missing == 0
                             && index_errors.is_empty()
+                            && digest_mismatch.is_empty()
                         {
                             ok = ok.saturating_add(1);
                         } else {
@@ -4709,6 +4731,19 @@ async fn handle_verify_api(
                                             chunk_checked,
                                             chunk_missing,
                                             missing_chunks.join(", ")
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            if !digest_mismatch.is_empty() {
+                                state_clone
+                                    .tasks
+                                    .log(
+                                        &upid_clone,
+                                        &format!(
+                                            "Chunk digest/size mismatches in {}: {}",
+                                            snapshot_path,
+                                            digest_mismatch.join(", ")
                                         ),
                                     )
                                     .await;
