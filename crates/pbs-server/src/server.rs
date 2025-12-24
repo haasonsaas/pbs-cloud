@@ -3745,6 +3745,8 @@ async fn handle_tasks_api(
                             "starttime": task.starttime,
                             "type": task.worker_type,
                             "id": task.worker_id,
+                            "worker_type": task.worker_type,
+                            "worker_id": task.worker_id,
                             "user": user,
                             "tokenid": tokenid,
                             "status": status,
