@@ -43,6 +43,11 @@ impl Datastore {
         &self.name
     }
 
+    /// Get the storage backend
+    pub fn backend(&self) -> Arc<dyn StorageBackend> {
+        self.backend.clone()
+    }
+
     /// Store a chunk (with deduplication)
     #[instrument(skip(self, chunk), fields(datastore = %self.name, digest = %chunk.digest()))]
     pub async fn store_chunk(&self, chunk: &Chunk) -> StorageResult<bool> {

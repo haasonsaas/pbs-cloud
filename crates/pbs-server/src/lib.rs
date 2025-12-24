@@ -29,7 +29,7 @@ pub mod validation;
 
 pub use auth::{AuthContext, AuthManager, Permission, User, ApiToken};
 pub use billing::{BillingManager, UsageEvent, UsageEventType, WebhookConfig};
-pub use config::ServerConfig;
+pub use config::{ServerConfig, GcConfig};
 pub use metrics::{Metrics, MetricsConfig};
 pub use persistence::{PersistenceConfig, PersistenceManager};
 pub use rate_limit::{RateLimitConfig, RateLimiter_, RateLimitResult};

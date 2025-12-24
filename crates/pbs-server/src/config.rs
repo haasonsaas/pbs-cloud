@@ -22,6 +22,9 @@ pub struct ServerConfig {
     pub storage: StorageConfig,
     /// Tenant configuration
     pub tenants: TenantsConfig,
+    /// Garbage collection configuration
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +36,7 @@ impl Default for ServerConfig {
             rate_limit: Some(RateLimitConfig::default()),
             storage: StorageConfig::default(),
             tenants: TenantsConfig::default(),
+            gc: GcConfig::default(),
         }
     }
 }
@@ -123,6 +127,24 @@ impl Default for TenantsConfig {
         Self {
             enabled: false,
             default_tenant: "default".to_string(),
+        }
+    }
+}
+
+/// Garbage collection configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcConfig {
+    /// Enable scheduled GC (runs every gc_interval_hours)
+    pub enabled: bool,
+    /// Interval in hours between automatic GC runs
+    pub interval_hours: u64,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_hours: 24, // Run GC once per day by default
         }
     }
 }

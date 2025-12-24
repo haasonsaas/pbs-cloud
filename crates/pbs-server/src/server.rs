@@ -14,7 +14,10 @@ use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use pbs_core::{ChunkDigest, CryptoConfig};
-use pbs_storage::{Datastore, LocalBackend, S3Backend, StorageBackend};
+use pbs_storage::{
+    Datastore, LocalBackend, S3Backend, StorageBackend,
+    GarbageCollector, GcOptions, Pruner, PruneOptions,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, instrument, warn, debug};
@@ -238,6 +241,51 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
             }
         }
     });
+
+    // Spawn scheduled GC if enabled
+    if state.config.gc.enabled {
+        let state_for_gc = state.clone();
+        let gc_interval = tokio::time::Duration::from_secs(state.config.gc.interval_hours * 3600);
+        info!("Scheduled GC enabled, running every {} hours", state.config.gc.interval_hours);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(gc_interval);
+            // Skip the first immediate tick
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                info!("Starting scheduled GC run");
+
+                let datastore = state_for_gc.default_datastore();
+                let backend = datastore.backend();
+                let gc = GarbageCollector::new(datastore, backend);
+
+                let options = GcOptions {
+                    dry_run: false,
+                    max_delete: None,
+                };
+
+                match gc.run(options).await {
+                    Ok(result) => {
+                        info!(
+                            "Scheduled GC completed: scanned={}, orphaned={}, deleted={}, freed={}",
+                            result.chunks_scanned,
+                            result.chunks_orphaned,
+                            result.chunks_deleted,
+                            result.bytes_freed
+                        );
+                        if !result.errors.is_empty() {
+                            warn!("GC errors: {:?}", result.errors);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Scheduled GC failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -551,6 +599,26 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
                 async move { handle_rate_limit_info(state, &ctx).await }
+            }).await
+        }
+
+        // GC/Admin API
+        (Method::POST, "/api2/json/admin/gc") => {
+            with_auth(auth_ctx, Permission::Admin, |_| {
+                let state = state.clone();
+                async move { handle_run_gc(state, req).await }
+            }).await
+        }
+        (Method::GET, "/api2/json/admin/gc/status") => {
+            with_auth(auth_ctx, Permission::Admin, |_| {
+                let state = state.clone();
+                async move { handle_gc_status(state).await }
+            }).await
+        }
+        (Method::POST, "/api2/json/admin/prune") => {
+            with_auth(auth_ctx, Permission::DatastoreAdmin, |_| {
+                let state = state.clone();
+                async move { handle_prune(state, req).await }
             }).await
         }
 
@@ -1460,6 +1528,144 @@ async fn handle_rate_limit_info(state: Arc<ServerState>, ctx: &AuthContext) -> R
             "requests_per_minute_limit": stats.requests_per_minute_limit
         }
     }))
+}
+
+// === GC/Admin handlers ===
+
+async fn handle_run_gc(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    #[derive(serde::Deserialize, Default)]
+    struct GcRequest {
+        #[serde(default)]
+        dry_run: bool,
+        max_delete: Option<usize>,
+    }
+
+    let params: GcRequest = if body.is_empty() {
+        GcRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(_) => return bad_request("Invalid JSON"),
+        }
+    };
+
+    let datastore = state.default_datastore();
+    let backend = datastore.backend();
+    let gc = GarbageCollector::new(datastore, backend);
+
+    let options = GcOptions {
+        dry_run: params.dry_run,
+        max_delete: params.max_delete,
+    };
+
+    info!("Starting GC run (dry_run={})", params.dry_run);
+
+    match gc.run(options).await {
+        Ok(result) => {
+            let response = serde_json::json!({
+                "data": {
+                    "chunks_scanned": result.chunks_scanned,
+                    "chunks_referenced": result.chunks_referenced,
+                    "chunks_orphaned": result.chunks_orphaned,
+                    "chunks_deleted": result.chunks_deleted,
+                    "bytes_freed": result.bytes_freed,
+                    "errors": result.errors
+                }
+            });
+            json_response(StatusCode::OK, &response)
+        }
+        Err(e) => error_response(ApiError::internal(&e.to_string())),
+    }
+}
+
+async fn handle_gc_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    // For now, just return datastore stats - could be extended to track ongoing GC
+    let datastore = state.default_datastore();
+    let backend = datastore.backend();
+
+    match backend.list_chunks().await {
+        Ok(chunks) => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "data": {
+                    "total_chunks": chunks.len(),
+                    "gc_running": false
+                }
+            }))
+        }
+        Err(e) => error_response(ApiError::internal(&e.to_string())),
+    }
+}
+
+async fn handle_prune(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let body = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return bad_request("Failed to read request body"),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct PruneRequest {
+        backup_type: String,
+        backup_id: String,
+        #[serde(default)]
+        dry_run: bool,
+        keep_last: Option<usize>,
+        keep_daily: Option<usize>,
+        keep_weekly: Option<usize>,
+        keep_monthly: Option<usize>,
+        keep_yearly: Option<usize>,
+    }
+
+    let params: PruneRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return bad_request("Invalid JSON"),
+    };
+
+    // Validate backup parameters
+    if let Err(e) = validate_backup_params(&params.backup_type, &params.backup_id, "2000-01-01T00:00:00Z") {
+        return error_response(e);
+    }
+
+    let datastore = state.default_datastore();
+    let pruner = Pruner::new(datastore);
+
+    let options = PruneOptions {
+        keep_last: params.keep_last.or(Some(1)),
+        keep_hourly: None,
+        keep_daily: params.keep_daily.or(Some(7)),
+        keep_weekly: params.keep_weekly.or(Some(4)),
+        keep_monthly: params.keep_monthly.or(Some(6)),
+        keep_yearly: params.keep_yearly,
+        dry_run: params.dry_run,
+    };
+
+    info!(
+        "Pruning {}/{} (dry_run={})",
+        params.backup_type, params.backup_id, params.dry_run
+    );
+
+    match pruner.prune(&params.backup_type, &params.backup_id, options).await {
+        Ok(result) => {
+            json_response(StatusCode::OK, &serde_json::json!({
+                "data": {
+                    "kept": result.kept,
+                    "pruned": result.pruned,
+                    "errors": result.errors
+                }
+            }))
+        }
+        Err(e) => error_response(ApiError::internal(&e.to_string())),
+    }
 }
 
 // === Response helpers ===
