@@ -121,6 +121,8 @@
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.
+- Ping: `/api2/json/ping`.
+- Status: `/api2/json/status`, `/api2/json/status/datastore-usage`, `/api2/json/nodes/localhost/status`.
 - Metrics: `/metrics` (public).
 - Compliance report: `GET /api2/json/compliance/report` (Admin, optional `store`).
 - Webhook verification: `POST /api2/json/billing/webhook` with `X-Signature-256`.

@@ -316,6 +316,7 @@ For Kubernetes or load balancer health checks:
 |----------|-------------|
 | `GET /health` or `GET /healthz` | Liveness probe - returns 200 if server is running |
 | `GET /ready` or `GET /readyz` | Readiness probe - returns 200 if datastores are configured |
+| `GET /api2/json/ping` | PBS API ping (returns `{ pong: true }`) |
 
 ```bash
 # Check health
@@ -323,6 +324,22 @@ curl https://localhost:8007/health
 
 # Check readiness
 curl https://localhost:8007/ready
+```
+
+### Status & Tasks
+
+```bash
+# Datastore usage summary (PBS-compatible)
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/status/datastore-usage
+
+# Node status (basic)
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/nodes/localhost/status
+
+# Task list
+curl -H "Authorization: PBSAPIToken=root@pam!root:pbs_..." \
+  https://localhost:8007/api2/json/nodes/localhost/tasks
 ```
 
 ## API Reference

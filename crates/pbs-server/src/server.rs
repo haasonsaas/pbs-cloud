@@ -774,6 +774,7 @@ async fn handle_request(
 
         // Public endpoints
         (Method::GET, "/api2/json/version") => handle_version().await,
+        (Method::GET, "/api2/json/ping") => handle_ping().await,
         (Method::GET, "/api2/json/access/ticket") => handle_auth_info().await,
 
         // Metrics endpoint
@@ -787,8 +788,16 @@ async fn handle_request(
 
         // API v2 routes (require auth)
         (Method::GET, "/api2/json/nodes") => {
-            with_auth(auth_ctx, Permission::Read, |_| async {
-                handle_nodes().await
+            with_auth(auth_ctx, Permission::Read, |_| {
+                let state = state.clone();
+                async move { handle_nodes(state).await }
+            })
+            .await
+        }
+        (Method::GET, "/api2/json/nodes/localhost/status") => {
+            with_auth(auth_ctx, Permission::Read, |_| {
+                let state = state.clone();
+                async move { handle_node_status(state).await }
             })
             .await
         }
@@ -810,6 +819,13 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
                 async move { handle_verify_config_api(state, &ctx, req).await }
+            })
+            .await
+        }
+        (Method::GET, "/api2/json/status/datastore-usage") => {
+            with_auth(auth_ctx, Permission::Read, |_| {
+                let state = state.clone();
+                async move { handle_status_datastore_usage(state).await }
             })
             .await
         }
@@ -2319,6 +2335,8 @@ fn task_snapshot_value(task: &TaskSnapshot) -> serde_json::Value {
         "starttime": task.starttime,
         "worker-type": task.worker_type,
         "worker-id": task.worker_id,
+        "worker_type": task.worker_type,
+        "worker_id": task.worker_id,
         "user": task.user,
         "endtime": task.endtime,
         "status": task.status,
@@ -2409,6 +2427,15 @@ async fn handle_version() -> Response<Full<Bytes>> {
         }
     });
     json_response(StatusCode::OK, &version)
+}
+
+async fn handle_ping() -> Response<Full<Bytes>> {
+    let response = serde_json::json!({
+        "data": {
+            "pong": true
+        }
+    });
+    json_response(StatusCode::OK, &response)
 }
 
 async fn handle_auth_info() -> Response<Full<Bytes>> {
@@ -2584,18 +2611,40 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
     }
 }
 
-async fn handle_nodes() -> Response<Full<Bytes>> {
+async fn handle_nodes(state: Arc<ServerState>) -> Response<Full<Bytes>> {
     let nodes = serde_json::json!({
         "data": [{
-            "node": "pbs-cloud",
+            "node": "localhost",
             "status": "online",
             "cpu": 0.0,
             "maxcpu": 1,
             "mem": 0,
-            "maxmem": 0
+            "maxmem": 0,
+            "uptime": state.start_time.elapsed().as_secs(),
         }]
     });
     json_response(StatusCode::OK, &nodes)
+}
+
+async fn handle_node_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let uptime = state.start_time.elapsed().as_secs();
+    let data = serde_json::json!({
+        "data": {
+            "memory": { "total": 0, "used": 0, "free": 0 },
+            "swap": { "total": 0, "used": 0, "free": 0 },
+            "root": { "total": 0, "used": 0, "avail": 0 },
+            "uptime": uptime,
+            "loadavg": [0.0, 0.0, 0.0],
+            "current-kernel": { "sysname": "", "release": "", "version": "", "machine": "" },
+            "kversion": "",
+            "cpu": 0.0,
+            "wait": 0.0,
+            "cpuinfo": { "model": "", "sockets": 0, "cpus": 0 },
+            "info": { "fingerprint": "" },
+            "boot-info": { "mode": "efi", "secureboot": false }
+        }
+    });
+    json_response(StatusCode::OK, &data)
 }
 
 async fn collect_namespaces(datastore: Arc<Datastore>) -> Vec<String> {
@@ -3725,6 +3774,49 @@ async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         }
     });
     json_response(StatusCode::OK, &status)
+}
+
+async fn handle_status_datastore_usage(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let mut stores: Vec<_> = state.datastores.keys().cloned().collect();
+    stores.sort();
+    let mut data = Vec::new();
+
+    for store in stores {
+        let datastore = match state.datastores.get(&store) {
+            Some(ds) => ds.clone(),
+            None => continue,
+        };
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "store".to_string(),
+            serde_json::Value::String(store.clone()),
+        );
+
+        match datastore.backend().stats().await {
+            Ok(stats) => {
+                let used = stats.chunk_bytes.saturating_add(stats.file_bytes);
+                entry.insert("used".to_string(), serde_json::Value::from(used));
+            }
+            Err(err) => {
+                entry.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(err.to_string()),
+                );
+            }
+        }
+
+        let gc_status = {
+            let map = state.gc_status.read().await;
+            map.get(&store).cloned()
+        };
+        if let Some(gc_status) = gc_status {
+            entry.insert("gc-status".to_string(), gc_status);
+        }
+
+        data.push(serde_json::Value::Object(entry));
+    }
+
+    json_response(StatusCode::OK, &serde_json::json!({ "data": data }))
 }
 
 async fn handle_protocol_upgrade(

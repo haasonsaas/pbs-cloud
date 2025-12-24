@@ -336,6 +336,8 @@ impl TaskRegistry {
                     "starttime": task.starttime,
                     "worker-type": task.worker_type,
                     "worker-id": task.worker_id,
+                    "worker_type": task.worker_type,
+                    "worker_id": task.worker_id,
                     "user": task.user,
                     "endtime": task.endtime,
                     "status": task.status,
