@@ -55,7 +55,7 @@ impl Datastore {
 
         // Create data blob (compressed, optionally encrypted)
         let blob = DataBlob::encode(chunk.data(), &self.crypto, true)
-            .map_err(|e| StorageError::Core(e))?;
+            .map_err(StorageError::Core)?;
 
         let data = Bytes::from(blob.to_bytes());
         self.backend.write_chunk(digest, data).await
@@ -65,9 +65,9 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, digest = %digest))]
     pub async fn read_chunk(&self, digest: &ChunkDigest) -> StorageResult<Chunk> {
         let data = self.backend.read_chunk(digest).await?;
-        let blob = DataBlob::from_bytes(&data).map_err(|e| StorageError::Core(e))?;
-        let raw_data = blob.decode(&self.crypto).map_err(|e| StorageError::Core(e))?;
-        Chunk::new(raw_data).map_err(|e| StorageError::Core(e))
+        let blob = DataBlob::from_bytes(&data).map_err(StorageError::Core)?;
+        let raw_data = blob.decode(&self.crypto).map_err(StorageError::Core)?;
+        Chunk::new(raw_data).map_err(StorageError::Core)
     }
 
     /// Check if a chunk exists
@@ -80,7 +80,7 @@ impl Datastore {
     pub async fn store_fixed_index(&self, path: &str, index: &FixedIndex) -> StorageResult<()> {
         let data = index.to_bytes();
         let blob = DataBlob::encode(&data, &self.crypto, true)
-            .map_err(|e| StorageError::Core(e))?;
+            .map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -90,9 +90,9 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, path = %path))]
     pub async fn read_fixed_index(&self, path: &str) -> StorageResult<FixedIndex> {
         let data = self.backend.read_file(path).await?;
-        let blob = DataBlob::from_bytes(&data).map_err(|e| StorageError::Core(e))?;
-        let raw_data = blob.decode(&self.crypto).map_err(|e| StorageError::Core(e))?;
-        FixedIndex::from_bytes(&raw_data).map_err(|e| StorageError::Core(e))
+        let blob = DataBlob::from_bytes(&data).map_err(StorageError::Core)?;
+        let raw_data = blob.decode(&self.crypto).map_err(StorageError::Core)?;
+        FixedIndex::from_bytes(&raw_data).map_err(StorageError::Core)
     }
 
     /// Store a dynamic index
@@ -104,7 +104,7 @@ impl Datastore {
     ) -> StorageResult<()> {
         let data = index.to_bytes();
         let blob = DataBlob::encode(&data, &self.crypto, true)
-            .map_err(|e| StorageError::Core(e))?;
+            .map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -114,16 +114,16 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, path = %path))]
     pub async fn read_dynamic_index(&self, path: &str) -> StorageResult<DynamicIndex> {
         let data = self.backend.read_file(path).await?;
-        let blob = DataBlob::from_bytes(&data).map_err(|e| StorageError::Core(e))?;
-        let raw_data = blob.decode(&self.crypto).map_err(|e| StorageError::Core(e))?;
-        DynamicIndex::from_bytes(&raw_data).map_err(|e| StorageError::Core(e))
+        let blob = DataBlob::from_bytes(&data).map_err(StorageError::Core)?;
+        let raw_data = blob.decode(&self.crypto).map_err(StorageError::Core)?;
+        DynamicIndex::from_bytes(&raw_data).map_err(StorageError::Core)
     }
 
     /// Store a blob file
     #[instrument(skip(self, data), fields(datastore = %self.name, path = %path, size = data.len()))]
     pub async fn store_blob(&self, path: &str, data: &[u8]) -> StorageResult<()> {
         let blob = DataBlob::encode(data, &self.crypto, true)
-            .map_err(|e| StorageError::Core(e))?;
+            .map_err(StorageError::Core)?;
         self.backend
             .write_file(path, Bytes::from(blob.to_bytes()))
             .await
@@ -133,15 +133,15 @@ impl Datastore {
     #[instrument(skip(self), fields(datastore = %self.name, path = %path))]
     pub async fn read_blob(&self, path: &str) -> StorageResult<Vec<u8>> {
         let data = self.backend.read_file(path).await?;
-        let blob = DataBlob::from_bytes(&data).map_err(|e| StorageError::Core(e))?;
-        blob.decode(&self.crypto).map_err(|e| StorageError::Core(e))
+        let blob = DataBlob::from_bytes(&data).map_err(StorageError::Core)?;
+        blob.decode(&self.crypto).map_err(StorageError::Core)
     }
 
     /// Store a backup manifest
     #[instrument(skip(self, manifest), fields(datastore = %self.name))]
     pub async fn store_manifest(&self, manifest: &BackupManifest) -> StorageResult<()> {
         let path = format!("{}/index.json", manifest.snapshot_path());
-        let json = manifest.to_json().map_err(|e| StorageError::Core(e))?;
+        let json = manifest.to_json().map_err(StorageError::Core)?;
         self.backend
             .write_file(&path, Bytes::from(json.into_bytes()))
             .await
@@ -153,7 +153,7 @@ impl Datastore {
         let data = self.backend.read_file(path).await?;
         let json = String::from_utf8(data.to_vec())
             .map_err(|e| StorageError::Backend(e.to_string()))?;
-        BackupManifest::from_json(&json).map_err(|e| StorageError::Core(e))
+        BackupManifest::from_json(&json).map_err(StorageError::Core)
     }
 
     /// List backup groups (type/id combinations)

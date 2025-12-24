@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use anyhow::Result;
+use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use pbs_server::{ServerConfig, server::{ServerState, run_server}};
@@ -26,10 +27,48 @@ async fn main() -> Result<()> {
     // Create server state
     let state = Arc::new(ServerState::from_config(config).await?);
 
-    // Start the server
-    run_server(state).await?;
+    // Start the server with graceful shutdown
+    let state_for_shutdown = state.clone();
+    tokio::select! {
+        result = run_server(state) => {
+            if let Err(e) = result {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("Shutdown signal received, saving state...");
+            if let Err(e) = state_for_shutdown.save_state().await {
+                tracing::error!("Failed to save state on shutdown: {}", e);
+            }
+            tracing::info!("Shutdown complete");
+        }
+    }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn load_config() -> Result<ServerConfig> {

@@ -403,6 +403,10 @@ async fn handle_request(
 
     // Route to appropriate handler
     let response = match (method.clone(), path.as_str()) {
+        // Health check endpoints (for k8s/load balancers)
+        (Method::GET, "/health") | (Method::GET, "/healthz") => handle_health(state.clone()).await,
+        (Method::GET, "/ready") | (Method::GET, "/readyz") => handle_ready(state.clone()).await,
+
         // Public endpoints
         (Method::GET, "/api2/json/version") => handle_version().await,
         (Method::GET, "/api2/json/access/ticket") => handle_auth_info().await,
@@ -671,6 +675,7 @@ fn is_public_endpoint(path: &str) -> bool {
     matches!(
         path,
         "/api2/json/version" | "/api2/json/access/ticket" | "/metrics"
+            | "/health" | "/healthz" | "/ready" | "/readyz"
     )
 }
 
@@ -743,6 +748,39 @@ fn get_query_param(uri: &hyper::Uri, name: &str) -> Option<String> {
 
 // === Handler implementations ===
 
+/// Health check endpoint - returns 200 if server is running
+async fn handle_health(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    let (backup_sessions, reader_sessions) = state.sessions.session_count().await;
+    let health = serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+        "sessions": {
+            "backup": backup_sessions,
+            "reader": reader_sessions
+        }
+    });
+    json_response(StatusCode::OK, &health)
+}
+
+/// Readiness check endpoint - returns 200 if server is ready to accept requests
+async fn handle_ready(state: Arc<ServerState>) -> Response<Full<Bytes>> {
+    // Check if we have at least one datastore available
+    let datastores_count = state.datastores.len();
+    if datastores_count == 0 {
+        let error = serde_json::json!({
+            "status": "not_ready",
+            "reason": "no datastores configured"
+        });
+        return json_response(StatusCode::SERVICE_UNAVAILABLE, &error);
+    }
+
+    let ready = serde_json::json!({
+        "status": "ready",
+        "datastores": datastores_count
+    });
+    json_response(StatusCode::OK, &ready)
+}
+
 async fn handle_version() -> Response<Full<Bytes>> {
     let version = serde_json::json!({
         "data": {
@@ -793,6 +831,7 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
     // Token-based auth: password field contains the API token
     match state.auth.authenticate_token(&params.password).await {
         Ok(ctx) => {
+            audit::log_auth_success(&params.username, &ctx.user.tenant_id, None);
             let response = serde_json::json!({
                 "data": {
                     "username": ctx.user.username,
@@ -802,7 +841,10 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
             });
             json_response(StatusCode::OK, &response)
         }
-        Err(e) => error_response(e),
+        Err(e) => {
+            audit::log_auth_failure(Some(&params.username), None, &e.message);
+            error_response(e)
+        }
     }
 }
 

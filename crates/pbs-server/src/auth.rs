@@ -226,7 +226,7 @@ impl AuthManager {
         let users = self.users.read().await;
         users
             .values()
-            .filter(|u| tenant_id.map_or(true, |t| u.tenant_id == t))
+            .filter(|u| tenant_id.is_none_or(|t| u.tenant_id == t))
             .cloned()
             .collect()
     }

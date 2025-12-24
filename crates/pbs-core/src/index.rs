@@ -166,7 +166,7 @@ impl FixedIndex {
 
         // Parse digests
         let digest_bytes = &bytes[HEADER_SIZE..];
-        if digest_bytes.len() % 32 != 0 {
+        if !digest_bytes.len().is_multiple_of(32) {
             return Err(Error::IndexCorrupted("Invalid digest data length".into()));
         }
 
@@ -250,8 +250,8 @@ impl DynamicIndex {
         let mut hasher = Sha256::new();
         for entry in &self.entries {
             hasher.update(entry.digest.as_bytes());
-            hasher.update(&entry.offset.to_le_bytes());
-            hasher.update(&entry.size.to_le_bytes());
+            hasher.update(entry.offset.to_le_bytes());
+            hasher.update(entry.size.to_le_bytes());
         }
         let result = hasher.finalize();
         let mut checksum = [0u8; 32];

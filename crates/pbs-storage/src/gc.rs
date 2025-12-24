@@ -14,6 +14,7 @@ use crate::error::StorageResult;
 
 /// Garbage collection options
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct GcOptions {
     /// Only report what would be deleted, don't actually delete
     pub dry_run: bool,
@@ -21,14 +22,6 @@ pub struct GcOptions {
     pub max_delete: Option<usize>,
 }
 
-impl Default for GcOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            max_delete: None,
-        }
-    }
-}
 
 /// Garbage collection result
 #[derive(Debug, Clone, Default)]
