@@ -37,6 +37,14 @@ impl BackupProtocolHandler {
             params.backup_type, params.backup_id, params.backup_time
         );
 
+        // Verify tenant is active
+        let tenant = self.state.tenants.get_tenant(&ctx.user.tenant_id).await
+            .ok_or_else(|| ApiError::not_found("Tenant not found"))?;
+
+        if !tenant.active {
+            return Err(ApiError::new(403, "Tenant is not active"));
+        }
+
         let datastore = self.state.default_datastore();
         let session_id = self.state.sessions.create_backup_session(
             &ctx.user.tenant_id,
@@ -58,9 +66,13 @@ impl BackupProtocolHandler {
     pub async fn upload_fixed_chunk(
         &self,
         session_id: &str,
+        tenant_id: &str,
         digest: ChunkDigest,
         data: Vec<u8>,
     ) -> Result<bool, ApiError> {
+        // Verify session ownership
+        self.state.sessions.verify_session_ownership(session_id, tenant_id).await?;
+
         let datastore = self.state.default_datastore();
 
         // Check if chunk already exists (deduplication)
@@ -85,7 +97,7 @@ impl BackupProtocolHandler {
             .map_err(|e| ApiError::internal(&e.to_string()))?;
 
         // Mark chunk as uploaded in session
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.mark_chunk_uploaded(digest);
             Ok(())
         }).await?;
@@ -98,21 +110,23 @@ impl BackupProtocolHandler {
     pub async fn upload_dynamic_chunk(
         &self,
         session_id: &str,
+        tenant_id: &str,
         digest: ChunkDigest,
         data: Vec<u8>,
     ) -> Result<bool, ApiError> {
         // Same as fixed chunk for now
-        self.upload_fixed_chunk(session_id, digest, data).await
+        self.upload_fixed_chunk(session_id, tenant_id, digest, data).await
     }
 
     /// Create a fixed index
     pub async fn create_fixed_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
         chunk_size: u64,
     ) -> Result<(), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.create_fixed_index(name, chunk_size);
             Ok(())
         }).await
@@ -122,11 +136,12 @@ impl BackupProtocolHandler {
     pub async fn append_fixed_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
         digest: ChunkDigest,
         size: u64,
     ) -> Result<(), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.append_fixed_index(name, digest, size)
         }).await
     }
@@ -135,9 +150,10 @@ impl BackupProtocolHandler {
     pub async fn close_fixed_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<(u64, ChunkDigest), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             let index = session.close_fixed_index(name)?;
             let data = index.to_bytes();
             let digest = ChunkDigest::from_data(&data);
@@ -149,9 +165,10 @@ impl BackupProtocolHandler {
     pub async fn create_dynamic_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<(), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.create_dynamic_index(name);
             Ok(())
         }).await
@@ -161,12 +178,13 @@ impl BackupProtocolHandler {
     pub async fn append_dynamic_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
         digest: ChunkDigest,
         offset: u64,
         size: u64,
     ) -> Result<(), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.append_dynamic_index(name, digest, offset, size)
         }).await
     }
@@ -175,9 +193,10 @@ impl BackupProtocolHandler {
     pub async fn close_dynamic_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<(u64, ChunkDigest), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             let index = session.close_dynamic_index(name)?;
             let data = index.to_bytes();
             let digest = ChunkDigest::from_data(&data);
@@ -189,10 +208,11 @@ impl BackupProtocolHandler {
     pub async fn upload_blob(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
         data: Vec<u8>,
     ) -> Result<(), ApiError> {
-        self.state.sessions.with_backup_session(session_id, |session| {
+        self.state.sessions.with_backup_session_verified(session_id, tenant_id, |session| {
             session.store_blob(name, data);
             Ok(())
         }).await
@@ -296,6 +316,14 @@ impl ReaderProtocolHandler {
             backup_type, backup_id, backup_time
         );
 
+        // Verify tenant is active
+        let tenant = self.state.tenants.get_tenant(&ctx.user.tenant_id).await
+            .ok_or_else(|| ApiError::not_found("Tenant not found"))?;
+
+        if !tenant.active {
+            return Err(ApiError::new(403, "Tenant is not active"));
+        }
+
         let datastore = self.state.default_datastore();
         let session_id = self.state.sessions.create_reader_session(
             &ctx.user.tenant_id,
@@ -317,6 +345,9 @@ impl ReaderProtocolHandler {
         digest: &ChunkDigest,
         tenant_id: &str,
     ) -> Result<Vec<u8>, ApiError> {
+        // Verify reader session ownership
+        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+
         // Read chunk directly from datastore
         let datastore = self.state.default_datastore();
         let chunk = datastore.read_chunk(digest).await
@@ -335,8 +366,12 @@ impl ReaderProtocolHandler {
     pub async fn read_fixed_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
+        // Verify reader session ownership
+        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+
         // We need to get the snapshot path from the session, then read from datastore
         let datastore = self.state.default_datastore();
         let path = format!("{}", name); // Simplified - in real code get from session
@@ -349,8 +384,12 @@ impl ReaderProtocolHandler {
     pub async fn read_dynamic_index(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
+        // Verify reader session ownership
+        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+
         let datastore = self.state.default_datastore();
         let path = format!("{}", name);
         let index = datastore.read_dynamic_index(&path).await
@@ -362,8 +401,12 @@ impl ReaderProtocolHandler {
     pub async fn read_blob(
         &self,
         session_id: &str,
+        tenant_id: &str,
         name: &str,
     ) -> Result<Vec<u8>, ApiError> {
+        // Verify reader session ownership
+        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
+
         let datastore = self.state.default_datastore();
         let path = format!("{}", name);
         datastore.read_blob(&path).await
@@ -374,7 +417,10 @@ impl ReaderProtocolHandler {
     pub async fn read_manifest(
         &self,
         session_id: &str,
+        tenant_id: &str,
     ) -> Result<String, ApiError> {
+        // Verify reader session ownership
+        self.state.sessions.verify_reader_session_ownership(session_id, tenant_id).await?;
         // For now, return a stub - in real implementation, read from session's snapshot path
         let manifest = pbs_core::BackupManifest::new("vm", "backup-1");
         manifest.to_json()

@@ -25,6 +25,7 @@ pub mod session;
 pub mod streaming;
 pub mod tenant;
 pub mod tls;
+pub mod validation;
 
 pub use auth::{AuthContext, AuthManager, Permission, User, ApiToken};
 pub use billing::{BillingManager, UsageEvent, UsageEventType, WebhookConfig};

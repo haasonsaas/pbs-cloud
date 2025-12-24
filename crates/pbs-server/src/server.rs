@@ -30,6 +30,10 @@ use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, ReaderProtocolHandler, FinishBackupResponse};
 use crate::tenant::TenantManager;
 use crate::tls::{TlsConfig, create_tls_acceptor};
+use crate::validation::{
+    validate_backup_params, validate_filename, validate_digest,
+    validate_username, validate_tenant_name,
+};
 
 /// Server state
 pub struct ServerState {
@@ -820,6 +824,11 @@ async fn handle_start_backup(
         Err(_) => return bad_request("Invalid backup parameters"),
     };
 
+    // Validate backup parameters
+    if let Err(e) = validate_backup_params(&params.backup_type, &params.backup_id, &params.backup_time) {
+        return error_response(e);
+    }
+
     let handler = BackupProtocolHandler::new(state);
     match handler.start_backup(ctx, params).await {
         Ok(session_id) => {
@@ -851,6 +860,11 @@ async fn handle_start_reader(
         Err(_) => return bad_request("Invalid reader parameters"),
     };
 
+    // Validate backup parameters
+    if let Err(e) = validate_backup_params(&params.backup_type, &params.backup_id, &params.backup_time) {
+        return error_response(e);
+    }
+
     let handler = ReaderProtocolHandler::new(state.clone());
     match handler.start_reader(ctx, &params.backup_type, &params.backup_id, &params.backup_time).await {
         Ok(session_id) => {
@@ -875,6 +889,11 @@ async fn handle_upload_chunk(
         None => return bad_request("Missing digest"),
     };
 
+    // Validate digest format
+    if let Err(e) = validate_digest(&digest_str) {
+        return error_response(e);
+    }
+
     let digest = match ChunkDigest::from_hex(&digest_str) {
         Ok(d) => d,
         Err(_) => return bad_request("Invalid digest format"),
@@ -894,9 +913,9 @@ async fn handle_upload_chunk(
 
     let handler = BackupProtocolHandler::new(state.clone());
     let result = if chunk_type == "fixed" {
-        handler.upload_fixed_chunk(&session_id, digest, body).await
+        handler.upload_fixed_chunk(&session_id, &ctx.user.tenant_id, digest, body).await
     } else {
-        handler.upload_dynamic_chunk(&session_id, digest, body).await
+        handler.upload_dynamic_chunk(&session_id, &ctx.user.tenant_id, digest, body).await
     };
 
     match result {
@@ -920,15 +939,20 @@ async fn handle_create_index(
         None => return bad_request("Missing name"),
     };
 
+    // Validate index name (no path traversal)
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+
     let handler = BackupProtocolHandler::new(state.clone());
 
     let result = if index_type == "fixed" {
         let chunk_size = get_query_param(req.uri(), "chunk_size")
             .and_then(|s| s.parse().ok())
             .unwrap_or(4 * 1024 * 1024); // 4MB default
-        handler.create_fixed_index(&session_id, &name, chunk_size).await
+        handler.create_fixed_index(&session_id, &ctx.user.tenant_id, &name, chunk_size).await
     } else {
-        handler.create_dynamic_index(&session_id, &name).await
+        handler.create_dynamic_index(&session_id, &ctx.user.tenant_id, &name).await
     };
 
     match result {
@@ -959,6 +983,14 @@ async fn handle_append_index(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
+    // Validate name and digest
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+    if let Err(e) = validate_digest(&digest_str) {
+        return error_response(e);
+    }
+
     let digest = match ChunkDigest::from_hex(&digest_str) {
         Ok(d) => d,
         Err(_) => return bad_request("Invalid digest format"),
@@ -967,12 +999,12 @@ async fn handle_append_index(
     let handler = BackupProtocolHandler::new(state.clone());
 
     let result = if index_type == "fixed" {
-        handler.append_fixed_index(&session_id, &name, digest, size).await
+        handler.append_fixed_index(&session_id, &ctx.user.tenant_id, &name, digest, size).await
     } else {
         let offset: u64 = get_query_param(req.uri(), "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        handler.append_dynamic_index(&session_id, &name, digest, offset, size).await
+        handler.append_dynamic_index(&session_id, &ctx.user.tenant_id, &name, digest, offset, size).await
     };
 
     match result {
@@ -996,12 +1028,17 @@ async fn handle_close_index(
         None => return bad_request("Missing name"),
     };
 
+    // Validate index name
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+
     let handler = BackupProtocolHandler::new(state.clone());
 
     let result = if index_type == "fixed" {
-        handler.close_fixed_index(&session_id, &name).await
+        handler.close_fixed_index(&session_id, &ctx.user.tenant_id, &name).await
     } else {
-        handler.close_dynamic_index(&session_id, &name).await
+        handler.close_dynamic_index(&session_id, &ctx.user.tenant_id, &name).await
     };
 
     match result {
@@ -1029,13 +1066,18 @@ async fn handle_upload_blob(
         None => return bad_request("Missing name"),
     };
 
+    // Validate blob name
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+
     let body = match req.collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
         Err(_) => return bad_request("Failed to read blob data"),
     };
 
     let handler = BackupProtocolHandler::new(state.clone());
-    match handler.upload_blob(&session_id, &name, body).await {
+    match handler.upload_blob(&session_id, &ctx.user.tenant_id, &name, body).await {
         Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": {}})),
         Err(e) => error_response(e),
     }
@@ -1117,6 +1159,11 @@ async fn handle_download_chunk(
         None => return bad_request("Missing digest"),
     };
 
+    // Validate digest format
+    if let Err(e) = validate_digest(&digest_str) {
+        return error_response(e);
+    }
+
     let digest = match ChunkDigest::from_hex(&digest_str) {
         Ok(d) => d,
         Err(_) => return bad_request("Invalid digest format"),
@@ -1150,11 +1197,16 @@ async fn handle_read_index(
         None => return bad_request("Missing name"),
     };
 
+    // Validate index name
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+
     let handler = ReaderProtocolHandler::new(state.clone());
     let result = if index_type == "fixed" {
-        handler.read_fixed_index(&session_id, &name).await
+        handler.read_fixed_index(&session_id, &ctx.user.tenant_id, &name).await
     } else {
-        handler.read_dynamic_index(&session_id, &name).await
+        handler.read_dynamic_index(&session_id, &ctx.user.tenant_id, &name).await
     };
 
     match result {
@@ -1183,8 +1235,13 @@ async fn handle_read_blob(
         None => return bad_request("Missing name"),
     };
 
+    // Validate blob name
+    if let Err(e) = validate_filename(&name) {
+        return error_response(e);
+    }
+
     let handler = ReaderProtocolHandler::new(state.clone());
-    match handler.read_blob(&session_id, &name).await {
+    match handler.read_blob(&session_id, &ctx.user.tenant_id, &name).await {
         Ok(data) => {
             Response::builder()
                 .status(StatusCode::OK)
@@ -1207,7 +1264,7 @@ async fn handle_read_manifest(
     };
 
     let handler = ReaderProtocolHandler::new(state.clone());
-    match handler.read_manifest(&session_id).await {
+    match handler.read_manifest(&session_id, &ctx.user.tenant_id).await {
         Ok(json) => json_response(StatusCode::OK, &serde_json::json!({"data": json})),
         Err(e) => error_response(e),
     }
@@ -1254,6 +1311,11 @@ async fn handle_create_tenant(
         Err(_) => return bad_request("Invalid JSON"),
     };
 
+    // Validate tenant name
+    if let Err(e) = validate_tenant_name(&params.name) {
+        return error_response(e);
+    }
+
     let tenant = state.tenants.create_tenant(&params.name).await;
 
     // Save state
@@ -1296,6 +1358,11 @@ async fn handle_create_user(
         Ok(p) => p,
         Err(_) => return bad_request("Invalid JSON"),
     };
+
+    // Validate username
+    if let Err(e) = validate_username(&params.username) {
+        return error_response(e);
+    }
 
     let permission = match params.permission.as_str() {
         "admin" => Permission::Admin,

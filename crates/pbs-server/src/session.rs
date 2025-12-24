@@ -447,6 +447,45 @@ impl SessionManager {
         f(session)
     }
 
+    /// Execute an operation on a backup session with tenant ownership verification
+    pub async fn with_backup_session_verified<F, R>(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        f: F,
+    ) -> Result<R, ApiError>
+    where
+        F: FnOnce(&mut BackupSession) -> Result<R, ApiError>,
+    {
+        let mut sessions = self.backup_sessions.write().await;
+        let session = sessions.get_mut(id)
+            .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+        // Verify tenant ownership
+        if session.tenant_id != tenant_id {
+            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+        }
+
+        if session.state != SessionState::Active {
+            return Err(ApiError::bad_request("Session is not active"));
+        }
+
+        f(session)
+    }
+
+    /// Verify session exists and belongs to the given tenant
+    pub async fn verify_session_ownership(&self, id: &str, tenant_id: &str) -> Result<(), ApiError> {
+        let sessions = self.backup_sessions.read().await;
+        let session = sessions.get(id)
+            .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+        if session.tenant_id != tenant_id {
+            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+        }
+
+        Ok(())
+    }
+
     /// Execute an async operation on a backup session
     pub async fn with_backup_session_async<F, Fut, R>(&self, id: &str, f: F) -> Result<R, ApiError>
     where
@@ -501,6 +540,19 @@ impl SessionManager {
             .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
         f(session).await
+    }
+
+    /// Verify reader session exists and belongs to the given tenant
+    pub async fn verify_reader_session_ownership(&self, id: &str, tenant_id: &str) -> Result<(), ApiError> {
+        let sessions = self.reader_sessions.read().await;
+        let session = sessions.get(id)
+            .ok_or_else(|| ApiError::not_found("Session not found"))?;
+
+        if session.tenant_id != tenant_id {
+            return Err(ApiError::new(403, "Access denied: session belongs to different tenant"));
+        }
+
+        Ok(())
     }
 
     /// Remove a reader session

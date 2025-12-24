@@ -46,6 +46,10 @@ governor = { workspace = true }
 # Metrics
 prometheus = { workspace = true }
 
+# Validation
+regex = { workspace = true }
+lazy_static = { workspace = true }
+
 # Additional utilities
 parking_lot = { workspace = true }
 dashmap = { workspace = true }

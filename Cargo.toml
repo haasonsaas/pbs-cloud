@@ -50,6 +50,10 @@ governor = "0.7"
 # Metrics
 prometheus = "0.13"
 
+# Validation
+regex = "1.11"
+lazy_static = "1.5"
+
 # Utilities
 thiserror = "2.0"
 anyhow = "1.0"
