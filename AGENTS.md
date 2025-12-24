@@ -95,6 +95,7 @@
 - `/api2/json/admin/verify` (GET) verification job list (synthetic per datastore).
 - `/api2/json/admin/verify/<id>/run` (POST) run verification task (job id or datastore name fallback).
 - `/api2/json/admin/verify/<id>/status` (GET) verification job schedule status.
+- `/api2/json/admin/verify/<id>/history` (GET) verification job task history.
 - `/api2/json/config/verify` (GET, POST) verification job config list/create.
 - `/api2/json/config/verify/<id>` (GET, PUT, DELETE) verification job config read/update/delete.
 
@@ -109,7 +110,7 @@
 - Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
 - If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
 - Admin/REST surface is a focused subset of PBS APIs (verify jobs supported; other job types/UI endpoints are not).
-- Verification job schedule parsing follows PBS calendar event notation; timezone support is limited to `UTC`/fixed offsets or server-local time (no named TZ database identifiers).
+- Verification job schedule parsing follows PBS calendar event notation; timezone support includes `UTC`, fixed offsets, server-local time, and named TZ database identifiers (e.g., `America/New_York`).
 - Verification jobs do not emit notification events yet.
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.

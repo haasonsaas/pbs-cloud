@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{Datelike, Duration, TimeZone, Timelike, Weekday};
+use chrono_tz::Tz;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -1556,6 +1557,7 @@ fn should_verify_snapshot(
 enum CalendarTimezone {
     Local,
     Fixed(chrono::FixedOffset),
+    Named(Tz),
 }
 
 #[derive(Clone, Debug)]
@@ -1654,7 +1656,13 @@ fn parse_timezone_token(token: &str) -> Result<Option<CalendarTimezone>, ApiErro
         .strip_prefix("TZ=")
         .or_else(|| trimmed.strip_prefix("tz="))
     {
-        return parse_fixed_offset(value).map(|offset| Some(CalendarTimezone::Fixed(offset)));
+        if let Ok(offset) = parse_fixed_offset(value) {
+            return Ok(Some(CalendarTimezone::Fixed(offset)));
+        }
+        let tz = value
+            .parse::<Tz>()
+            .map_err(|_| ApiError::bad_request("Invalid schedule timezone"))?;
+        return Ok(Some(CalendarTimezone::Named(tz)));
     }
     if trimmed.eq_ignore_ascii_case("local") {
         return Ok(Some(CalendarTimezone::Local));
@@ -1667,6 +1675,12 @@ fn parse_timezone_token(token: &str) -> Result<Option<CalendarTimezone>, ApiErro
     }
     if trimmed.starts_with('+') || trimmed.starts_with('-') {
         return parse_fixed_offset(trimmed).map(|offset| Some(CalendarTimezone::Fixed(offset)));
+    }
+    if trimmed.contains('/') && trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+        let tz = trimmed
+            .parse::<Tz>()
+            .map_err(|_| ApiError::bad_request("Invalid schedule timezone"))?;
+        return Ok(Some(CalendarTimezone::Named(tz)));
     }
     Ok(None)
 }
@@ -2033,6 +2047,22 @@ fn next_calendar_run(
                     as Box<dyn Fn(chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>>>,
             )
         }
+        CalendarTimezone::Named(tz) => {
+            let local = start.with_timezone(&tz);
+            (
+                local.naive_local(),
+                Box::new(
+                    move |naive: chrono::NaiveDateTime| match tz.from_local_datetime(&naive) {
+                        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                        chrono::LocalResult::Ambiguous(a, b) => {
+                            Some(if a <= b { a } else { b }.with_timezone(&chrono::Utc))
+                        }
+                        chrono::LocalResult::None => None,
+                    },
+                )
+                    as Box<dyn Fn(chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>>>,
+            )
+        }
     };
 
     for day_offset in 0..=max_days {
@@ -2157,6 +2187,23 @@ fn compute_verify_job_status(
     };
 
     (next_run, last_run_state, last_run_upid, last_run_endtime)
+}
+
+fn task_snapshot_value(task: &TaskSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "upid": task.upid,
+        "node": task.node,
+        "pid": task.pid,
+        "pstart": task.pstart,
+        "starttime": task.starttime,
+        "worker-type": task.worker_type,
+        "worker-id": task.worker_id,
+        "user": task.user,
+        "endtime": task.endtime,
+        "status": task.status,
+        "exitstatus": task.exitstatus,
+        "running": task.running,
+    })
 }
 
 enum H2Context {
@@ -6330,6 +6377,45 @@ async fn handle_verify_api(
                 }),
             )
         }
+        (&Method::GET, [job_id, "history"]) => {
+            let job = {
+                let guard = state.verify_jobs.read().await;
+                guard.get(*job_id).cloned()
+            };
+            let Some(job) = job else {
+                return not_found();
+            };
+            let start = get_query_param(&uri, "start")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = get_query_param(&uri, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50);
+            let worker_id = format!("{}:{}", job.store, job.id);
+            let mut items = state
+                .tasks
+                .snapshot()
+                .await
+                .into_iter()
+                .filter(|task| {
+                    task.worker_type == "verificationjob"
+                        && task.worker_id.as_deref() == Some(worker_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            items.sort_by(|a, b| b.starttime.cmp(&a.starttime));
+            let total = items.len();
+            let start_idx = start.min(total);
+            let end_idx = total.min(start_idx.saturating_add(limit));
+            let data = items[start_idx..end_idx]
+                .iter()
+                .map(task_snapshot_value)
+                .collect::<Vec<_>>();
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "data": data, "total": total }),
+            )
+        }
         (&Method::POST, [target, "run"]) => {
             let job = {
                 let guard = state.verify_jobs.read().await;
@@ -6484,5 +6570,13 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let next = next_calendar_run(&spec, base).expect("next");
         assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_named_timezone() {
+        let spec = parse_calendar_event("daily 00:00 America/New_York").expect("schedule");
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let next = next_calendar_run(&spec, base).expect("next");
+        assert_eq!(next, Utc.with_ymd_and_hms(2024, 1, 1, 5, 0, 0).unwrap());
     }
 }
