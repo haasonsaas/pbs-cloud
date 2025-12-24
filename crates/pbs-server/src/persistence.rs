@@ -5,11 +5,10 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tracing::{info, warn, error};
+use tracing::info;
 
 use crate::auth::{User, ApiToken, Permission};
 use crate::tenant::Tenant;
-use crate::protocol::ApiError;
 
 /// Persistence configuration
 #[derive(Debug, Clone)]

@@ -9,7 +9,7 @@ use tracing::{info, warn, instrument};
 
 use crate::backend::StorageBackend;
 use crate::datastore::Datastore;
-use crate::error::{StorageError, StorageResult};
+use crate::error::StorageResult;
 
 /// Garbage collection options
 #[derive(Debug, Clone)]

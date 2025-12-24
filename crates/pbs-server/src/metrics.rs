@@ -3,14 +3,14 @@
 //! Exports server metrics in Prometheus format.
 
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec,
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec,
     Encoder, TextEncoder, Registry, Opts, HistogramOpts,
     register_counter_vec_with_registry, register_gauge_vec_with_registry,
     register_histogram_vec_with_registry, register_counter_with_registry,
     register_gauge_with_registry,
 };
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::error;
 
 /// Metrics configuration
 #[derive(Debug, Clone)]

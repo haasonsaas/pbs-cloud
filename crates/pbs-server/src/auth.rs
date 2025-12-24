@@ -3,7 +3,6 @@
 //! Supports API tokens and PBS-compatible authentication.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

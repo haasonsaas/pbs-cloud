@@ -10,7 +10,7 @@ use bytes::Bytes;
 use pbs_core::ChunkDigest;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 
 use crate::backend::{BackendStats, ChunkReader, ChunkWriter, StorageBackend};

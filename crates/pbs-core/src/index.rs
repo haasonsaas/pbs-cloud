@@ -142,19 +142,27 @@ impl FixedIndex {
         let uuid = Uuid::from_slice(&bytes[8..24])
             .map_err(|e| Error::IndexCorrupted(e.to_string()))?;
 
-        // Parse ctime
-        let ctime_secs = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        // Parse ctime (slice is exactly 8 bytes, guaranteed by HEADER_SIZE check)
+        let ctime_secs = i64::from_le_bytes(
+            bytes[24..32].try_into().expect("slice is 8 bytes")
+        );
         let ctime = DateTime::from_timestamp(ctime_secs, 0)
             .ok_or_else(|| Error::IndexCorrupted("Invalid timestamp".into()))?;
 
         // Skip stored checksum (we'll verify after parsing)
-        let stored_checksum: [u8; 32] = bytes[32..64].try_into().unwrap();
+        let stored_checksum: [u8; 32] = bytes[32..64]
+            .try_into()
+            .expect("slice is 32 bytes");
 
         // Parse size
-        let size = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        let size = u64::from_le_bytes(
+            bytes[64..72].try_into().expect("slice is 8 bytes")
+        );
 
         // Parse chunk size
-        let chunk_size = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+        let chunk_size = u64::from_le_bytes(
+            bytes[72..80].try_into().expect("slice is 8 bytes")
+        );
 
         // Parse digests
         let digest_bytes = &bytes[HEADER_SIZE..];
@@ -305,16 +313,22 @@ impl DynamicIndex {
         let uuid = Uuid::from_slice(&bytes[8..24])
             .map_err(|e| Error::IndexCorrupted(e.to_string()))?;
 
-        // Parse ctime
-        let ctime_secs = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        // Parse ctime (slice is exactly 8 bytes, guaranteed by HEADER_SIZE check)
+        let ctime_secs = i64::from_le_bytes(
+            bytes[24..32].try_into().expect("slice is 8 bytes")
+        );
         let ctime = DateTime::from_timestamp(ctime_secs, 0)
             .ok_or_else(|| Error::IndexCorrupted("Invalid timestamp".into()))?;
 
         // Store checksum for verification
-        let stored_checksum: [u8; 32] = bytes[32..64].try_into().unwrap();
+        let stored_checksum: [u8; 32] = bytes[32..64]
+            .try_into()
+            .expect("slice is 32 bytes");
 
         // Parse entry count
-        let count = u64::from_le_bytes(bytes[64..72].try_into().unwrap()) as usize;
+        let count = u64::from_le_bytes(
+            bytes[64..72].try_into().expect("slice is 8 bytes")
+        ) as usize;
 
         // Parse entries
         let entry_size = 32 + 8 + 8; // digest + offset + size
@@ -331,10 +345,15 @@ impl DynamicIndex {
             let digest = ChunkDigest::from_bytes(digest_bytes);
             pos += 32;
 
-            let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            // Safe: length verified by expected_len check above
+            let offset = u64::from_le_bytes(
+                bytes[pos..pos + 8].try_into().expect("slice is 8 bytes")
+            );
             pos += 8;
 
-            let size = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let size = u64::from_le_bytes(
+                bytes[pos..pos + 8].try_into().expect("slice is 8 bytes")
+            );
             pos += 8;
 
             entries.push(IndexEntry {

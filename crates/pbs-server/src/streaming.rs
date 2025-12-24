@@ -3,17 +3,13 @@
 //! Implements the PBS backup/restore protocol for streaming data transfer.
 
 use std::sync::Arc;
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::{Request, Response, StatusCode, body::Incoming};
 use pbs_core::{Chunk, ChunkDigest};
-use tracing::{info, debug, warn, error, instrument};
+use tracing::{info, debug, warn, instrument};
 
 use crate::auth::AuthContext;
 use crate::billing::{UsageEvent, UsageEventType};
 use crate::protocol::{ApiError, BackupParams};
 use crate::server::ServerState;
-use crate::session::{SessionState, BackupSession, ReaderSession};
 
 /// Handle backup protocol requests within a session
 pub struct BackupProtocolHandler {
@@ -251,8 +247,11 @@ impl BackupProtocolHandler {
             total_bytes
         );
 
+        let manifest_json = manifest.to_json()
+            .map_err(|e| ApiError::internal(&format!("Failed to serialize manifest: {}", e)))?;
+
         Ok(FinishResult {
-            manifest_digest: ChunkDigest::from_data(manifest.to_json().unwrap().as_bytes()),
+            manifest_digest: ChunkDigest::from_data(manifest_json.as_bytes()),
             total_bytes,
             chunk_count: manifest.files.len(),
         })
@@ -268,9 +267,10 @@ impl BackupProtocolHandler {
     /// Check known chunks (for deduplication)
     pub async fn check_known_chunks(
         &self,
-        session_id: &str,
+        _session_id: &str,
         digests: &[ChunkDigest],
     ) -> Result<Vec<bool>, ApiError> {
+        // TODO: verify session ownership
         let datastore = self.state.default_datastore();
         let mut results = Vec::with_capacity(digests.len());
 
@@ -484,6 +484,7 @@ impl From<FinishResult> for FinishBackupResponse {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     // Integration tests would go here, requiring a full server setup

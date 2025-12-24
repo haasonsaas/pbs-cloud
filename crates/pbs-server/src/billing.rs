@@ -3,7 +3,6 @@
 //! Tracks usage and sends events to billing systems via webhooks.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

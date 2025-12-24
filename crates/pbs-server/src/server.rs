@@ -13,7 +13,7 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use pbs_core::{ChunkDigest, CryptoConfig, Chunk};
+use pbs_core::{ChunkDigest, CryptoConfig};
 use pbs_storage::{Datastore, LocalBackend, S3Backend, StorageBackend};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -25,11 +25,11 @@ use crate::config::{ServerConfig, StorageConfig};
 use crate::metrics::{Metrics, MetricsConfig};
 use crate::persistence::{PersistenceConfig, PersistenceManager};
 use crate::protocol::{ApiError, BackupParams, PROTOCOL_HEADER};
-use crate::rate_limit::{RateLimitConfig, RateLimiter_, RateLimitResult};
+use crate::rate_limit::{RateLimiter_, RateLimitResult};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, ReaderProtocolHandler, FinishBackupResponse};
 use crate::tenant::TenantManager;
-use crate::tls::{TlsConfig, create_tls_acceptor};
+use crate::tls::create_tls_acceptor;
 use crate::validation::{
     validate_backup_params, validate_filename, validate_digest,
     validate_username, validate_tenant_name,
@@ -155,7 +155,10 @@ impl ServerState {
 
     /// Get the default datastore
     pub fn default_datastore(&self) -> Arc<Datastore> {
-        self.datastores.get("default").cloned().unwrap()
+        self.datastores
+            .get("default")
+            .cloned()
+            .expect("default datastore must be configured")
     }
 
     /// Save current state to persistence
@@ -666,7 +669,7 @@ async fn handle_metrics(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")
         .body(Full::new(Bytes::from(output)))
-        .unwrap()
+        .expect("valid response")
 }
 
 async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Response<Full<Bytes>> {
@@ -719,7 +722,7 @@ async fn handle_nodes() -> Response<Full<Bytes>> {
 
 async fn handle_datastore_api(
     state: Arc<ServerState>,
-    ctx: &AuthContext,
+    _ctx: &AuthContext,
     path: &str,
 ) -> Response<Full<Bytes>> {
     let parts: Vec<&str> = path
@@ -798,15 +801,15 @@ async fn handle_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
 }
 
 async fn handle_protocol_upgrade(
-    state: Arc<ServerState>,
-    req: &Request<Incoming>,
+    _state: Arc<ServerState>,
+    _req: &Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     // Protocol upgrade for streaming - this is handled via HTTP/2 streams
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("upgrade", PROTOCOL_HEADER)
         .body(Full::new(Bytes::new()))
-        .unwrap()
+        .expect("valid response")
 }
 
 async fn handle_start_backup(
@@ -1106,9 +1109,10 @@ async fn handle_finish_backup(
 
 async fn handle_known_chunks(
     state: Arc<ServerState>,
-    ctx: &AuthContext,
+    _ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    // TODO: verify ctx.user.tenant_id owns this session
     let session_id = match get_query_param(req.uri(), "session_id") {
         Some(id) => id,
         None => return bad_request("Missing session_id"),
@@ -1176,7 +1180,7 @@ async fn handle_download_chunk(
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
                 .body(Full::new(Bytes::from(data)))
-                .unwrap()
+                .expect("valid response")
         }
         Err(e) => error_response(e),
     }
@@ -1215,7 +1219,7 @@ async fn handle_read_index(
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
                 .body(Full::new(Bytes::from(data)))
-                .unwrap()
+                .expect("valid response")
         }
         Err(e) => error_response(e),
     }
@@ -1247,7 +1251,7 @@ async fn handle_read_blob(
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
                 .body(Full::new(Bytes::from(data)))
-                .unwrap()
+                .expect("valid response")
         }
         Err(e) => error_response(e),
     }
@@ -1279,6 +1283,11 @@ async fn handle_close_reader(
         Some(id) => id,
         None => return bad_request("Missing session_id"),
     };
+
+    // Verify session ownership
+    if let Err(e) = state.sessions.verify_reader_session_ownership(&session_id, &ctx.user.tenant_id).await {
+        return error_response(e);
+    }
 
     let handler = ReaderProtocolHandler::new(state.clone());
     match handler.close_reader(&session_id).await {
@@ -1461,7 +1470,7 @@ fn json_response<T: serde::Serialize>(status: StatusCode, data: &T) -> Response<
         .status(status)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(json)))
-        .unwrap()
+        .expect("valid response")
 }
 
 fn error_response(error: ApiError) -> Response<Full<Bytes>> {
@@ -1482,14 +1491,16 @@ fn rate_limited_response(retry_after: u32, limit: u32, remaining: u32) -> Respon
         "error": "Rate limit exceeded",
         "retry_after": retry_after
     });
+    // serde_json::Value always serializes successfully
+    let json = serde_json::to_string(&body).expect("JSON value serializes");
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "application/json")
         .header("Retry-After", retry_after.to_string())
         .header("X-RateLimit-Limit", limit.to_string())
         .header("X-RateLimit-Remaining", remaining.to_string())
-        .body(Full::new(Bytes::from(serde_json::to_string(&body).unwrap())))
-        .unwrap()
+        .body(Full::new(Bytes::from(json)))
+        .expect("valid response")
 }
 
 fn not_found() -> Response<Full<Bytes>> {

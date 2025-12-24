@@ -344,7 +344,8 @@ impl ReaderSession {
             self.manifest = Some(manifest);
         }
         self.touch();
-        Ok(self.manifest.as_ref().unwrap())
+        // Safe: we just set manifest above if it was None
+        Ok(self.manifest.as_ref().expect("manifest was just loaded"))
     }
 
     /// Read a chunk
@@ -424,8 +425,8 @@ impl SessionManager {
     }
 
     /// Get a backup session
-    pub async fn get_backup_session(&self, id: &str) -> Option<BackupSession> {
-        let sessions = self.backup_sessions.read().await;
+    pub async fn get_backup_session(&self, _id: &str) -> Option<BackupSession> {
+        let _sessions = self.backup_sessions.read().await;
         // We can't return a reference due to RwLock, so we need a different approach
         // For now, return None - we'll refactor this
         None
