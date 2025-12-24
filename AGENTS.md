@@ -43,6 +43,7 @@
 ## Pre-commit (optional)
 - Install hooks: `pre-commit install`
 - Run manual hooks: `pre-commit run --all-files --hook-stage manual`
+- Hooks include actionlint (workflows), shellcheck (scripts), and TOML/JSON validation.
 
 ## Run
 - Local storage:

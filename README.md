@@ -442,6 +442,22 @@ curl -X POST https://localhost:8007/api2/json/billing/webhook \
   -d '{"event":"test"}'
 ```
 
+## Verification Jobs
+
+Verification jobs are configured via `/api2/json/config/verify` and can run on a schedule or interval
+(`PBS_VERIFY_INTERVAL_HOURS`). Schedules use the PBS calendar event format:
+
+Examples:
+- `daily 02:00 UTC`
+- `mon..fri 8..17:0/15 America/New_York`
+- `*-*-last 03:00 UTC` (last day of month)
+- `jan-15 02:00 UTC` or `2025-01-15 02:00 UTC`
+
+Supported timezone formats:
+- `UTC`, `+02:00`, `-0500`
+- `local`
+- Named TZ database identifiers like `America/Los_Angeles` (or `TZ=America/Los_Angeles`)
+
 ## Permissions
 
 ```mermaid
