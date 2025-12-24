@@ -1,0 +1,174 @@
+# PBS Cloud Helm Chart Values
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/haasonsaas/pbs-cloud
+  pullPolicy: IfNotPresent
+  tag: ""  # Defaults to appVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8007
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+    # nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    # nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+  hosts:
+    - host: pbs.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: pbs-tls
+  #    hosts:
+  #      - pbs.example.com
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# PBS Cloud configuration
+config:
+  # Server listen address (inside container)
+  listenAddr: "0.0.0.0:8007"
+
+  # Default tenant name
+  defaultTenant: "default"
+
+  # Garbage collection
+  gc:
+    enabled: true
+    intervalHours: 24
+
+# TLS configuration
+tls:
+  # Use self-signed certificate (generated at startup)
+  selfSigned: true
+  # Or provide your own certificate
+  existingSecret: ""
+  # Keys in the secret (if using existingSecret)
+  certKey: "tls.crt"
+  keyKey: "tls.key"
+
+# Storage configuration
+storage:
+  # Storage type: "local" or "s3"
+  type: "local"
+
+  # Local storage settings
+  local:
+    # Storage class for PVC
+    storageClass: ""
+    # Storage size
+    size: 100Gi
+    # Access mode
+    accessMode: ReadWriteOnce
+
+  # S3 storage settings
+  s3:
+    bucket: ""
+    region: ""
+    endpoint: ""  # For MinIO, R2, etc.
+    prefix: ""
+    # Credentials (can use existingSecret instead)
+    accessKeyId: ""
+    secretAccessKey: ""
+    # Use existing secret for S3 credentials
+    existingSecret: ""
+    # Keys in the secret
+    accessKeyIdKey: "aws-access-key-id"
+    secretAccessKeyKey: "aws-secret-access-key"
+
+# Persistence for users, tokens, tenants
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 1Gi
+  accessMode: ReadWriteOnce
+  # Use existing PVC
+  existingClaim: ""
+
+# Prometheus metrics
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+# Health check settings
+healthCheck:
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Extra environment variables
+extraEnv: []
+# - name: RUST_LOG
+#   value: "debug"
+
+# Extra volume mounts
+extraVolumeMounts: []
+
+# Extra volumes
+extraVolumes: []

@@ -1,0 +1,59 @@
+PBS Cloud has been deployed!
+
+{{- if .Values.ingress.enabled }}
+Access PBS Cloud at:
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  https://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+Get the application URL by running:
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "pbs-cloud.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "https://$NODE_IP:$NODE_PORT"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+Get the application URL by running:
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  echo "https://$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "pbs-cloud.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'):{{ .Values.service.port }}"
+{{- else if contains "ClusterIP" .Values.service.type }}
+Access PBS Cloud by running:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "pbs-cloud.fullname" . }} 8007:{{ .Values.service.port }}
+
+Then access: https://localhost:8007
+{{- end }}
+
+IMPORTANT: On first startup, PBS Cloud will create a root user and API token.
+Check the logs to retrieve the token:
+
+  kubectl logs --namespace {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "pbs-cloud.name" . }} | grep "Root API token"
+
+Save this token securely - it will only be shown once!
+
+Configure proxmox-backup-client:
+  export PBS_REPOSITORY="root@pam@<PBS_HOST>:default"
+  export PBS_PASSWORD="<your-token>"
+  export PBS_FINGERPRINT="<fingerprint>"  # Only needed for self-signed certs
+
+Health Check:
+  curl -k https://<PBS_HOST>:{{ .Values.service.port }}/health
+
+Metrics (Prometheus):
+  curl -k https://<PBS_HOST>:{{ .Values.service.port }}/metrics
+
+{{- if eq .Values.storage.type "s3" }}
+
+S3 Storage Configuration:
+  Bucket: {{ .Values.storage.s3.bucket }}
+  {{- if .Values.storage.s3.region }}
+  Region: {{ .Values.storage.s3.region }}
+  {{- end }}
+  {{- if .Values.storage.s3.endpoint }}
+  Endpoint: {{ .Values.storage.s3.endpoint }}
+  {{- end }}
+{{- else }}
+
+Local Storage:
+  PVC: {{ include "pbs-cloud.storagePvcName" . }}
+  Size: {{ .Values.storage.local.size }}
+{{- end }}

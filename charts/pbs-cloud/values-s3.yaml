@@ -1,0 +1,57 @@
+# Example values for S3 storage backend
+# Usage: helm install pbs-cloud ./charts/pbs-cloud -f ./charts/pbs-cloud/values-s3.yaml
+
+storage:
+  type: s3
+  s3:
+    bucket: "my-pbs-backups"
+    region: "us-east-1"
+    # For MinIO or other S3-compatible storage:
+    # endpoint: "https://minio.example.com"
+    # prefix: "pbs-cloud/"
+
+    # Option 1: Inline credentials (not recommended for production)
+    # accessKeyId: "AKIAIOSFODNN7EXAMPLE"
+    # secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+    # Option 2: Use existing secret (recommended)
+    existingSecret: "pbs-s3-credentials"
+    accessKeyIdKey: "aws-access-key-id"
+    secretAccessKeyKey: "aws-secret-access-key"
+
+# Persistence for user/token/tenant data still needed
+persistence:
+  enabled: true
+  size: 1Gi
+
+# Enable ingress with TLS
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"  # Allow large uploads
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: pbs.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: pbs-tls
+      hosts:
+        - pbs.example.com
+
+# Use your own TLS certificate
+tls:
+  selfSigned: false
+  existingSecret: "pbs-tls"
+
+# Resource limits for production
+resources:
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi

@@ -1,0 +1,26 @@
+apiVersion: v2
+name: pbs-cloud
+description: PBS-compatible backup server with S3 storage and multi-tenancy support for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - backup
+  - proxmox
+  - pbs
+  - proxmox-backup-server
+  - s3
+  - storage
+  - kubernetes
+  - multi-tenant
+  - deduplication
+  - cloud-native
+home: https://github.com/haasonsaas/pbs-cloud
+sources:
+  - https://github.com/haasonsaas/pbs-cloud
+maintainers:
+  - name: haasonsaas
+icon: https://raw.githubusercontent.com/haasonsaas/pbs-cloud/main/docs/icon.svg
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/category: storage

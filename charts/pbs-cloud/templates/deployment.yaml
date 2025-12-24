@@ -1,0 +1,173 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pbs-cloud.fullname" . }}
+  labels:
+    {{- include "pbs-cloud.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pbs-cloud.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "pbs-cloud.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "pbs-cloud.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: https
+              containerPort: 8007
+              protocol: TCP
+          env:
+            - name: PBS_LISTEN_ADDR
+              value: {{ .Values.config.listenAddr | quote }}
+            - name: PBS_DEFAULT_TENANT
+              value: {{ .Values.config.defaultTenant | quote }}
+            {{- if .Values.persistence.enabled }}
+            - name: PBS_PERSISTENCE_DIR
+              value: "/data/state"
+            {{- end }}
+            {{- if not .Values.config.gc.enabled }}
+            - name: PBS_GC_DISABLED
+              value: "1"
+            {{- else }}
+            - name: PBS_GC_INTERVAL_HOURS
+              value: {{ .Values.config.gc.intervalHours | quote }}
+            {{- end }}
+            {{- if eq .Values.storage.type "local" }}
+            - name: PBS_DATA_DIR
+              value: "/data/storage"
+            {{- else if eq .Values.storage.type "s3" }}
+            - name: PBS_S3_BUCKET
+              value: {{ .Values.storage.s3.bucket | quote }}
+            {{- if .Values.storage.s3.region }}
+            - name: PBS_S3_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            {{- end }}
+            {{- if .Values.storage.s3.endpoint }}
+            - name: PBS_S3_ENDPOINT
+              value: {{ .Values.storage.s3.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.storage.s3.prefix }}
+            - name: PBS_S3_PREFIX
+              value: {{ .Values.storage.s3.prefix | quote }}
+            {{- end }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pbs-cloud.s3SecretName" . }}
+                  key: {{ .Values.storage.s3.accessKeyIdKey }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pbs-cloud.s3SecretName" . }}
+                  key: {{ .Values.storage.s3.secretAccessKeyKey }}
+            {{- end }}
+            {{- if and (not .Values.tls.selfSigned) .Values.tls.existingSecret }}
+            - name: PBS_TLS_CERT
+              value: "/tls/{{ .Values.tls.certKey }}"
+            - name: PBS_TLS_KEY
+              value: "/tls/{{ .Values.tls.keyKey }}"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data/state
+            {{- end }}
+            {{- if eq .Values.storage.type "local" }}
+            - name: storage
+              mountPath: /data/storage
+            {{- end }}
+            {{- if and (not .Values.tls.selfSigned) .Values.tls.existingSecret }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.healthCheck.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .Values.healthCheck.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.healthCheck.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .Values.healthCheck.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.readinessProbe.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "pbs-cloud.persistencePvcName" . }}
+        {{- end }}
+        {{- if eq .Values.storage.type "local" }}
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ include "pbs-cloud.storagePvcName" . }}
+        {{- end }}
+        {{- if and (not .Values.tls.selfSigned) .Values.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

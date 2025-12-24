@@ -12,6 +12,9 @@ edition = "2021"
 license = "MIT"
 authors = ["haasonsaas"]
 repository = "https://github.com/haasonsaas/pbs-cloud"
+description = "PBS-compatible backup server with S3 storage backend and multi-tenancy support"
+keywords = ["backup", "proxmox", "pbs", "s3", "kubernetes"]
+categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
 # Async runtime

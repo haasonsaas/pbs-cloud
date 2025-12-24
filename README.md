@@ -1,5 +1,9 @@
 # PBS Cloud
 
+[![CI](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml/badge.svg)](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.83%2B-blue.svg)](https://www.rust-lang.org)
+
 A PBS-compatible backup server with S3 storage, multi-tenancy, and compliance features.
 
 ## Overview

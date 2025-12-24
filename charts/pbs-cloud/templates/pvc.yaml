@@ -1,0 +1,35 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pbs-cloud.persistencePvcName" . }}
+  labels:
+    {{- include "pbs-cloud.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}
+---
+{{- if eq .Values.storage.type "local" }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pbs-cloud.storagePvcName" . }}
+  labels:
+    {{- include "pbs-cloud.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.storage.local.accessMode }}
+  {{- if .Values.storage.local.storageClass }}
+  storageClassName: {{ .Values.storage.local.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.local.size }}
+{{- end }}

@@ -1,0 +1,28 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation
+*.md
+LICENSE
+docs/
+
+# Charts (not needed for Docker build)
+charts/
+
+# CI
+.github/
+
+# Misc
+.DS_Store
+*.log

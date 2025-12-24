@@ -1,0 +1,32 @@
+# Example values for local filesystem storage
+# Usage: helm install pbs-cloud ./charts/pbs-cloud -f ./charts/pbs-cloud/values-local.yaml
+
+storage:
+  type: local
+  local:
+    storageClass: ""  # Use default storage class
+    size: 500Gi
+    accessMode: ReadWriteOnce
+
+# Persistence for user/token/tenant data
+persistence:
+  enabled: true
+  size: 1Gi
+
+# Use self-signed TLS (default)
+tls:
+  selfSigned: true
+
+# Basic service (use port-forward for access)
+service:
+  type: ClusterIP
+  port: 8007
+
+# Resource limits
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 100m
+    memory: 256Mi
