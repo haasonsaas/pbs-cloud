@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_HOME: ${{ github.workspace }}/target/cargo-home
+  TMPDIR: ${{ github.workspace }}/target/tmp
 
 jobs:
   check:
@@ -24,6 +26,11 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Prepare temp dirs
+        run: |
+          mkdir -p target/tmp
+          mkdir -p target/cargo-home
 
       - name: Check formatting
         run: cargo fmt --all -- --check

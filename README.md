@@ -525,14 +525,19 @@ Protects against:
 
 ```bash
 # Run all tests
-cargo test
+./scripts/test.sh
+
+# Full local CI-style check (fmt + clippy + build + tests + helm lint)
+./scripts/ci.sh
 
 # Run with output
-cargo test -- --nocapture
+./scripts/test.sh -- --nocapture
 
 # Run specific test
-cargo test test_path_traversal
+./scripts/test.sh test_path_traversal
 ```
+
+Note: the scripts set `TMPDIR` and `CARGO_HOME` under `target/` to avoid issues on low-space systems.
 
 ## License
 
