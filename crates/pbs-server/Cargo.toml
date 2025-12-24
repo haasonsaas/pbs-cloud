@@ -54,6 +54,7 @@ lazy_static = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

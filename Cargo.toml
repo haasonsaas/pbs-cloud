@@ -74,6 +74,7 @@ tempfile = "3.14"
 parking_lot = "0.12"
 dashmap = "6.1"
 url = "2.5"
+percent-encoding = "2.3"
 
 # Internal crates
 pbs-core = { path = "crates/pbs-core" }

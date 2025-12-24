@@ -1832,6 +1832,7 @@ dependencies = [
  "parking_lot",
  "pbs-core",
  "pbs-storage",
+ "percent-encoding",
  "prometheus",
  "rand 0.8.5",
  "rcgen",

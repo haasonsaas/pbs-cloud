@@ -21,6 +21,7 @@ use pbs_storage::{
     StorageBackend,
 };
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -34,6 +35,7 @@ use crate::protocol::{ApiError, BackupParams, BACKUP_PROTOCOL_HEADER, READER_PRO
 use crate::rate_limit::{RateLimitResult, RateLimiter_};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtocolHandler};
+use crate::tasks::TaskRegistry;
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
@@ -68,6 +70,10 @@ pub struct ServerState {
     pub tls_acceptor: Option<TlsAcceptor>,
     /// Server start time
     pub start_time: Instant,
+    /// Task registry for PBS task APIs
+    pub tasks: Arc<TaskRegistry>,
+    /// Last GC status per datastore
+    pub gc_status: Arc<RwLock<HashMap<String, serde_json::Value>>>,
 }
 
 impl ServerState {
@@ -210,6 +216,9 @@ impl ServerState {
             tenants.tenant_count().await
         );
 
+        let tasks = Arc::new(TaskRegistry::new("localhost"));
+        let gc_status = Arc::new(RwLock::new(HashMap::new()));
+
         Ok(Self {
             config,
             backend,
@@ -223,6 +232,8 @@ impl ServerState {
             persistence,
             tls_acceptor,
             start_time: Instant::now(),
+            tasks,
+            gc_status,
         })
     }
 
@@ -968,6 +979,10 @@ fn parse_bool_param(value: &str) -> Option<bool> {
     }
 }
 
+fn task_auth_id(ctx: &AuthContext) -> String {
+    format!("{}@pbs", ctx.user.username)
+}
+
 fn manifest_note_line(manifest: &BackupManifest) -> Option<String> {
     manifest
         .unprotected
@@ -1044,6 +1059,79 @@ fn namespace_is_descendant(root: &str, ns: Option<&str>) -> bool {
         return true;
     }
     value == root || value.starts_with(&format!("{}/", root))
+}
+
+fn classify_backup_type(backup_type: &str) -> &'static str {
+    match backup_type {
+        "ct" => "ct",
+        "vm" => "vm",
+        "host" => "host",
+        _ => "other",
+    }
+}
+
+async fn collect_datastore_counts(datastore: Arc<Datastore>) -> Option<serde_json::Value> {
+    let groups = datastore.list_backup_groups().await.ok()?;
+    if groups.is_empty() {
+        return None;
+    }
+
+    let mut counts: HashMap<&'static str, (u64, u64)> = HashMap::new();
+    for group in groups {
+        let key = classify_backup_type(&group.backup_type);
+        let entry = counts.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+
+        let snapshots = datastore
+            .list_snapshots(
+                group.namespace.as_deref(),
+                &group.backup_type,
+                &group.backup_id,
+            )
+            .await
+            .unwrap_or_default();
+        entry.1 = entry.1.saturating_add(snapshots.len() as u64);
+    }
+
+    let mut result = serde_json::Map::new();
+    for (key, (groups, snapshots)) in counts {
+        if groups == 0 && snapshots == 0 {
+            continue;
+        }
+        result.insert(
+            key.to_string(),
+            serde_json::json!({
+                "groups": groups,
+                "snapshots": snapshots,
+            }),
+        );
+    }
+
+    if result.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(result))
+    }
+}
+
+fn gc_status_from_result(
+    upid: &str,
+    used: u64,
+    result: &pbs_storage::GcResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "upid": upid,
+        "index-file-count": 0,
+        "index-data-bytes": 0,
+        "disk-bytes": used,
+        "disk-chunks": result.chunks_scanned as usize,
+        "removed-bytes": result.bytes_freed,
+        "removed-chunks": result.chunks_deleted as usize,
+        "pending-bytes": 0,
+        "pending-chunks": 0,
+        "removed-bad": 0,
+        "still-bad": 0,
+    })
 }
 
 fn namespace_prefix(namespace: Option<&str>) -> String {
@@ -1419,7 +1507,7 @@ async fn handle_datastore_api(
             let stats = datastore.backend().stats().await.unwrap_or_default();
             let used = stats.chunk_bytes + stats.file_bytes;
             let total = used.max(1);
-            let info = serde_json::json!({
+            let mut info = serde_json::json!({
                 "data": {
                     "store": ds_name,
                     "total": total,
@@ -1427,19 +1515,45 @@ async fn handle_datastore_api(
                     "avail": total.saturating_sub(used),
                 }
             });
+            let counts = collect_datastore_counts(datastore.clone()).await;
+            let gc_status = {
+                let map = state.gc_status.read().await;
+                map.get(ds_name).cloned()
+            };
+            if let Some(obj) = info.get_mut("data").and_then(|value| value.as_object_mut()) {
+                if let Some(counts) = counts {
+                    obj.insert("counts".to_string(), counts);
+                }
+                if let Some(gc_status) = gc_status {
+                    obj.insert("gc-status".to_string(), gc_status);
+                }
+            }
             json_response(StatusCode::OK, &info)
         }
         (Method::GET, "status") => {
             let stats = datastore.backend().stats().await.unwrap_or_default();
             let used = stats.chunk_bytes + stats.file_bytes;
             let total = used.max(1);
-            let info = serde_json::json!({
+            let mut info = serde_json::json!({
                 "data": {
                     "total": total,
                     "used": used,
                     "avail": total.saturating_sub(used),
                 }
             });
+            let counts = collect_datastore_counts(datastore.clone()).await;
+            let gc_status = {
+                let map = state.gc_status.read().await;
+                map.get(ds_name).cloned()
+            };
+            if let Some(obj) = info.get_mut("data").and_then(|value| value.as_object_mut()) {
+                if let Some(counts) = counts {
+                    obj.insert("counts".to_string(), counts);
+                }
+                if let Some(gc_status) = gc_status {
+                    obj.insert("gc-status".to_string(), gc_status);
+                }
+            }
             json_response(StatusCode::OK, &info)
         }
         (Method::GET, "groups") => {
@@ -2139,28 +2253,55 @@ async fn handle_datastore_api(
                     Err(_) => return bad_request("Invalid JSON"),
                 }
             };
-            let backend = datastore.backend();
-            let gc = GarbageCollector::new(datastore, backend);
             let options = GcOptions {
                 dry_run: params.dry_run,
                 max_delete: params.max_delete,
             };
-            match gc.run(options).await {
-                Ok(result) => json_response(
-                    StatusCode::OK,
-                    &serde_json::json!({
-                        "data": {
-                            "chunks_scanned": result.chunks_scanned,
-                            "chunks_referenced": result.chunks_referenced,
-                            "chunks_orphaned": result.chunks_orphaned,
-                            "chunks_deleted": result.chunks_deleted,
-                            "bytes_freed": result.bytes_freed,
-                            "errors": result.errors
-                        }
-                    }),
-                ),
-                Err(e) => error_response(ApiError::internal(&e.to_string())),
-            }
+            let auth_id = task_auth_id(ctx);
+            let store_name = ds_name.to_string();
+            let upid = state
+                .tasks
+                .create(&auth_id, "gc", Some(ds_name), Some(ds_name))
+                .await;
+            let state = state.clone();
+            let datastore = datastore.clone();
+            let upid_clone = upid.clone();
+            tokio::spawn(async move {
+                state
+                    .tasks
+                    .log(&upid_clone, "Starting garbage collection")
+                    .await;
+                let backend = datastore.backend();
+                let gc = GarbageCollector::new(datastore.clone(), backend);
+                match gc.run(options).await {
+                    Ok(result) => {
+                        state
+                            .tasks
+                            .log(
+                                &upid_clone,
+                                &format!(
+                                    "GC completed: deleted {} chunks ({} bytes)",
+                                    result.chunks_deleted, result.bytes_freed
+                                ),
+                            )
+                            .await;
+                        state.tasks.finish(&upid_clone, "OK").await;
+                        let stats = datastore.backend().stats().await.unwrap_or_default();
+                        let used = stats.chunk_bytes + stats.file_bytes;
+                        let gc_status = gc_status_from_result(&upid_clone, used, &result);
+                        let mut map = state.gc_status.write().await;
+                        map.insert(store_name, gc_status);
+                    }
+                    Err(e) => {
+                        state
+                            .tasks
+                            .log(&upid_clone, &format!("GC failed: {}", e))
+                            .await;
+                        state.tasks.finish(&upid_clone, "ERROR").await;
+                    }
+                }
+            });
+            json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
         }
         (Method::POST, "prune") => {
             if !ctx.allows(Permission::DatastoreAdmin) {
@@ -2177,7 +2318,7 @@ async fn handle_datastore_api(
 }
 
 async fn handle_tasks_api(
-    _state: Arc<ServerState>,
+    state: Arc<ServerState>,
     _ctx: &AuthContext,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
@@ -2193,32 +2334,73 @@ async fn handle_tasks_api(
         if req.method() != Method::GET {
             return not_found();
         }
-        return json_response(StatusCode::OK, &serde_json::json!({ "data": [] }));
+        let running = get_query_param(&uri, "running").and_then(|v| parse_bool_param(&v));
+        let start = get_query_param(&uri, "start")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = get_query_param(&uri, "limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50);
+        let userfilter = get_query_param(&uri, "userfilter");
+        let store = get_query_param(&uri, "store");
+
+        let list = state
+            .tasks
+            .list(
+                running,
+                start,
+                limit,
+                userfilter.as_deref(),
+                store.as_deref(),
+            )
+            .await;
+        return json_response(StatusCode::OK, &serde_json::json!({ "data": list }));
     }
 
     let mut parts = rest.split('/');
-    let _upid = parts.next().unwrap_or("");
+    let upid_encoded = parts.next().unwrap_or("");
+    let upid = percent_encoding::percent_decode_str(upid_encoded)
+        .decode_utf8()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| upid_encoded.to_string());
     let action = parts.next();
 
     match (req.method().clone(), action) {
-        (Method::GET, Some("log")) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({
-                "data": [],
-                "total": 0,
-                "active": false,
-            }),
-        ),
-        (Method::GET, Some("status")) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({
-                "data": {
-                    "status": "stopped",
-                    "exitstatus": "OK",
-                }
-            }),
-        ),
-        (Method::DELETE, None) => json_response(StatusCode::OK, &serde_json::json!({"data": null})),
+        (Method::GET, Some("log")) => {
+            let start = get_query_param(&uri, "start")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            let limit = get_query_param(&uri, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(500);
+            match state.tasks.log_entries(&upid, start, limit).await {
+                Some((data, total, active)) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "data": data,
+                        "total": total,
+                        "active": active,
+                    }),
+                ),
+                None => not_found(),
+            }
+        }
+        (Method::GET, Some("status")) => match state.tasks.status(&upid).await {
+            Some((status, exitstatus)) => json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "data": {
+                        "status": status,
+                        "exitstatus": exitstatus,
+                    }
+                }),
+            ),
+            None => not_found(),
+        },
+        (Method::DELETE, None) => {
+            state.tasks.abort(&upid).await;
+            json_response(StatusCode::OK, &serde_json::json!({"data": null}))
+        }
         _ => not_found(),
     }
 }
@@ -3777,7 +3959,7 @@ async fn handle_run_gc(
         None => return not_found(),
     };
     let backend = datastore.backend();
-    let gc = GarbageCollector::new(datastore, backend);
+    let gc = GarbageCollector::new(datastore.clone(), backend);
 
     let options = GcOptions {
         dry_run: params.dry_run,
@@ -3796,6 +3978,12 @@ async fn handle_run_gc(
                 result.chunks_deleted,
                 result.bytes_freed,
             );
+
+            let stats = datastore.backend().stats().await.unwrap_or_default();
+            let used = stats.chunk_bytes + stats.file_bytes;
+            let gc_status = gc_status_from_result("manual", used, &result);
+            let mut map = state.gc_status.write().await;
+            map.insert(store.clone(), gc_status);
 
             let response = serde_json::json!({
                 "data": {

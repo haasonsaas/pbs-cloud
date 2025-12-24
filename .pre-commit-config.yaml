@@ -28,3 +28,9 @@ repos:
         language: system
         pass_filenames: false
         stages: [manual]
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --all
+        language: system
+        pass_filenames: false
