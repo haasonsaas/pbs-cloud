@@ -28,6 +28,7 @@ pub mod tasks;
 pub mod tenant;
 pub mod tls;
 pub mod validation;
+pub mod verify_jobs;
 
 pub use auth::{ApiToken, AuthContext, AuthManager, Permission, User};
 pub use billing::{BillingManager, UsageEvent, UsageEventType, WebhookConfig};

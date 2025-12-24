@@ -10,6 +10,7 @@ use tracing::info;
 use crate::auth::{ApiToken, Permission, User};
 use crate::tasks::TaskSnapshot;
 use crate::tenant::Tenant;
+use crate::verify_jobs::VerificationJobConfig;
 
 /// Persistence configuration
 #[derive(Debug, Clone)]
@@ -39,6 +40,10 @@ impl PersistenceConfig {
 
     fn tasks_file(&self) -> PathBuf {
         self.data_dir.join("tasks.json")
+    }
+
+    fn verify_jobs_file(&self) -> PathBuf {
+        self.data_dir.join("verify-jobs.json")
     }
 }
 
@@ -156,6 +161,22 @@ impl Default for TasksData {
         Self {
             version: 1,
             tasks: Vec::new(),
+        }
+    }
+}
+
+/// Data format for verify jobs file
+#[derive(Debug, Serialize, Deserialize)]
+struct VerifyJobsData {
+    version: u32,
+    jobs: Vec<VerificationJobConfig>,
+}
+
+impl Default for VerifyJobsData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            jobs: Vec::new(),
         }
     }
 }
@@ -300,6 +321,38 @@ impl PersistenceManager {
 
         let content = serde_json::to_string_pretty(&data)?;
         let path = self.config.tasks_file();
+
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, &content).await?;
+        fs::rename(&temp_path, &path).await?;
+
+        Ok(())
+    }
+
+    /// Load verification jobs from disk
+    pub async fn load_verify_jobs(&self) -> anyhow::Result<Vec<VerificationJobConfig>> {
+        let path = self.config.verify_jobs_file();
+        if !path.exists() {
+            info!("No verify jobs file found, starting fresh");
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&path).await?;
+        let data: VerifyJobsData = serde_json::from_str(&content)?;
+
+        info!("Loaded {} verify jobs from disk", data.jobs.len());
+        Ok(data.jobs)
+    }
+
+    /// Save verification jobs to disk
+    pub async fn save_verify_jobs(&self, jobs: &[VerificationJobConfig]) -> anyhow::Result<()> {
+        let data = VerifyJobsData {
+            version: 1,
+            jobs: jobs.to_vec(),
+        };
+
+        let content = serde_json::to_string_pretty(&data)?;
+        let path = self.config.verify_jobs_file();
 
         let temp_path = path.with_extension("json.tmp");
         fs::write(&temp_path, &content).await?;

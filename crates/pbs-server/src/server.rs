@@ -37,7 +37,7 @@ use crate::protocol::{ApiError, BackupParams, BACKUP_PROTOCOL_HEADER, READER_PRO
 use crate::rate_limit::{RateLimitResult, RateLimiter_};
 use crate::session::SessionManager;
 use crate::streaming::{BackupProtocolHandler, FinishBackupResponse, ReaderProtocolHandler};
-use crate::tasks::{TaskRegistry, TaskSnapshot};
+use crate::tasks::{TaskListFilter, TaskListRequest, TaskRegistry, TaskSnapshot};
 use crate::tenant::TenantManager;
 use crate::tls::create_tls_acceptor;
 use crate::validation::{
@@ -45,6 +45,7 @@ use crate::validation::{
     validate_backup_params_with_ns, validate_backup_type, validate_datastore_name, validate_digest,
     validate_filename, validate_tenant_name, validate_username,
 };
+use crate::verify_jobs::{DeletableProperty, VerificationJobConfig, VerificationJobConfigUpdater};
 
 /// Server state
 pub struct ServerState {
@@ -80,6 +81,8 @@ pub struct ServerState {
     pub backup_tasks: Arc<RwLock<HashMap<String, String>>>,
     /// Task UPIDs for active reader sessions
     pub reader_tasks: Arc<RwLock<HashMap<String, String>>>,
+    /// Verification job configurations
+    pub verify_jobs: Arc<RwLock<HashMap<String, VerificationJobConfig>>>,
 }
 
 impl ServerState {
@@ -230,11 +233,21 @@ impl ServerState {
         let gc_status = Arc::new(RwLock::new(HashMap::new()));
         let backup_tasks = Arc::new(RwLock::new(HashMap::new()));
         let reader_tasks = Arc::new(RwLock::new(HashMap::new()));
+        let verify_jobs = Arc::new(RwLock::new(HashMap::new()));
 
         let task_snapshots = persistence.load_tasks().await.unwrap_or_default();
         if !task_snapshots.is_empty() {
             tasks.restore(task_snapshots).await;
             info!("Restored task history from persistence");
+        }
+
+        let jobs = persistence.load_verify_jobs().await.unwrap_or_default();
+        if !jobs.is_empty() {
+            let mut guard = verify_jobs.write().await;
+            for job in jobs {
+                guard.insert(job.id.clone(), job);
+            }
+            info!("Loaded verify job configuration from persistence");
         }
 
         Ok(Self {
@@ -254,6 +267,7 @@ impl ServerState {
             gc_status,
             backup_tasks,
             reader_tasks,
+            verify_jobs,
         })
     }
 
@@ -276,11 +290,16 @@ impl ServerState {
         let tokens = self.auth.list_all_tokens().await;
         let tenants = self.tenants.list_tenants().await;
         let tasks = self.tasks.snapshot().await;
+        let verify_jobs = {
+            let guard = self.verify_jobs.read().await;
+            guard.values().cloned().collect::<Vec<_>>()
+        };
 
         self.persistence.save_users(&users).await?;
         self.persistence.save_tokens(&tokens).await?;
         self.persistence.save_tenants(&tenants).await?;
         self.persistence.save_tasks(&tasks).await?;
+        self.persistence.save_verify_jobs(&verify_jobs).await?;
 
         debug!("Saved state to persistence");
         Ok(())
@@ -449,38 +468,89 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
                 info!("Starting scheduled verification run");
 
                 let snapshots = state_for_verify.tasks.snapshot().await;
-                let mut running_stores = std::collections::HashSet::new();
+                let mut running_workers = std::collections::HashSet::new();
                 for task in snapshots {
-                    if task.worker_type == "verify" && task.running {
-                        if let Some(store) = task.store {
-                            running_stores.insert(store);
+                    if task.worker_type == "verificationjob" && task.running {
+                        if let Some(worker_id) = task.worker_id {
+                            running_workers.insert(worker_id);
                         }
                     }
                 }
 
-                let datastores: Vec<_> = state_for_verify
-                    .datastores
-                    .iter()
-                    .map(|(name, ds)| (name.clone(), ds.clone()))
-                    .collect();
+                let jobs = {
+                    let guard = state_for_verify.verify_jobs.read().await;
+                    guard.values().cloned().collect::<Vec<_>>()
+                };
 
-                for (store, datastore) in datastores {
-                    if running_stores.contains(&store) {
-                        info!(
-                            "Skipping scheduled verification for {} (already running)",
-                            store
-                        );
-                        continue;
+                if jobs.is_empty() {
+                    let datastores: Vec<_> = state_for_verify
+                        .datastores
+                        .iter()
+                        .map(|(name, ds)| (name.clone(), ds.clone()))
+                        .collect();
+
+                    for (store, datastore) in datastores {
+                        if running_workers.contains(&store) {
+                            info!(
+                                "Skipping scheduled verification for {} (already running)",
+                                store
+                            );
+                            continue;
+                        }
+                        let auth_id = "root@pam".to_string();
+                        let _ = spawn_verify_task(
+                            state_for_verify.clone(),
+                            datastore,
+                            auth_id,
+                            store,
+                            VerifyTaskOptions {
+                                job_id: None,
+                                namespace: None,
+                                max_depth: None,
+                                ignore_verified: false,
+                                outdated_after: None,
+                                trigger: "scheduled".to_string(),
+                            },
+                        )
+                        .await;
                     }
-                    let auth_id = "root@pam".to_string();
-                    let _ = spawn_verify_task(
-                        state_for_verify.clone(),
-                        datastore,
-                        auth_id,
-                        store,
-                        "scheduled",
-                    )
-                    .await;
+                } else {
+                    for job in jobs {
+                        let worker_id = format!("{}:{}", job.store, job.id);
+                        if running_workers.contains(&worker_id) {
+                            info!(
+                                "Skipping scheduled verification for {} (already running)",
+                                worker_id
+                            );
+                            continue;
+                        }
+                        let datastore = match state_for_verify.get_datastore(&job.store) {
+                            Some(ds) => ds,
+                            None => {
+                                warn!(
+                                    "Skipping scheduled verification for {} (datastore missing)",
+                                    job.store
+                                );
+                                continue;
+                            }
+                        };
+                        let auth_id = "root@pam".to_string();
+                        let _ = spawn_verify_task(
+                            state_for_verify.clone(),
+                            datastore,
+                            auth_id,
+                            job.store.clone(),
+                            VerifyTaskOptions {
+                                job_id: Some(job.id.clone()),
+                                namespace: job.ns.clone(),
+                                max_depth: job.max_depth,
+                                ignore_verified: job.ignore_verified.unwrap_or(true),
+                                outdated_after: job.outdated_after,
+                                trigger: "scheduled".to_string(),
+                            },
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -658,6 +728,13 @@ async fn handle_request(
             with_auth(auth_ctx, Permission::Read, |ctx| {
                 let state = state.clone();
                 async move { handle_datastore_api(state, &ctx, req).await }
+            })
+            .await
+        }
+        (_, p) if p.starts_with("/api2/json/config/verify") => {
+            with_auth(auth_ctx, Permission::Read, |ctx| {
+                let state = state.clone();
+                async move { handle_verify_config_api(state, &ctx, req).await }
             })
             .await
         }
@@ -1039,6 +1116,16 @@ fn get_query_param(uri: &hyper::Uri, name: &str) -> Option<String> {
     })
 }
 
+fn get_query_params(uri: &hyper::Uri, name: &str) -> Vec<String> {
+    uri.query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .filter_map(|(k, v)| (k == name).then_some(v.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn epoch_to_rfc3339(epoch: i64) -> Result<String, ApiError> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
         .ok_or_else(|| ApiError::bad_request("Invalid backup-time"))?;
@@ -1296,6 +1383,82 @@ fn namespace_prefix(namespace: Option<&str>) -> String {
         prefix.push('/');
     }
     prefix
+}
+
+fn namespace_in_scope(
+    base: Option<&str>,
+    candidate: Option<&str>,
+    max_depth: Option<usize>,
+) -> bool {
+    let base_ns = base.unwrap_or("");
+    let cand_ns = candidate.unwrap_or("");
+
+    if base_ns.is_empty() {
+        return max_depth
+            .map(|depth| namespace_depth(cand_ns) <= depth)
+            .unwrap_or(true);
+    }
+
+    if cand_ns.is_empty() {
+        return false;
+    }
+
+    if cand_ns != base_ns && !cand_ns.starts_with(&format!("{}/", base_ns)) {
+        return false;
+    }
+
+    if let Some(depth) = max_depth {
+        let base_depth = namespace_depth(base_ns);
+        let cand_depth = namespace_depth(cand_ns);
+        return cand_depth.saturating_sub(base_depth) <= depth;
+    }
+
+    true
+}
+
+const MAX_VERIFY_DEPTH: usize = 7;
+
+fn parse_upid_starttime(upid: &str) -> Option<i64> {
+    let mut parts = upid.split(':');
+    let _ = parts.next()?; // UPID
+    let _ = parts.next()?; // node
+    let _ = parts.next()?; // pid
+    let _ = parts.next()?; // pstart
+    let _ = parts.next()?; // taskid
+    let start_hex = parts.next()?;
+    u64::from_str_radix(start_hex, 16).ok().map(|v| v as i64)
+}
+
+fn should_verify_snapshot(
+    ignore_verified: bool,
+    outdated_after: Option<i64>,
+    manifest: &BackupManifest,
+) -> bool {
+    if !ignore_verified {
+        return true;
+    }
+
+    let Some(unprotected) = manifest.unprotected.as_ref() else {
+        return true;
+    };
+    let Some(verify_state) = unprotected.get("verify_state") else {
+        return true;
+    };
+    let Some(upid) = verify_state.get("upid").and_then(|v| v.as_str()) else {
+        return true;
+    };
+    let Some(starttime) = parse_upid_starttime(upid) else {
+        return true;
+    };
+
+    match outdated_after {
+        None => false,
+        Some(max_age_days) => {
+            let now = chrono::Utc::now().timestamp();
+            let days_since = (now - starttime) / 86_400;
+            days_since > max_age_days
+        }
+    }
 }
 
 enum H2Context {
@@ -2537,20 +2700,27 @@ async fn handle_tasks_api(
         let since = get_query_param(&uri, "since").and_then(|v| v.parse::<i64>().ok());
         let until = get_query_param(&uri, "until").and_then(|v| v.parse::<i64>().ok());
         let typefilter = get_query_param(&uri, "typefilter");
-        let statusfilter = get_query_param(&uri, "statusfilter").map(|value| {
-            value
-                .split(',')
-                .map(|entry| entry.trim().to_ascii_lowercase())
-                .filter(|entry| !entry.is_empty())
-                .collect::<Vec<_>>()
-        });
+        let mut status_entries = Vec::new();
+        for value in get_query_params(&uri, "statusfilter") {
+            for entry in value.split(',') {
+                let entry = entry.trim().to_ascii_lowercase();
+                if !entry.is_empty() {
+                    status_entries.push(entry);
+                }
+            }
+        }
+        let statusfilter = if status_entries.is_empty() {
+            None
+        } else {
+            Some(status_entries)
+        };
 
         let (list, total) = state
             .tasks
-            .list(crate::tasks::TaskListRequest {
+            .list(TaskListRequest {
                 start,
                 limit,
-                filter: crate::tasks::TaskListFilter {
+                filter: TaskListFilter {
                     running,
                     userfilter: userfilter.as_deref(),
                     store: store.as_deref(),
@@ -2578,21 +2748,62 @@ async fn handle_tasks_api(
 
     match (req.method().clone(), action) {
         (Method::GET, Some("log")) => {
+            let download = get_query_param(&uri, "download")
+                .and_then(|v| parse_bool_param(&v))
+                .unwrap_or(false);
+            let test_status = get_query_param(&uri, "test-status")
+                .and_then(|v| parse_bool_param(&v))
+                .unwrap_or(false);
+
+            if download {
+                let has_start = get_query_param(&uri, "start").is_some();
+                let has_limit = get_query_param(&uri, "limit").is_some();
+                let has_test = get_query_param(&uri, "test-status").is_some();
+                if has_start || has_limit || has_test {
+                    return bad_request("Parameter 'download' cannot be used with other params");
+                }
+                let task = match state.tasks.get(&upid).await {
+                    Some(task) => task,
+                    None => return not_found(),
+                };
+                let mut body = task.log.join("\n");
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                let filename = match epoch_to_rfc3339(task.starttime) {
+                    Ok(ts) => format!("task-{}-{}-{}.log", task.node, task.worker_type, ts),
+                    Err(_) => format!("task-{}-{}.log", task.node, task.worker_type),
+                };
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .header(
+                        "content-disposition",
+                        format!("attachment; filename={}", filename),
+                    )
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("valid response");
+            }
+
             let start = get_query_param(&uri, "start")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1);
+                .unwrap_or(0);
             let limit = get_query_param(&uri, "limit")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(50);
             match state.tasks.log_entries(&upid, start, limit).await {
-                Some((data, total, active)) => json_response(
-                    StatusCode::OK,
-                    &serde_json::json!({
+                Some((data, total, active)) => {
+                    let mut body = serde_json::json!({
                         "data": data,
                         "total": total,
-                        "active": active,
-                    }),
-                ),
+                    });
+                    if test_status {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert("active".to_string(), serde_json::Value::Bool(active));
+                        }
+                    }
+                    json_response(StatusCode::OK, &body)
+                }
                 None => not_found(),
             }
         }
@@ -4554,22 +4765,53 @@ async fn handle_prune(
     handle_prune_body(state, ctx, &store, body).await
 }
 
+struct VerifyTaskOptions {
+    job_id: Option<String>,
+    namespace: Option<String>,
+    max_depth: Option<usize>,
+    ignore_verified: bool,
+    outdated_after: Option<i64>,
+    trigger: String,
+}
+
 async fn spawn_verify_task(
     state: Arc<ServerState>,
     datastore: Arc<Datastore>,
     auth_id: String,
     store_name: String,
-    trigger: &str,
+    options: VerifyTaskOptions,
 ) -> String {
+    let VerifyTaskOptions {
+        job_id,
+        namespace,
+        max_depth,
+        ignore_verified,
+        outdated_after,
+        trigger,
+    } = options;
+
+    let worker_id = job_id
+        .as_deref()
+        .map(|id| format!("{}:{}", store_name, id))
+        .unwrap_or_else(|| store_name.clone());
     let upid = state
         .tasks
-        .create(&auth_id, "verify", Some(&store_name), Some(&store_name))
+        .create(
+            &auth_id,
+            "verificationjob",
+            Some(&worker_id),
+            Some(&store_name),
+        )
         .await;
     let state_clone = state.clone();
     let datastore_clone = datastore.clone();
     let upid_clone = upid.clone();
     let store_name_clone = store_name.clone();
-    let trigger_label = trigger.to_string();
+    let namespace_clone = namespace.clone();
+    let max_depth_clone = max_depth;
+    let ignore_verified_clone = ignore_verified;
+    let outdated_after_clone = outdated_after;
+    let trigger_label = trigger;
 
     tokio::spawn(async move {
         let mut start_message = format!("Verification started for {}", store_name_clone);
@@ -4594,6 +4836,13 @@ async fn spawn_verify_task(
         let mut failed = 0u64;
 
         for group in groups {
+            if !namespace_in_scope(
+                namespace_clone.as_deref(),
+                group.namespace.as_deref(),
+                max_depth_clone,
+            ) {
+                continue;
+            }
             let snapshots = datastore_clone
                 .list_snapshots(
                     group.namespace.as_deref(),
@@ -4607,6 +4856,24 @@ async fn spawn_verify_task(
                 let snapshot_path = format!("{}/{}", group.path(), snapshot);
                 match datastore_clone.read_manifest_any(&snapshot_path).await {
                     Ok(mut manifest) => {
+                        if !should_verify_snapshot(
+                            ignore_verified_clone,
+                            outdated_after_clone,
+                            &manifest,
+                        ) {
+                            ok = ok.saturating_add(1);
+                            state_clone
+                                .tasks
+                                .log(
+                                    &upid_clone,
+                                    &format!(
+                                        "Skipping snapshot {} (recently verified)",
+                                        snapshot_path
+                                    ),
+                                )
+                                .await;
+                            continue;
+                        }
                         let prefix = format!("{}/", snapshot_path);
                         let mut missing = Vec::new();
                         let mut size_mismatch = Vec::new();
@@ -4926,6 +5193,211 @@ async fn spawn_verify_task(
     upid
 }
 
+fn normalize_verify_job_config(config: &mut VerificationJobConfig) {
+    if let Some(comment) = config.comment.as_ref() {
+        let trimmed = comment.trim();
+        if trimmed.is_empty() {
+            config.comment = None;
+        } else if trimmed.len() != comment.len() {
+            config.comment = Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(schedule) = config.schedule.as_ref() {
+        let trimmed = schedule.trim();
+        if trimmed.is_empty() {
+            config.schedule = None;
+        } else if trimmed.len() != schedule.len() {
+            config.schedule = Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(ns) = config.ns.as_ref() {
+        let trimmed = ns.trim();
+        if trimmed.is_empty() {
+            config.ns = None;
+        } else if trimmed.len() != ns.len() {
+            config.ns = Some(trimmed.to_string());
+        }
+    }
+}
+
+fn validate_verify_job_config(
+    state: &ServerState,
+    config: &VerificationJobConfig,
+) -> Result<(), ApiError> {
+    validate_filename(&config.id)?;
+    validate_datastore_name(&config.store)?;
+    if state.get_datastore(&config.store).is_none() {
+        return Err(ApiError::not_found("Datastore not found"));
+    }
+    if let Some(ns) = config.ns.as_ref() {
+        validate_backup_namespace(ns)?;
+    }
+    if let Some(max_depth) = config.max_depth {
+        if max_depth > MAX_VERIFY_DEPTH {
+            return Err(ApiError::bad_request(
+                "max-depth exceeds namespace depth limit",
+            ));
+        }
+    }
+    if let Some(outdated_after) = config.outdated_after {
+        if outdated_after < 0 {
+            return Err(ApiError::bad_request(
+                "outdated-after must be a non-negative integer",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_verify_config_api(
+    state: Arc<ServerState>,
+    ctx: &AuthContext,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let uri = req.uri().clone();
+    let path = uri.path();
+    let rest = path
+        .trim_start_matches("/api2/json/config/verify")
+        .trim_start_matches('/');
+
+    if rest.is_empty() {
+        match *req.method() {
+            Method::GET => {
+                let store_filter = get_query_param(&uri, "store");
+                let mut items = {
+                    let guard = state.verify_jobs.read().await;
+                    guard.values().cloned().collect::<Vec<_>>()
+                };
+                if let Some(filter) = store_filter {
+                    items.retain(|job| job.store == filter);
+                }
+                items.sort_by(|a, b| a.id.cmp(&b.id));
+                return json_response(StatusCode::OK, &serde_json::json!({ "data": items }));
+            }
+            Method::POST => {
+                if let Err(e) = ctx.require(Permission::DatastoreAdmin) {
+                    return error_response(e);
+                }
+
+                let body = match req.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(_) => return bad_request("Failed to read request body"),
+                };
+
+                let mut config: VerificationJobConfig = match serde_json::from_slice(&body) {
+                    Ok(p) => p,
+                    Err(_) => return bad_request("Invalid JSON"),
+                };
+                normalize_verify_job_config(&mut config);
+
+                if let Err(e) = validate_verify_job_config(&state, &config) {
+                    return error_response(e);
+                }
+
+                let mut guard = state.verify_jobs.write().await;
+                if guard.contains_key(&config.id) {
+                    return bad_request("Verification job already exists");
+                }
+                guard.insert(config.id.clone(), config.clone());
+                drop(guard);
+
+                if let Err(e) = state.save_state().await {
+                    warn!("Failed to save state after verify job creation: {}", e);
+                }
+
+                return json_response(StatusCode::CREATED, &serde_json::json!({ "data": config }));
+            }
+            _ => return not_found(),
+        }
+    }
+
+    if rest.contains('/') {
+        return not_found();
+    }
+    let id = rest;
+
+    if let Err(e) = validate_filename(id) {
+        return error_response(e);
+    }
+
+    match *req.method() {
+        Method::GET => {
+            let guard = state.verify_jobs.read().await;
+            match guard.get(id) {
+                Some(job) => json_response(StatusCode::OK, &serde_json::json!({ "data": job })),
+                None => not_found(),
+            }
+        }
+        Method::PUT => {
+            if let Err(e) = ctx.require(Permission::DatastoreAdmin) {
+                return error_response(e);
+            }
+
+            let body = match req.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return bad_request("Failed to read request body"),
+            };
+
+            #[derive(serde::Deserialize)]
+            struct UpdateRequest {
+                #[serde(flatten)]
+                update: VerificationJobConfigUpdater,
+                delete: Option<Vec<DeletableProperty>>,
+                digest: Option<String>,
+            }
+
+            let params: UpdateRequest = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(_) => return bad_request("Invalid JSON"),
+            };
+            let _ = params.digest;
+
+            let mut guard = state.verify_jobs.write().await;
+            let Some(existing) = guard.get_mut(id) else {
+                return not_found();
+            };
+            let mut updated = existing.clone();
+            updated.apply_update(params.update, params.delete);
+            normalize_verify_job_config(&mut updated);
+            if let Err(e) = validate_verify_job_config(&state, &updated) {
+                return error_response(e);
+            }
+            *existing = updated.clone();
+            drop(guard);
+
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after verify job update: {}", e);
+            }
+
+            json_response(StatusCode::OK, &serde_json::json!({ "data": updated }))
+        }
+        Method::DELETE => {
+            if let Err(e) = ctx.require(Permission::DatastoreAdmin) {
+                return error_response(e);
+            }
+
+            let mut guard = state.verify_jobs.write().await;
+            let removed = guard.remove(id);
+            drop(guard);
+            if removed.is_none() {
+                return not_found();
+            }
+
+            if let Err(e) = state.save_state().await {
+                warn!("Failed to save state after verify job deletion: {}", e);
+            }
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "data": { "deleted": true, "id": id } }),
+            )
+        }
+        _ => not_found(),
+    }
+}
+
 async fn handle_verify_api(
     state: Arc<ServerState>,
     ctx: &AuthContext,
@@ -4946,56 +5418,115 @@ async fn handle_verify_api(
         let interval = state.config.verify.interval_hours as i64 * 3600;
 
         let mut items = Vec::new();
-        for store in state.datastores.keys() {
-            if let Some(ref filter) = store_filter {
-                if store != filter {
-                    continue;
+        let jobs = {
+            let guard = state.verify_jobs.read().await;
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        if jobs.is_empty() {
+            for store in state.datastores.keys() {
+                if let Some(ref filter) = store_filter {
+                    if store != filter {
+                        continue;
+                    }
                 }
-            }
-            let mut last_task: Option<TaskSnapshot> = None;
-            for task in snapshots
-                .iter()
-                .filter(|t| t.worker_type == "verify" && t.store.as_deref() == Some(store.as_str()))
-            {
-                if last_task
-                    .as_ref()
-                    .map(|prev| task.starttime > prev.starttime)
-                    .unwrap_or(true)
-                {
-                    last_task = Some(task.clone());
+                let mut last_task: Option<TaskSnapshot> = None;
+                for task in snapshots.iter().filter(|t| {
+                    t.worker_type == "verificationjob" && t.store.as_deref() == Some(store.as_str())
+                }) {
+                    if last_task
+                        .as_ref()
+                        .map(|prev| task.starttime > prev.starttime)
+                        .unwrap_or(true)
+                    {
+                        last_task = Some(task.clone());
+                    }
                 }
+
+                let (last_run_upid, last_run_state, last_run_endtime) = match last_task.as_ref() {
+                    Some(task) => (
+                        Some(task.upid.clone()),
+                        task.exitstatus.clone().or_else(|| task.status.clone()),
+                        task.endtime,
+                    ),
+                    None => (None, None, None),
+                };
+
+                let next_run = if state.config.verify.enabled && interval > 0 {
+                    let base = last_run_endtime.unwrap_or(now);
+                    Some(base + interval)
+                } else {
+                    None
+                };
+
+                items.push(serde_json::json!({
+                    "id": store,
+                    "store": store,
+                    "schedule": None::<String>,
+                    "comment": None::<String>,
+                    "ignore-verified": None::<bool>,
+                    "outdated-after": None::<i64>,
+                    "ns": None::<String>,
+                    "max-depth": None::<usize>,
+                    "next-run": next_run,
+                    "last-run-state": last_run_state,
+                    "last-run-upid": last_run_upid,
+                    "last-run-endtime": last_run_endtime,
+                }));
             }
+        } else {
+            for job in jobs {
+                if let Some(ref filter) = store_filter {
+                    if job.store != *filter {
+                        continue;
+                    }
+                }
+                let worker_id = format!("{}:{}", job.store, job.id);
+                let mut last_task: Option<TaskSnapshot> = None;
+                for task in snapshots.iter().filter(|t| {
+                    t.worker_type == "verificationjob"
+                        && t.worker_id.as_deref() == Some(worker_id.as_str())
+                }) {
+                    if last_task
+                        .as_ref()
+                        .map(|prev| task.starttime > prev.starttime)
+                        .unwrap_or(true)
+                    {
+                        last_task = Some(task.clone());
+                    }
+                }
 
-            let (last_run_upid, last_run_state, last_run_endtime) = match last_task.as_ref() {
-                Some(task) => (
-                    Some(task.upid.clone()),
-                    task.exitstatus.clone().or_else(|| task.status.clone()),
-                    task.endtime,
-                ),
-                None => (None, None, None),
-            };
+                let (last_run_upid, last_run_state, last_run_endtime) = match last_task.as_ref() {
+                    Some(task) => (
+                        Some(task.upid.clone()),
+                        task.exitstatus.clone().or_else(|| task.status.clone()),
+                        task.endtime,
+                    ),
+                    None => (None, None, None),
+                };
 
-            let next_run = if state.config.verify.enabled && interval > 0 {
-                let base = last_run_endtime.unwrap_or(now);
-                Some(base + interval)
-            } else {
-                None
-            };
+                let next_run = if state.config.verify.enabled && interval > 0 {
+                    let base = last_run_endtime.unwrap_or(now);
+                    Some(base + interval)
+                } else {
+                    None
+                };
 
-            items.push(serde_json::json!({
-                "id": store,
-                "store": store,
-                "schedule": None::<String>,
-                "comment": None::<String>,
-                "ignore-verified": None::<bool>,
-                "outdated-after": None::<i64>,
-                "ns": None::<String>,
-                "max-depth": None::<usize>,
-                "next-run": next_run,
-                "last-run-state": last_run_state,
-                "last-run-upid": last_run_upid,
-                "last-run-endtime": last_run_endtime,
-            }));
+                items.push(serde_json::json!({
+                    "id": job.id,
+                    "store": job.store,
+                    "schedule": job.schedule,
+                    "comment": job.comment,
+                    "ignore-verified": job.ignore_verified,
+                    "outdated-after": job.outdated_after,
+                    "ns": job.ns,
+                    "max-depth": job.max_depth,
+                    "next-run": next_run,
+                    "last-run-state": last_run_state,
+                    "last-run-upid": last_run_upid,
+                    "last-run-endtime": last_run_endtime,
+                }));
+            }
         }
 
         return json_response(StatusCode::OK, &serde_json::json!({ "data": items }));
@@ -5005,24 +5536,58 @@ async fn handle_verify_api(
     if parts.len() < 2 || parts[1] != "run" || req.method() != Method::POST {
         return not_found();
     }
-    let store = parts[0];
-    if let Err(e) = validate_datastore_name(store) {
-        return error_response(e);
-    }
-    let datastore = match state.get_datastore(store) {
-        Some(ds) => ds,
-        None => return not_found(),
+    let target = parts[0];
+
+    let job = {
+        let guard = state.verify_jobs.read().await;
+        guard.get(target).cloned()
     };
 
     let auth_id = task_auth_id(ctx);
-    let upid = spawn_verify_task(
-        state.clone(),
-        datastore,
-        auth_id,
-        store.to_string(),
-        "manual",
-    )
-    .await;
+    let upid = if let Some(job) = job {
+        let datastore = match state.get_datastore(&job.store) {
+            Some(ds) => ds,
+            None => return not_found(),
+        };
+        spawn_verify_task(
+            state.clone(),
+            datastore,
+            auth_id,
+            job.store.clone(),
+            VerifyTaskOptions {
+                job_id: Some(job.id.clone()),
+                namespace: job.ns.clone(),
+                max_depth: job.max_depth,
+                ignore_verified: job.ignore_verified.unwrap_or(true),
+                outdated_after: job.outdated_after,
+                trigger: "manual".to_string(),
+            },
+        )
+        .await
+    } else {
+        if let Err(e) = validate_datastore_name(target) {
+            return error_response(e);
+        }
+        let datastore = match state.get_datastore(target) {
+            Some(ds) => ds,
+            None => return not_found(),
+        };
+        spawn_verify_task(
+            state.clone(),
+            datastore,
+            auth_id,
+            target.to_string(),
+            VerifyTaskOptions {
+                job_id: None,
+                namespace: None,
+                max_depth: None,
+                ignore_verified: false,
+                outdated_after: None,
+                trigger: "manual".to_string(),
+            },
+        )
+        .await
+    };
 
     json_response(StatusCode::OK, &serde_json::json!({ "data": upid }))
 }

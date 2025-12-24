@@ -10,6 +10,8 @@
 - Validate compatibility against upstream `proxmox/proxmox-backup` using `gh api` when touching protocol or admin endpoints.
 - Align response payloads with upstream `pbs-api-types` (field names and optional fields matter).
 - Update AGENTS.md when you change APIs, compatibility, or operational behavior.
+- Keep AGENTS.md concise and command-oriented; add nested files only when a subdirectory needs different rules.
+- Add or update tests for behavioral changes, even if not explicitly requested.
 - Run `cargo test` and `helm lint ./charts/pbs-cloud` before pushing.
 - Add nested `AGENTS.md` or `AGENTS.override.md` only when a subdirectory needs stricter or different rules.
 
@@ -91,7 +93,9 @@
 - `/api2/json/admin/datastore/<store>/gc` (POST) GC.
 - `/api2/json/admin/datastore/<store>/prune` (POST) prune.
 - `/api2/json/admin/verify` (GET) verification job list (synthetic per datastore).
-- `/api2/json/admin/verify/<store>/run` (POST) run verification task.
+- `/api2/json/admin/verify/<id>/run` (POST) run verification task (job id or datastore name fallback).
+- `/api2/json/config/verify` (GET, POST) verification job config list/create.
+- `/api2/json/config/verify/<id>` (GET, PUT, DELETE) verification job config read/update/delete.
 
 ## Storage layout
 - Manifests: `index.json.blob` (DataBlob-encoded JSON), with legacy fallback to `index.json`.
@@ -103,8 +107,9 @@
 ## Shortcuts / compatibility gaps
 - Server-managed encryption is global (env-only) with no key rotation or per-datastore keys.
 - If clients upload encrypted DataBlob payloads and the server has no key, size/digest verification is skipped.
-- Admin/REST surface is a focused subset of PBS APIs (no full job config endpoints or UI-specific endpoints).
-- Verification jobs are interval-based and not configurable via PBS job config APIs (no per-namespace/outdated filters).
+- Admin/REST surface is a focused subset of PBS APIs (verify jobs supported; other job types/UI endpoints are not).
+- Verification jobs store schedule strings but the scheduler still uses the global interval; no cron parsing yet.
+- Verification job config has no digest/concurrency checks and no notifications.
 - Namespace comments are not stored (API always returns `comment: null`).
 - Datastore `total`/`avail` in status are synthetic for backends without capacity reporting.
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
