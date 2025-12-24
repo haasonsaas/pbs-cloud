@@ -14,6 +14,7 @@ pub struct TaskRegistry {
     tasks: Arc<RwLock<HashMap<String, TaskEntry>>>,
     order: Arc<RwLock<VecDeque<String>>>,
     max_tasks: usize,
+    max_log_lines: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +102,7 @@ impl TaskRegistry {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             order: Arc::new(RwLock::new(VecDeque::new())),
             max_tasks: 1000,
+            max_log_lines: 1000,
         }
     }
 
@@ -171,6 +173,10 @@ impl TaskRegistry {
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(upid) {
             task.log.push(line);
+            if task.log.len() > self.max_log_lines {
+                let excess = task.log.len() - self.max_log_lines;
+                task.log.drain(0..excess);
+            }
         }
     }
 
@@ -308,6 +314,10 @@ impl TaskRegistry {
         order.clear();
 
         for mut snapshot in snapshots {
+            if snapshot.log.len() > self.max_log_lines {
+                let excess = snapshot.log.len() - self.max_log_lines;
+                snapshot.log.drain(0..excess);
+            }
             if snapshot.running {
                 snapshot.running = false;
                 snapshot.status = Some("stopped".to_string());

@@ -14,7 +14,9 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use pbs_core::{BackupManifest, ChunkDigest, CryptoConfig, DynamicIndex, FileType, FixedIndex};
+use pbs_core::{
+    BackupManifest, Chunk, ChunkDigest, CryptoConfig, DataBlob, DynamicIndex, FileType, FixedIndex,
+};
 use pbs_storage::error::StorageError;
 use pbs_storage::{
     Datastore, GarbageCollector, GcOptions, LocalBackend, PruneOptions, Pruner, S3Backend,
@@ -1082,7 +1084,11 @@ fn parse_bool_param(value: &str) -> Option<bool> {
 }
 
 fn task_auth_id(ctx: &AuthContext) -> String {
-    format!("{}@pbs", ctx.user.username)
+    if let Some(token_id) = ctx.token_id.as_deref() {
+        format!("{}!{}@pbs", ctx.user.username, token_id)
+    } else {
+        format!("{}@pbs", ctx.user.username)
+    }
 }
 
 async fn store_session_task(
@@ -4555,6 +4561,10 @@ async fn spawn_verify_task(
                         let mut digest_mismatch = Vec::new();
                         let mut chunk_checked = 0usize;
                         let mut chunk_missing = 0usize;
+                        let mut chunk_skipped = 0usize;
+                        let mut skipped_chunks = Vec::new();
+                        let crypto = datastore_clone.crypto_config();
+                        let has_encryption_key = crypto.key.is_some();
                         let existing = match datastore_clone.backend().list_files(&prefix).await {
                             Ok(files) => {
                                 let mut set = std::collections::HashSet::new();
@@ -4655,23 +4665,8 @@ async fn spawn_verify_task(
 
                         for (digest, expected_size) in chunk_expectations {
                             chunk_checked = chunk_checked.saturating_add(1);
-                            match datastore_clone.read_chunk(&digest).await {
-                                Ok(chunk) => {
-                                    if chunk.digest() != &digest && digest_mismatch.len() < 10 {
-                                        digest_mismatch.push(digest.to_hex());
-                                    }
-                                    if let Some(size) = expected_size {
-                                        if chunk.size() as u64 != size && digest_mismatch.len() < 10
-                                        {
-                                            digest_mismatch.push(format!(
-                                                "{} (size {} != {})",
-                                                digest.to_hex(),
-                                                chunk.size(),
-                                                size
-                                            ));
-                                        }
-                                    }
-                                }
+                            let blob_bytes = match datastore_clone.read_chunk_blob(&digest).await {
+                                Ok(bytes) => bytes,
                                 Err(e) => {
                                     chunk_missing = chunk_missing.saturating_add(1);
                                     if missing_chunks.len() < 10 {
@@ -4681,6 +4676,74 @@ async fn spawn_verify_task(
                                             e
                                         ));
                                     }
+                                    continue;
+                                }
+                            };
+
+                            let blob = match DataBlob::from_bytes(&blob_bytes) {
+                                Ok(blob) => blob,
+                                Err(e) => {
+                                    chunk_missing = chunk_missing.saturating_add(1);
+                                    if missing_chunks.len() < 10 {
+                                        missing_chunks.push(format!(
+                                            "{} (parse error: {})",
+                                            digest.to_hex(),
+                                            e
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            if blob.blob_type().is_encrypted() && !has_encryption_key {
+                                chunk_skipped = chunk_skipped.saturating_add(1);
+                                if skipped_chunks.len() < 10 {
+                                    skipped_chunks.push(digest.to_hex());
+                                }
+                                continue;
+                            }
+
+                            let raw_data = match blob.decode(&crypto) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    chunk_missing = chunk_missing.saturating_add(1);
+                                    if missing_chunks.len() < 10 {
+                                        missing_chunks.push(format!(
+                                            "{} (decode error: {})",
+                                            digest.to_hex(),
+                                            e
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            let chunk = match Chunk::new(raw_data) {
+                                Ok(chunk) => chunk,
+                                Err(e) => {
+                                    chunk_missing = chunk_missing.saturating_add(1);
+                                    if missing_chunks.len() < 10 {
+                                        missing_chunks.push(format!(
+                                            "{} (chunk error: {})",
+                                            digest.to_hex(),
+                                            e
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            if chunk.digest() != &digest && digest_mismatch.len() < 10 {
+                                digest_mismatch.push(digest.to_hex());
+                            }
+                            if let Some(size) = expected_size {
+                                if chunk.size() as u64 != size && digest_mismatch.len() < 10 {
+                                    digest_mismatch.push(format!(
+                                        "{} (size {} != {})",
+                                        digest.to_hex(),
+                                        chunk.size(),
+                                        size
+                                    ));
                                 }
                             }
                         }
@@ -4766,14 +4829,28 @@ async fn spawn_verify_task(
                                     .log(
                                         &upid_clone,
                                         &format!(
-                                            "Chunk check in {}: checked={}, missing={}, samples={}",
+                                            "Chunk check in {}: checked={}, missing={}, skipped={}, samples={}",
                                             snapshot_path,
                                             chunk_checked,
                                             chunk_missing,
+                                            chunk_skipped,
                                             missing_chunks.join(", ")
                                         ),
                                     )
                                     .await;
+                                if chunk_skipped > 0 && !skipped_chunks.is_empty() {
+                                    state_clone
+                                        .tasks
+                                        .log(
+                                            &upid_clone,
+                                            &format!(
+                                                "Chunk check skipped (encrypted, no key) in {}: {}",
+                                                snapshot_path,
+                                                skipped_chunks.join(", ")
+                                            ),
+                                        )
+                                        .await;
+                                }
                             }
                             if !digest_mismatch.is_empty() {
                                 state_clone
@@ -4886,7 +4963,7 @@ async fn handle_verify_api(
             items.push(serde_json::json!({
                 "id": store,
                 "store": store,
-                "schedule": if state.config.verify.enabled { Some(format!("interval-{}h", state.config.verify.interval_hours)) } else { None },
+                "schedule": None::<String>,
                 "comment": None::<String>,
                 "ignore-verified": None::<bool>,
                 "outdated-after": None::<i64>,
