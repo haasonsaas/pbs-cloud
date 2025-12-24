@@ -57,6 +57,9 @@
 - Multiple datastores:
   - `export PBS_DATASTORES=fast,archive`
   - Default store uses `PBS_DATA_DIR` or `PBS_S3_PREFIX`; additional stores are created under per-store paths/prefixes.
+- CLI:
+  - `cargo run -p pbs-cli -- --help`
+  - `PBS_API_TOKEN=... cargo run -p pbs-cli -- datastores list`
 
 ## Configuration (env vars)
 - Server: `PBS_LISTEN_ADDR`, `PBS_PERSISTENCE_DIR`

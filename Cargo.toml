@@ -4,6 +4,7 @@ members = [
     "crates/pbs-core",
     "crates/pbs-storage",
     "crates/pbs-server",
+    "crates/pbs-cli",
 ]
 
 [workspace.package]
@@ -76,6 +77,7 @@ parking_lot = "0.12"
 dashmap = "6.1"
 url = "2.5"
 percent-encoding = "2.3"
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Internal crates
 pbs-core = { path = "crates/pbs-core" }

@@ -582,6 +582,31 @@ Protects against:
 
 Note: the scripts set `TMPDIR` and `CARGO_HOME` under `target/` to avoid issues on low-space systems.
 
+## CLI
+
+PBS Cloud includes a lightweight CLI for common API interactions.
+
+```bash
+# Build
+cargo build -p pbs-cli
+
+# Ping (no auth required)
+./target/debug/pbs-cloud --url https://localhost:8007 ping
+
+# List datastores
+./target/debug/pbs-cloud --token "$PBS_API_TOKEN" datastores list
+
+# Task list
+./target/debug/pbs-cloud --token "$PBS_API_TOKEN" tasks list --limit 20
+
+# Verify jobs
+./target/debug/pbs-cloud --token "$PBS_API_TOKEN" verify list
+```
+
+Environment variables:
+- `PBS_API_URL` (default `https://localhost:8007`)
+- `PBS_API_TOKEN`
+
 ## License
 
 MIT
