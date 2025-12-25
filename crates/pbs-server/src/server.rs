@@ -4523,8 +4523,6 @@ async fn handle_protocol_upgrade(
         let upgrade_fut = hyper::upgrade::on(req);
         tokio::spawn(async move {
             if let Ok(upgraded) = upgrade_fut.await {
-                // Wrap with TokioIo for proper async I/O handling
-                let io = TokioIo::new(upgraded);
                 // Configure H2 with large window sizes for backup workloads
                 // PBS chunks can be up to 4MB, so we need large flow control windows
                 let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -4532,8 +4530,10 @@ async fn handle_protocol_upgrade(
                     .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
                     .max_concurrent_streams(100)
                     .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
+                    .keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+                    .keep_alive_timeout(std::time::Duration::from_secs(30))
                     .serve_connection(
-                        io,
+                        upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
                     )
                     .await;
@@ -4589,16 +4589,16 @@ async fn handle_protocol_upgrade(
         let upgrade_fut = hyper::upgrade::on(req);
         tokio::spawn(async move {
             if let Ok(upgraded) = upgrade_fut.await {
-                // Wrap with TokioIo for proper async I/O handling
-                let io = TokioIo::new(upgraded);
                 // Configure H2 with large window sizes for restore workloads
                 let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
                     .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
                     .max_concurrent_streams(100)
                     .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
+                    .keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+                    .keep_alive_timeout(std::time::Duration::from_secs(30))
                     .serve_connection(
-                        io,
+                        upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
                     )
                     .await;
