@@ -21,6 +21,7 @@ http-body-util = { workspace = true }
 h2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }

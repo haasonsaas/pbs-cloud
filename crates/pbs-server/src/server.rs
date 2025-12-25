@@ -2837,6 +2837,14 @@ async fn handle_compliance_report(
 }
 
 async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+    // Check Content-Type header to determine parsing method
+    let is_json = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("application/json"))
+        .unwrap_or(false);
+
     let body = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return bad_request("Failed to read request body"),
@@ -2848,9 +2856,22 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
         password: String,
     }
 
-    let params: LoginRequest = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(_) => return bad_request("Invalid JSON"),
+    // Try JSON first, then form-urlencoded (for PBS client compatibility)
+    let params: LoginRequest = if is_json {
+        match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(_) => return bad_request("Invalid JSON"),
+        }
+    } else {
+        // Try form-urlencoded (application/x-www-form-urlencoded)
+        match serde_urlencoded::from_bytes(&body) {
+            Ok(p) => p,
+            // Fallback to JSON parsing for backwards compatibility
+            Err(_) => match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(_) => return bad_request("Invalid request body (expected JSON or form-urlencoded)"),
+            },
+        }
     };
 
     // Token-based auth: password field contains the API token
