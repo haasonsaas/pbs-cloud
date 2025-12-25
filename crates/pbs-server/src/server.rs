@@ -1227,7 +1227,7 @@ async fn authenticate(
             // Check if it's a PBS ticket (PBS:username:timestamp:signature)
             if ticket.starts_with("PBS:") {
                 // Validate ticket from ticket store
-                if let Some(entry) = state.tickets.get(ticket) {
+                if let Some(entry) = state.tickets.get(&ticket) {
                     let username = entry.value().clone();
                     // Look up user and create auth context
                     if let Some(user) = state.auth.get_user_by_username(&username).await {
@@ -1241,19 +1241,25 @@ async fn authenticate(
                 return Err(ApiError::unauthorized("Invalid or expired ticket"));
             }
             // Otherwise treat as API token
-            return state.auth.authenticate_token(ticket).await;
+            return state.auth.authenticate_token(&ticket).await;
         }
     }
 
     Err(ApiError::unauthorized("No authentication provided"))
 }
 
-/// Extract PBS API token from cookie
-fn extract_pbs_token(cookie: &str) -> Option<&str> {
+/// Extract PBS API token from cookie (returns percent-decoded value)
+fn extract_pbs_token(cookie: &str) -> Option<String> {
     for part in cookie.split(';') {
         let part = part.trim();
         if let Some(value) = part.strip_prefix("PBSAuthCookie=") {
-            return Some(value);
+            // PBS client percent-encodes the ticket in cookie
+            return Some(
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| value.to_string()),
+            );
         }
     }
     None

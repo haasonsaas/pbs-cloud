@@ -413,10 +413,36 @@ impl AuthManager {
             return self.authenticate_token(token.trim()).await;
         }
 
-        // Support "PBSAPIToken=<user>:<token>" format (PBS compatible)
+        // Support "PBSAPIToken <auth_id>:<token>" format (PBS compatible)
+        // Note: PBS uses space, not equals sign
+        if let Some(rest) = auth_header.strip_prefix("PBSAPIToken ") {
+            if let Some((_, token)) = rest.split_once(':') {
+                // Token may be percent-encoded
+                let decoded = percent_encoding::percent_decode_str(token.trim())
+                    .decode_utf8()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| token.trim().to_string());
+                return self.authenticate_token(&decoded).await;
+            }
+        }
+
+        // Also support "PBSAPIToken=<user>:<token>" format (alternate)
         if let Some(rest) = auth_header.strip_prefix("PBSAPIToken=") {
             if let Some((_, token)) = rest.split_once(':') {
                 return self.authenticate_token(token.trim()).await;
+            }
+        }
+
+        // Support HTTP Basic Auth: "Basic base64(user:password)"
+        // where password is the API token
+        if let Some(encoded) = auth_header.strip_prefix("Basic ") {
+            use base64::Engine;
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+                if let Ok(credentials) = String::from_utf8(decoded) {
+                    if let Some((_, password)) = credentials.split_once(':') {
+                        return self.authenticate_token(password).await;
+                    }
+                }
             }
         }
 
