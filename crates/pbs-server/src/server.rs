@@ -34,7 +34,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::audit;
-use crate::auth::{AuthContext, AuthManager, Permission};
+use crate::auth::{AuthContext, AuthManager, Permission, User};
 use crate::billing::{BillingManager, UsageEvent, UsageEventType};
 use crate::config::{ServerConfig, StorageConfig};
 use crate::metrics::{Metrics, MetricsConfig};
@@ -100,6 +100,8 @@ pub struct ServerState {
     pub verify_job_state: Arc<RwLock<HashMap<String, VerificationJobState>>>,
     /// Active session tickets (ticket -> username)
     pub tickets: DashMap<String, String>,
+    /// Server signing key for tickets (HMAC-SHA256)
+    pub ticket_key: [u8; 32],
 }
 
 impl ServerState {
@@ -312,6 +314,13 @@ impl ServerState {
             verify_jobs,
             verify_job_state,
             tickets: DashMap::new(),
+            // Generate random key for signing tickets (in production, this should be persisted)
+            ticket_key: {
+                use rand::Rng;
+                let mut key = [0u8; 32];
+                rand::thread_rng().fill(&mut key);
+                key
+            },
         })
     }
 
@@ -1212,39 +1221,70 @@ async fn authenticate(
     state: Arc<ServerState>,
     req: &Request<Incoming>,
 ) -> Result<AuthContext, ApiError> {
+    // Log auth attempts for debugging
+    tracing::info!("[AUTH] Request path: {} method: {}", req.uri().path(), req.method());
+    for (name, value) in req.headers().iter() {
+        if name.as_str() == "authorization" || name.as_str() == "cookie" || name.as_str() == "upgrade" {
+            tracing::info!("[AUTH] Header: {} = {:?}", name, value.to_str().unwrap_or("<invalid>"));
+        }
+    }
+
     // Check Authorization header
     if let Some(auth_header) = req.headers().get("authorization") {
         let auth_str = auth_header
             .to_str()
             .map_err(|_| ApiError::unauthorized("Invalid authorization header"))?;
+        tracing::info!("[AUTH] Using Authorization header");
         return state.auth.authenticate_header(auth_str).await;
     }
 
     // Check for PBS cookie-based auth (ticket or token)
     if let Some(cookie) = req.headers().get("cookie") {
         let cookie_str = cookie.to_str().unwrap_or("");
+        tracing::info!("[AUTH] Found cookie header (len={})", cookie_str.len());
         if let Some(ticket) = extract_pbs_token(cookie_str) {
-            // Check if it's a PBS ticket (PBS:username:timestamp:signature)
-            if ticket.starts_with("PBS:") {
-                // Validate ticket from ticket store
-                if let Some(entry) = state.tickets.get(&ticket) {
-                    let username = entry.value().clone();
+            tracing::info!("[AUTH] Extracted PBS token (first 50 chars): {}", &ticket[..ticket.len().min(50)]);
+            // Check if it's a PBS ticket (PBS:username:timestamp::signature)
+            if ticket.starts_with("PBS:") && ticket.contains("::") {
+                tracing::info!("[AUTH] Token is PBS ticket format, verifying signature");
+                // Verify ticket signature cryptographically
+                if let Some(username) = verify_pbs_ticket(&state, &ticket) {
+                    tracing::info!("[AUTH] Ticket verified for user: {}", username);
                     // Look up user and create auth context
+                    // For PBS compatibility, we use the token to authenticate
+                    // and the ticket just proves they already authenticated
                     if let Some(user) = state.auth.get_user_by_username(&username).await {
+                        tracing::info!("[AUTH] User lookup succeeded");
                         return Ok(AuthContext {
                             user,
                             token_id: None,
                             permission: Permission::Admin,
                         });
                     }
+                    // If no user by that exact name, create a synthetic auth context
+                    // This handles PBS usernames like "root@pam" which we map to our token user
+                    tracing::info!("[AUTH] User '{}' not found directly, using ticket auth", username);
+                    // Get any valid user from our auth system as fallback
+                    // In practice, the ticket was signed by us, so we trust the username
+                    return Ok(AuthContext {
+                        user: User::new(&username, "default", Permission::Admin),
+                        token_id: None,
+                        permission: Permission::Admin,
+                    });
                 }
+                tracing::warn!("[AUTH] Ticket verification failed");
                 return Err(ApiError::unauthorized("Invalid or expired ticket"));
             }
             // Otherwise treat as API token
+            tracing::info!("[AUTH] Token is not PBS format, trying as API token");
             return state.auth.authenticate_token(&ticket).await;
         }
+        tracing::info!("[AUTH] Could not extract PBSAuthCookie from cookie header");
+    } else {
+        tracing::info!("[AUTH] No cookie header found");
     }
 
+    tracing::info!("[AUTH] No authentication provided");
     Err(ApiError::unauthorized("No authentication provided"))
 }
 
@@ -2905,29 +2945,18 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
     match state.auth.authenticate_token(&params.password).await {
         Ok(ctx) => {
             audit::log_auth_success(&params.username, &ctx.user.tenant_id, None);
-            // Generate PBS-compatible ticket: PBS:username:timestamp:signature
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let ticket_data = format!("PBS:{}:{:08X}", ctx.user.username, timestamp);
-            // Sign with HMAC-SHA256 using the token as key
-            use hmac::{Hmac, Mac};
-            type HmacSha256 = Hmac<sha2::Sha256>;
-            let mut mac = HmacSha256::new_from_slice(params.password.as_bytes())
-                .expect("HMAC can take key of any size");
-            mac.update(ticket_data.as_bytes());
-            let signature = hex::encode(mac.finalize().into_bytes());
-            let ticket = format!("{}:{}", ticket_data, signature);
+            // Generate PBS-compatible ticket
+            let ticket = generate_pbs_ticket(&state, &params.username);
+            tracing::info!("[AUTH] Generated ticket for user {}: {}", params.username, &ticket[..ticket.len().min(50)]);
 
-            // Store ticket for validation
-            state.tickets.insert(ticket.clone(), ctx.user.username.clone());
+            // Generate CSRF token using same HMAC key
+            let csrf_token = generate_csrf_token(&state, &params.username);
 
             let response = serde_json::json!({
                 "data": {
-                    "username": ctx.user.username,
+                    "username": params.username,
                     "ticket": ticket,
-                    "CSRFPreventionToken": "not-used"
+                    "CSRFPreventionToken": csrf_token
                 }
             });
             json_response(StatusCode::OK, &response)
@@ -2937,6 +2966,108 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
             error_response(e)
         }
     }
+}
+
+/// Generate a PBS-compatible ticket in format: PBS:<userid>:<timestamp_hex>::<base64_signature>
+fn generate_pbs_ticket(state: &ServerState, username: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Ticket data to sign: PBS:<userid>:<timestamp_hex>
+    let ticket_data = format!("PBS:{}:{:08X}", username, timestamp);
+
+    // Sign with server's ticket key
+    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
+        .expect("HMAC can take key of any size");
+    mac.update(ticket_data.as_bytes());
+    let signature = mac.finalize().into_bytes();
+
+    // Encode signature as base64 without padding (like proxmox_base64::encode_no_pad)
+    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&signature);
+
+    // Full ticket: PBS:<userid>:<timestamp>::<base64_signature> (note double colon)
+    format!("{}::{}", ticket_data, sig_b64)
+}
+
+/// Verify a PBS ticket and return the username if valid
+fn verify_pbs_ticket(state: &ServerState, ticket: &str) -> Option<String> {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    // Parse ticket: PBS:<userid>:<timestamp>::<signature>
+    // Split on "::" first to get data and signature
+    let (data_part, sig_part) = ticket.split_once("::")?;
+
+    // data_part should be: PBS:<userid>:<timestamp>
+    let parts: Vec<&str> = data_part.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "PBS" {
+        tracing::warn!("[AUTH] Ticket parse failed: wrong format");
+        return None;
+    }
+
+    let username = parts[1];
+    let timestamp_hex = parts[2];
+
+    // Parse timestamp and check age (allow -5 min to +2 hours)
+    let timestamp = i64::from_str_radix(timestamp_hex, 16).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let age = now - timestamp;
+
+    if age < -300 {
+        tracing::warn!("[AUTH] Ticket rejected: timestamp too far in future");
+        return None;
+    }
+    if age > 7200 { // 2 hour lifetime
+        tracing::warn!("[AUTH] Ticket rejected: expired (age={}s)", age);
+        return None;
+    }
+
+    // Verify signature
+    let expected_sig = base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_part).ok()?;
+
+    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
+        .expect("HMAC can take key of any size");
+    mac.update(data_part.as_bytes());
+
+    if mac.verify_slice(&expected_sig).is_err() {
+        tracing::warn!("[AUTH] Ticket rejected: invalid signature");
+        return None;
+    }
+
+    tracing::info!("[AUTH] Ticket verified for user: {}", username);
+    Some(username.to_string())
+}
+
+/// Generate CSRF prevention token
+fn generate_csrf_token(state: &ServerState, username: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let data = format!("{:08X}:{}:", timestamp, username);
+
+    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
+        .expect("HMAC can take key of any size");
+    mac.update(data.as_bytes());
+    let signature = mac.finalize().into_bytes();
+
+    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&signature);
+    format!("{:08X}:{}", timestamp, sig_b64)
 }
 
 async fn handle_nodes(state: Arc<ServerState>) -> Response<Full<Bytes>> {
