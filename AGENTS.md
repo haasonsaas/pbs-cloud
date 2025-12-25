@@ -82,6 +82,7 @@
 - H2 paths used by PBS clients:
   - Backup: `/blob`, `/fixed_index`, `/dynamic_index`, `/fixed_chunk`, `/dynamic_chunk`, `/fixed_close`, `/dynamic_close`, `/finish`, `/previous_backup_time`, `/previous`.
   - Reader: `/download`, `/chunk`, `/speedtest`.
+- H2 settings follow upstream defaults (32MB stream/connection windows, 4MB max frame size).
 - Query params supported on upgrade: `backup-type`, `backup-id`, `backup-time`, `ns` (namespace), `store` (datastore).
 - `backup-time` on upgrade is a Unix epoch; stored internally as RFC3339.
 

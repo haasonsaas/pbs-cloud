@@ -4527,9 +4527,8 @@ async fn handle_protocol_upgrade(
                 // PBS chunks can be up to 4MB, so we need large flow control windows
                 let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
-                    .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
-                    .max_concurrent_streams(100)
-                    .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
+                    .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
+                    .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
                     .serve_connection(
                         upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
@@ -4590,9 +4589,8 @@ async fn handle_protocol_upgrade(
                 // Configure H2 with large window sizes for restore workloads
                 let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
-                    .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
-                    .max_concurrent_streams(100)
-                    .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
+                    .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
+                    .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
                     .serve_connection(
                         upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
