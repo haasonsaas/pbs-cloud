@@ -3041,7 +3041,7 @@ fn generate_pbs_ticket(state: &ServerState, username: &str) -> String {
     let signature = mac.finalize().into_bytes();
 
     // Encode signature as base64 without padding (like proxmox_base64::encode_no_pad)
-    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&signature);
+    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(signature);
 
     // Full ticket: PBS:<userid>:<timestamp>::<base64_signature> (note double colon)
     format!("{}::{}", ticket_data, sig_b64)
@@ -3121,7 +3121,7 @@ fn generate_csrf_token(state: &ServerState, username: &str) -> String {
     mac.update(data.as_bytes());
     let signature = mac.finalize().into_bytes();
 
-    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&signature);
+    let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(signature);
     format!("{:08X}:{}", timestamp, sig_b64)
 }
 
