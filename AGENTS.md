@@ -134,6 +134,7 @@
 - Task APIs track GC, prune, backup, and reader sessions; other operations may not emit task logs yet.
 - Task logs are capped to the most recent 1000 lines per task to limit persistence growth.
 - Verification tasks check manifest presence, archive file existence, size consistency, and chunk existence/digest integrity via index parsing.
+- S3 checksum calculation/validation is set to `WhenRequired` to avoid crc-fast SIMD panics on older CPUs.
 
 ## Operational endpoints
 - Health: `/health`, `/healthz`, `/ready`, `/readyz`.

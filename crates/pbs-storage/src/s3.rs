@@ -83,6 +83,12 @@ impl S3Backend {
         let sdk_config = aws_config.load().await;
         let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
             .force_path_style(config.endpoint.is_some()) // Use path style for non-AWS
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
             .build();
 
         let client = Client::from_conf(s3_config);
