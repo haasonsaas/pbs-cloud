@@ -53,6 +53,12 @@ impl S3Config {
         self.prefix = Some(prefix.to_string());
         self
     }
+
+    /// Set the region (required for auth signing)
+    pub fn with_region(mut self, region: &str) -> Self {
+        self.region = Some(region.to_string());
+        self
+    }
 }
 
 /// S3 storage backend

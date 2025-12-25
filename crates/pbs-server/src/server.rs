@@ -117,7 +117,14 @@ impl ServerState {
                 prefix,
             } => {
                 let mut s3_config = match endpoint {
-                    Some(ep) => pbs_storage::S3Config::compatible(bucket, ep),
+                    Some(ep) => {
+                        let mut cfg = pbs_storage::S3Config::compatible(bucket, ep);
+                        // Set region for auth signing (required by many S3-compatible services)
+                        if let Some(r) = region {
+                            cfg = cfg.with_region(r);
+                        }
+                        cfg
+                    }
                     None => {
                         pbs_storage::S3Config::aws(bucket, region.as_deref().unwrap_or("us-east-1"))
                     }
@@ -169,7 +176,13 @@ impl ServerState {
                     prefix,
                 } => {
                     let mut s3_config = match endpoint {
-                        Some(ep) => pbs_storage::S3Config::compatible(bucket, ep),
+                        Some(ep) => {
+                            let mut cfg = pbs_storage::S3Config::compatible(bucket, ep);
+                            if let Some(r) = region {
+                                cfg = cfg.with_region(r);
+                            }
+                            cfg
+                        }
                         None => pbs_storage::S3Config::aws(
                             bucket,
                             region.as_deref().unwrap_or("us-east-1"),
