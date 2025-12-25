@@ -38,7 +38,7 @@ impl BackupProtocolHandler {
         let tenant = self
             .state
             .tenants
-            .get_tenant_by_name(&ctx.user.tenant_id)
+            .get_tenant(&ctx.user.tenant_id)
             .await
             .ok_or_else(|| ApiError::not_found("Tenant not found"))?;
 
@@ -488,7 +488,7 @@ impl ReaderProtocolHandler {
         let tenant = self
             .state
             .tenants
-            .get_tenant_by_name(&ctx.user.tenant_id)
+            .get_tenant(&ctx.user.tenant_id)
             .await
             .ok_or_else(|| ApiError::not_found("Tenant not found"))?;
 

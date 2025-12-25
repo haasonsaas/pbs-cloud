@@ -385,10 +385,10 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
 
         // Create default tenant
         let tenant = state.tenants.create_tenant(default_tenant).await;
-        info!("Created default tenant: {}", tenant.name);
+        info!("Created default tenant: {} (id: {})", tenant.name, tenant.id);
 
-        // Create root user
-        match state.auth.create_root_user(default_tenant).await {
+        // Create root user with tenant UUID, not name
+        match state.auth.create_root_user(&tenant.id).await {
             Ok((user, token)) => {
                 info!("Created root user: {}", user.username);
                 if let Some(path) = state.config.root_token_file.as_deref() {
