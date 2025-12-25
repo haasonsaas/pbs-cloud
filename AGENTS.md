@@ -40,6 +40,7 @@
 - Format (CI): `cargo fmt --all -- --check`
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
+- Docker build targets baseline x86-64 (no SSE4.1/PCLMULQDQ) for older CPUs.
 
 ## Pre-commit (optional)
 - Install hooks: `pre-commit install`

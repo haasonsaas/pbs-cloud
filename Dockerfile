@@ -14,6 +14,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build release binary
+ENV RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=-sse4.1,-pclmulqdq"
 RUN cargo build --release --package pbs-server
 
 # Runtime stage
