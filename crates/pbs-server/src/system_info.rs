@@ -25,8 +25,8 @@ impl CpuTracker {
 
         let (usage, wait) = if let Some(previous) = self.last {
             let total_delta = current.total.saturating_sub(previous.total);
-            let idle_delta = (current.idle + current.iowait)
-                .saturating_sub(previous.idle + previous.iowait);
+            let idle_delta =
+                (current.idle + current.iowait).saturating_sub(previous.idle + previous.iowait);
             let wait_delta = current.iowait.saturating_sub(previous.iowait);
 
             if total_delta > 0 {
@@ -109,9 +109,7 @@ pub fn collect_system_snapshot(
 ) -> SystemSnapshot {
     let memory = read_memory_info().unwrap_or_default();
     let swap = read_swap_info().unwrap_or_default();
-    let root = data_dir
-        .and_then(read_storage_info)
-        .unwrap_or_default();
+    let root = data_dir.and_then(read_storage_info).unwrap_or_default();
     let uptime = read_uptime().unwrap_or(0);
     let loadavg = read_loadavg().unwrap_or([0.0, 0.0, 0.0]);
     let (cpu_usage, cpu_wait) = cpu_tracker.sample();
@@ -175,7 +173,11 @@ fn read_cpu_sample() -> Option<CpuSample> {
     let idle = values.get(3).copied().unwrap_or(0);
     let iowait = values.get(4).copied().unwrap_or(0);
     let total = values.iter().sum();
-    Some(CpuSample { total, idle, iowait })
+    Some(CpuSample {
+        total,
+        idle,
+        iowait,
+    })
 }
 
 fn read_memory_info() -> Option<MemoryInfo> {
@@ -356,11 +358,7 @@ fn read_storage_info(path: &Path) -> Option<StorageInfo> {
         let free = vfs.f_bfree as u64 * block_size;
         let avail = vfs.f_bavail as u64 * block_size;
         let used = total.saturating_sub(free);
-        return Some(StorageInfo {
-            total,
-            used,
-            avail,
-        });
+        return Some(StorageInfo { total, used, avail });
     }
     #[cfg(not(unix))]
     {

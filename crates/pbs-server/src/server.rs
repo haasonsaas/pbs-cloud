@@ -2,8 +2,8 @@
 //!
 //! Handles both REST API and PBS backup protocol with TLS, rate limiting, and metrics.
 
-use std::collections::HashMap;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -398,7 +398,10 @@ pub async fn run_server(state: Arc<ServerState>) -> anyhow::Result<()> {
 
         // Create default tenant
         let tenant = state.tenants.create_tenant(default_tenant).await;
-        info!("Created default tenant: {} (id: {})", tenant.name, tenant.id);
+        info!(
+            "Created default tenant: {} (id: {})",
+            tenant.name, tenant.id
+        );
 
         // Create root user with tenant UUID, not name
         match state.auth.create_root_user(&tenant.id).await {
@@ -1237,10 +1240,21 @@ async fn authenticate(
     req: &Request<Incoming>,
 ) -> Result<AuthContext, ApiError> {
     // Log auth attempts for debugging
-    tracing::info!("[AUTH] Request path: {} method: {}", req.uri().path(), req.method());
+    tracing::info!(
+        "[AUTH] Request path: {} method: {}",
+        req.uri().path(),
+        req.method()
+    );
     for (name, value) in req.headers().iter() {
-        if name.as_str() == "authorization" || name.as_str() == "cookie" || name.as_str() == "upgrade" {
-            tracing::info!("[AUTH] Header: {} = {:?}", name, value.to_str().unwrap_or("<invalid>"));
+        if name.as_str() == "authorization"
+            || name.as_str() == "cookie"
+            || name.as_str() == "upgrade"
+        {
+            tracing::info!(
+                "[AUTH] Header: {} = {:?}",
+                name,
+                value.to_str().unwrap_or("<invalid>")
+            );
         }
     }
 
@@ -1258,7 +1272,10 @@ async fn authenticate(
         let cookie_str = cookie.to_str().unwrap_or("");
         tracing::info!("[AUTH] Found cookie header (len={})", cookie_str.len());
         if let Some(ticket) = extract_pbs_token(cookie_str) {
-            tracing::info!("[AUTH] Extracted PBS token (first 50 chars): {}", &ticket[..ticket.len().min(50)]);
+            tracing::info!(
+                "[AUTH] Extracted PBS token (first 50 chars): {}",
+                &ticket[..ticket.len().min(50)]
+            );
             // Check if it's a PBS ticket (PBS:username:timestamp::signature)
             if ticket.starts_with("PBS:") && ticket.contains("::") {
                 tracing::info!("[AUTH] Token is PBS ticket format, verifying signature");
@@ -1278,11 +1295,22 @@ async fn authenticate(
                     }
                     // If no user by that exact name, create a synthetic auth context
                     // This handles PBS usernames like "root@pam" which we map to our token user
-                    tracing::info!("[AUTH] User '{}' not found directly, using ticket auth", username);
+                    tracing::info!(
+                        "[AUTH] User '{}' not found directly, using ticket auth",
+                        username
+                    );
                     // Look up the default tenant by name to get its actual ID
                     let default_tenant_name = &state.config.tenants.default_tenant;
-                    let tenant = state.tenants.get_tenant_by_name(default_tenant_name).await
-                        .ok_or_else(|| ApiError::internal(&format!("Default tenant '{}' not found", default_tenant_name)))?;
+                    let tenant = state
+                        .tenants
+                        .get_tenant_by_name(default_tenant_name)
+                        .await
+                        .ok_or_else(|| {
+                            ApiError::internal(&format!(
+                                "Default tenant '{}' not found",
+                                default_tenant_name
+                            ))
+                        })?;
                     tracing::info!("[AUTH] Using tenant '{}' (id: {})", tenant.name, tenant.id);
                     return Ok(AuthContext {
                         user: User::new(&username, &tenant.id, Permission::Admin),
@@ -2954,7 +2982,9 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
             // Fallback to JSON parsing for backwards compatibility
             Err(_) => match serde_json::from_slice(&body) {
                 Ok(p) => p,
-                Err(_) => return bad_request("Invalid request body (expected JSON or form-urlencoded)"),
+                Err(_) => {
+                    return bad_request("Invalid request body (expected JSON or form-urlencoded)")
+                }
             },
         }
     };
@@ -2965,7 +2995,11 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
             audit::log_auth_success(&params.username, &ctx.user.tenant_id, None);
             // Generate PBS-compatible ticket
             let ticket = generate_pbs_ticket(&state, &params.username);
-            tracing::info!("[AUTH] Generated ticket for user {}: {}", params.username, &ticket[..ticket.len().min(50)]);
+            tracing::info!(
+                "[AUTH] Generated ticket for user {}: {}",
+                params.username,
+                &ticket[..ticket.len().min(50)]
+            );
 
             // Generate CSRF token using same HMAC key
             let csrf_token = generate_csrf_token(&state, &params.username);
@@ -3001,8 +3035,8 @@ fn generate_pbs_ticket(state: &ServerState, username: &str) -> String {
     let ticket_data = format!("PBS:{}:{:08X}", username, timestamp);
 
     // Sign with server's ticket key
-    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(&state.ticket_key).expect("HMAC can take key of any size");
     mac.update(ticket_data.as_bytes());
     let signature = mac.finalize().into_bytes();
 
@@ -3045,16 +3079,19 @@ fn verify_pbs_ticket(state: &ServerState, ticket: &str) -> Option<String> {
         tracing::warn!("[AUTH] Ticket rejected: timestamp too far in future");
         return None;
     }
-    if age > 7200 { // 2 hour lifetime
+    if age > 7200 {
+        // 2 hour lifetime
         tracing::warn!("[AUTH] Ticket rejected: expired (age={}s)", age);
         return None;
     }
 
     // Verify signature
-    let expected_sig = base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_part).ok()?;
+    let expected_sig = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(sig_part)
+        .ok()?;
 
-    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(&state.ticket_key).expect("HMAC can take key of any size");
     mac.update(data_part.as_bytes());
 
     if mac.verify_slice(&expected_sig).is_err() {
@@ -3079,8 +3116,8 @@ fn generate_csrf_token(state: &ServerState, username: &str) -> String {
 
     let data = format!("{:08X}:{}:", timestamp, username);
 
-    let mut mac = HmacSha256::new_from_slice(&state.ticket_key)
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(&state.ticket_key).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let signature = mac.finalize().into_bytes();
 
@@ -3097,7 +3134,11 @@ async fn handle_nodes(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         .unwrap_or_else(|| Path::new("/"));
     let snapshot = {
         let mut tracker = state.cpu_tracker.lock();
-        collect_system_snapshot(Some(data_dir), state.tls_fingerprint.as_deref(), &mut tracker)
+        collect_system_snapshot(
+            Some(data_dir),
+            state.tls_fingerprint.as_deref(),
+            &mut tracker,
+        )
     };
     let nodes = serde_json::json!({
         "data": [{
@@ -3122,7 +3163,11 @@ async fn handle_node_status(state: Arc<ServerState>) -> Response<Full<Bytes>> {
         .unwrap_or_else(|| Path::new("/"));
     let snapshot = {
         let mut tracker = state.cpu_tracker.lock();
-        collect_system_snapshot(Some(data_dir), state.tls_fingerprint.as_deref(), &mut tracker)
+        collect_system_snapshot(
+            Some(data_dir),
+            state.tls_fingerprint.as_deref(),
+            &mut tracker,
+        )
     };
     let data = serde_json::json!({
         "data": {
