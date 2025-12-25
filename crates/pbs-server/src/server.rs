@@ -4361,7 +4361,8 @@ async fn handle_protocol_upgrade(
     let state_for_upgrade = state.clone();
     let tenant_id = auth_ctx.user.tenant_id.clone();
     let uri = req.uri().clone();
-    let path = uri.path();
+    // Normalize path: collapse multiple slashes to single slash
+    let path = uri.path().replace("//", "/");
     if mode == "backup" && path != "/api2/json/backup" {
         return bad_request("Invalid backup upgrade path");
     }
