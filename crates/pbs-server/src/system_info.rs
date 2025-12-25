@@ -361,11 +361,8 @@ fn read_storage_info(path: &Path) -> Option<StorageInfo> {
         #[cfg(target_os = "linux")]
         let (blocks, free_blocks, avail_blocks) = (vfs.f_blocks, vfs.f_bfree, vfs.f_bavail);
         #[cfg(not(target_os = "linux"))]
-        let (blocks, free_blocks, avail_blocks) = (
-            vfs.f_blocks as u64,
-            vfs.f_bfree as u64,
-            vfs.f_bavail as u64,
-        );
+        let (blocks, free_blocks, avail_blocks) =
+            (vfs.f_blocks as u64, vfs.f_bfree as u64, vfs.f_bavail as u64);
 
         let total = blocks * block_size;
         let free = free_blocks * block_size;
