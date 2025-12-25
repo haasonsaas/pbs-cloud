@@ -2555,6 +2555,7 @@ async fn handle_h2_request(
     ctx: Arc<H2Context>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    println!("H2 request: {} {}", req.method(), req.uri());
     tracing::info!("H2 request: {} {}", req.method(), req.uri());
     let response = match &*ctx {
         H2Context::Backup(backup) => handle_h2_backup(backup, req).await,
@@ -4402,6 +4403,12 @@ async fn handle_protocol_upgrade(
     req: Request<Incoming>,
     protocol: &str,
 ) -> Response<Full<Bytes>> {
+    println!(
+        "H2 upgrade request: {} {} (protocol={})",
+        req.method(),
+        req.uri(),
+        protocol
+    );
     let auth_ctx = match authenticate(state.clone(), &req).await {
         Ok(ctx) => ctx,
         Err(e) => return error_response(e),
