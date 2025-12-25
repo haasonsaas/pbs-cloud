@@ -4614,6 +4614,12 @@ async fn handle_protocol_upgrade(
 async fn handle_h2_backup(ctx: &H2BackupContext, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().trim_start_matches('/').to_string();
+    let query = req.uri().query().unwrap_or("");
+    if query.is_empty() {
+        tracing::debug!("H2 backup request: {} {}", method, path);
+    } else {
+        tracing::debug!("H2 backup request: {} {}?{}", method, path, query);
+    }
 
     match (method, path.as_str()) {
         (Method::POST, "blob") => {
@@ -4894,7 +4900,10 @@ async fn handle_h2_backup(ctx: &H2BackupContext, req: Request<Incoming>) -> Resp
                     let response: FinishBackupResponse = result.into();
                     json_response(StatusCode::OK, &serde_json::json!({"data": response}))
                 }
-                Err(e) => error_response(e),
+                Err(e) => {
+                    tracing::error!("H2 backup finish error: {}", e);
+                    error_response(e)
+                }
             }
         }
         (Method::GET, "previous_backup_time") => {
