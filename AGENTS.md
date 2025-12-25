@@ -40,6 +40,10 @@
 - Format (CI): `cargo fmt --all -- --check`
 - Lint (CI): `cargo clippy --all-targets --all-features -- -D warnings`
 - Helm chart lint (CI): `helm lint ./charts/pbs-cloud`
+
+## Helm chart operations
+- Optional prune + GC CronJob: `pruneGc.*` in `charts/pbs-cloud/values.yaml`.
+- Keep `charts/pbs-cloud/files/pbs_prune_gc.py` in sync with `scripts/pbs_prune_gc.py`.
 - Docker build targets baseline x86-64 (no SSE4.1/PCLMULQDQ) for older CPUs.
 
 ## Pre-commit (optional)

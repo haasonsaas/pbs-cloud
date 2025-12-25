@@ -99,6 +99,38 @@ config:
     enabled: true
     intervalHours: 6
 
+# Scheduled prune + garbage collection job
+pruneGc:
+  enabled: false
+  schedule: "0 3 * * *"
+  store: "default"
+  dryRun: false
+  keepLast: null
+  keepDaily: null
+  keepWeekly: null
+  keepMonthly: null
+  keepYearly: null
+  url: ""
+  insecure: true
+  username: "root@pam"
+  apiTokenSecret:
+    name: ""
+    key: "token"
+  passwordSecret:
+    name: ""
+    key: "password"
+  image:
+    repository: python
+    tag: "3.12-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
 # TLS configuration
 tls:
   # Use self-signed certificate (generated at startup)

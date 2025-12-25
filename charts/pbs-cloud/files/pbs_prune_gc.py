@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# NOTE: Keep this file in sync with scripts/pbs_prune_gc.py
 import argparse
 import json
 import os

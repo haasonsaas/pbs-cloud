@@ -1,0 +1,122 @@
+{{- if .Values.pruneGc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pbs-cloud.fullname" . }}-prune-gc
+  labels:
+    {{- include "pbs-cloud.labels" . | nindent 4 }}
+data:
+  prune_gc.py: |
+{{- .Files.Get "files/pbs_prune_gc.py" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pbs-cloud.fullname" . }}-prune-gc
+  labels:
+    {{- include "pbs-cloud.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.pruneGc.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "pbs-cloud.selectorLabels" . | nindent 12 }}
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: prune-gc
+              image: "{{ .Values.pruneGc.image.repository }}:{{ .Values.pruneGc.image.tag }}"
+              imagePullPolicy: {{ .Values.pruneGc.image.pullPolicy }}
+              command:
+                - python
+                - /tmp/prune_gc.py
+              env:
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+                - name: PBS_URL
+                  value: {{ default (printf "https://%s:%v" (include "pbs-cloud.fullname" .) .Values.service.port) .Values.pruneGc.url | quote }}
+                - name: PBS_STORE
+                  value: {{ .Values.pruneGc.store | quote }}
+                - name: PBS_DRY_RUN
+                  value: {{ ternary "1" "0" .Values.pruneGc.dryRun | quote }}
+                - name: PBS_INSECURE
+                  value: {{ ternary "1" "0" .Values.pruneGc.insecure | quote }}
+                {{- if ne .Values.pruneGc.keepLast nil }}
+                - name: PBS_KEEP_LAST
+                  value: {{ .Values.pruneGc.keepLast | quote }}
+                {{- end }}
+                {{- if ne .Values.pruneGc.keepDaily nil }}
+                - name: PBS_KEEP_DAILY
+                  value: {{ .Values.pruneGc.keepDaily | quote }}
+                {{- end }}
+                {{- if ne .Values.pruneGc.keepWeekly nil }}
+                - name: PBS_KEEP_WEEKLY
+                  value: {{ .Values.pruneGc.keepWeekly | quote }}
+                {{- end }}
+                {{- if ne .Values.pruneGc.keepMonthly nil }}
+                - name: PBS_KEEP_MONTHLY
+                  value: {{ .Values.pruneGc.keepMonthly | quote }}
+                {{- end }}
+                {{- if ne .Values.pruneGc.keepYearly nil }}
+                - name: PBS_KEEP_YEARLY
+                  value: {{ .Values.pruneGc.keepYearly | quote }}
+                {{- end }}
+                {{- if .Values.pruneGc.apiTokenSecret.name }}
+                - name: PBS_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.pruneGc.apiTokenSecret.name | quote }}
+                      key: {{ .Values.pruneGc.apiTokenSecret.key | quote }}
+                {{- else if .Values.pruneGc.passwordSecret.name }}
+                - name: PBS_USERNAME
+                  value: {{ .Values.pruneGc.username | quote }}
+                - name: PBS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.pruneGc.passwordSecret.name | quote }}
+                      key: {{ .Values.pruneGc.passwordSecret.key | quote }}
+                {{- end }}
+              volumeMounts:
+                - name: prune-gc-script
+                  mountPath: /tmp/prune_gc.py
+                  subPath: prune_gc.py
+                  readOnly: true
+              {{- with .Values.securityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.pruneGc.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+          volumes:
+            - name: prune-gc-script
+              configMap:
+                name: {{ include "pbs-cloud.fullname" . }}-prune-gc
+                defaultMode: 0444
+          restartPolicy: OnFailure
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}
