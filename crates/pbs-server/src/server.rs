@@ -1264,10 +1264,13 @@ async fn authenticate(
                     // If no user by that exact name, create a synthetic auth context
                     // This handles PBS usernames like "root@pam" which we map to our token user
                     tracing::info!("[AUTH] User '{}' not found directly, using ticket auth", username);
-                    // Get any valid user from our auth system as fallback
-                    // In practice, the ticket was signed by us, so we trust the username
+                    // Look up the default tenant by name to get its actual ID
+                    let default_tenant_name = &state.config.tenants.default_tenant;
+                    let tenant = state.tenants.get_tenant_by_name(default_tenant_name).await
+                        .ok_or_else(|| ApiError::internal(&format!("Default tenant '{}' not found", default_tenant_name)))?;
+                    tracing::info!("[AUTH] Using tenant '{}' (id: {})", tenant.name, tenant.id);
                     return Ok(AuthContext {
-                        user: User::new(&username, "default", Permission::Admin),
+                        user: User::new(&username, &tenant.id, Permission::Admin),
                         token_id: None,
                         permission: Permission::Admin,
                     });

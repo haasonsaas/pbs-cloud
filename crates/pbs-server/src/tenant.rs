@@ -97,6 +97,12 @@ impl TenantManager {
         tenants.get(id).cloned()
     }
 
+    /// Get a tenant by name
+    pub async fn get_tenant_by_name(&self, name: &str) -> Option<Tenant> {
+        let tenants = self.tenants.read().await;
+        tenants.values().find(|t| t.name == name).cloned()
+    }
+
     /// List all tenants
     pub async fn list_tenants(&self) -> Vec<Tenant> {
         let tenants = self.tenants.read().await;

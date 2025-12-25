@@ -33,9 +33,16 @@ securityContext:
       - ALL
 
 service:
+  # Use LoadBalancer with Tailscale for backup protocol support
+  # The backup protocol requires HTTP/1.1 Upgrade headers which don't work
+  # through L7 proxies like Ingress. LoadBalancer provides L4 passthrough.
   type: ClusterIP
   port: 8007
   annotations: {}
+  # For Tailscale LoadBalancer (recommended for backup protocol):
+  # type: LoadBalancer
+  # loadBalancerClass: tailscale
+  loadBalancerClass: ""
 
 ingress:
   enabled: false
