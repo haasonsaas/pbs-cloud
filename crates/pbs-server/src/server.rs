@@ -2555,6 +2555,7 @@ async fn handle_h2_request(
     ctx: Arc<H2Context>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    tracing::info!("H2 request: {} {}", req.method(), req.uri());
     let response = match &*ctx {
         H2Context::Backup(backup) => handle_h2_backup(backup, req).await,
         H2Context::Reader(reader) => handle_h2_reader(reader, req).await,
@@ -4626,9 +4627,9 @@ async fn handle_h2_backup(ctx: &H2BackupContext, req: Request<Incoming>) -> Resp
     let path = req.uri().path().trim_start_matches('/').to_string();
     let query = req.uri().query().unwrap_or("");
     if query.is_empty() {
-        tracing::debug!("H2 backup request: {} {}", method, path);
+        tracing::info!("H2 backup request: {} {}", method, path);
     } else {
-        tracing::debug!("H2 backup request: {} {}?{}", method, path, query);
+        tracing::info!("H2 backup request: {} {}?{}", method, path, query);
     }
 
     match (method, path.as_str()) {
