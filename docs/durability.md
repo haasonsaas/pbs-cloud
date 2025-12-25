@@ -21,6 +21,21 @@ This document describes the durability assumptions and failure modes for PBS Clo
 - There is no explicit lease/epoch protocol yet, so GC can race with in-flight uploads.
 - Recommendation: run GC during low-traffic windows and avoid concurrent GC with large ingests.
 
+## Object count and chunk sizing
+
+- Chunk sizing is controlled by the **client** (`proxmox-backup-client`), not the server.
+- Upstream clients enforce `--chunk-size` between 64 KiB and 4 MiB (default 4 MiB).
+- Changing server-side constants does **not** reduce object counts; lowering object counts
+  requires either:
+  - Prune + GC to delete old/unreferenced chunks, and/or
+  - A forked client that allows larger chunk sizes (compatibility risk).
+
+## Suggested lifecycle hygiene (B2/S3)
+
+- Prefer prune + GC to remove objects; do **not** blindly expire `chunks/` objects.
+- If versioning is enabled, expire noncurrent versions after a short window.
+- Abort incomplete multipart uploads after a few days to reduce clutter.
+
 ## Object storage semantics (S3)
 
 - GC and verification rely on list/read operations being consistent enough to observe newly
