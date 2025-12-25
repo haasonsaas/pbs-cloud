@@ -3,6 +3,7 @@
 //! Handles both REST API and PBS backup protocol with TLS, rate limiting, and metrics.
 
 use std::collections::HashMap;
+use dashmap::DashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,8 @@ pub struct ServerState {
     pub verify_jobs: Arc<RwLock<HashMap<String, VerificationJobConfig>>>,
     /// Verification job state (last run, status)
     pub verify_job_state: Arc<RwLock<HashMap<String, VerificationJobState>>>,
+    /// Active session tickets (ticket -> username)
+    pub tickets: DashMap<String, String>,
 }
 
 impl ServerState {
@@ -308,6 +311,7 @@ impl ServerState {
             reader_tasks,
             verify_jobs,
             verify_job_state,
+            tickets: DashMap::new(),
         })
     }
 
@@ -1216,11 +1220,28 @@ async fn authenticate(
         return state.auth.authenticate_header(auth_str).await;
     }
 
-    // Check for PBS cookie-based auth
+    // Check for PBS cookie-based auth (ticket or token)
     if let Some(cookie) = req.headers().get("cookie") {
         let cookie_str = cookie.to_str().unwrap_or("");
-        if let Some(token) = extract_pbs_token(cookie_str) {
-            return state.auth.authenticate_token(token).await;
+        if let Some(ticket) = extract_pbs_token(cookie_str) {
+            // Check if it's a PBS ticket (PBS:username:timestamp:signature)
+            if ticket.starts_with("PBS:") {
+                // Validate ticket from ticket store
+                if let Some(entry) = state.tickets.get(ticket) {
+                    let username = entry.value().clone();
+                    // Look up user and create auth context
+                    if let Some(user) = state.auth.get_user_by_username(&username).await {
+                        return Ok(AuthContext {
+                            user,
+                            token_id: None,
+                            permission: Permission::Admin,
+                        });
+                    }
+                }
+                return Err(ApiError::unauthorized("Invalid or expired ticket"));
+            }
+            // Otherwise treat as API token
+            return state.auth.authenticate_token(ticket).await;
         }
     }
 
@@ -2878,10 +2899,28 @@ async fn handle_login(state: Arc<ServerState>, req: Request<Incoming>) -> Respon
     match state.auth.authenticate_token(&params.password).await {
         Ok(ctx) => {
             audit::log_auth_success(&params.username, &ctx.user.tenant_id, None);
+            // Generate PBS-compatible ticket: PBS:username:timestamp:signature
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let ticket_data = format!("PBS:{}:{:08X}", ctx.user.username, timestamp);
+            // Sign with HMAC-SHA256 using the token as key
+            use hmac::{Hmac, Mac};
+            type HmacSha256 = Hmac<sha2::Sha256>;
+            let mut mac = HmacSha256::new_from_slice(params.password.as_bytes())
+                .expect("HMAC can take key of any size");
+            mac.update(ticket_data.as_bytes());
+            let signature = hex::encode(mac.finalize().into_bytes());
+            let ticket = format!("{}:{}", ticket_data, signature);
+
+            // Store ticket for validation
+            state.tickets.insert(ticket.clone(), ctx.user.username.clone());
+
             let response = serde_json::json!({
                 "data": {
                     "username": ctx.user.username,
-                    "ticket": params.password,  // Echo back the token
+                    "ticket": ticket,
                     "CSRFPreventionToken": "not-used"
                 }
             });
