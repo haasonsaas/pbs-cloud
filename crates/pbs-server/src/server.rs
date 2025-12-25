@@ -4529,7 +4529,7 @@ async fn handle_protocol_upgrade(
                     .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
                     .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
                     .max_concurrent_streams(100)
-                    .max_frame_size(16 * 1024 * 1024) // 16MB frames
+                    .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
                     .serve_connection(
                         upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
@@ -4592,7 +4592,7 @@ async fn handle_protocol_upgrade(
                     .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
                     .initial_connection_window_size(64 * 1024 * 1024) // 64MB connection
                     .max_concurrent_streams(100)
-                    .max_frame_size(16 * 1024 * 1024) // 16MB frames
+                    .max_frame_size((1 << 24) - 1) // Max allowed by HTTP/2 spec (16MB - 1 byte)
                     .serve_connection(
                         upgraded,
                         service_fn(move |req| handle_h2_request(ctx.clone(), req)),
