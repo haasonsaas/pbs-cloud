@@ -353,10 +353,10 @@ fn read_storage_info(path: &Path) -> Option<StorageInfo> {
         if result != 0 {
             return None;
         }
-        let block_size = vfs.f_frsize;
-        let total = vfs.f_blocks * block_size;
-        let free = vfs.f_bfree * block_size;
-        let avail = vfs.f_bavail * block_size;
+        let block_size = vfs.f_frsize as u64;
+        let total = (vfs.f_blocks as u64) * block_size;
+        let free = (vfs.f_bfree as u64) * block_size;
+        let avail = (vfs.f_bavail as u64) * block_size;
         let used = total.saturating_sub(free);
         Some(StorageInfo { total, used, avail })
     }
