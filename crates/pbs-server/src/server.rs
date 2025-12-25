@@ -735,7 +735,9 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let start = Instant::now();
     let method = req.method().clone();
+    // Normalize path: collapse multiple slashes to single slash
     let path = req.uri().path().to_string();
+    let path = path.replace("//", "/");
 
     debug!("{} {} from {}", method, path, peer_addr);
 
