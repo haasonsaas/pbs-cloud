@@ -4522,20 +4522,25 @@ async fn handle_protocol_upgrade(
 
         let upgrade_fut = hyper::upgrade::on(req);
         tokio::spawn(async move {
-            if let Ok(upgraded) = upgrade_fut.await {
-                // Configure H2 with large window sizes for backup workloads
-                // PBS chunks can be up to 4MB, so we need large flow control windows
-                let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
-                    .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
-                    .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
-                    .serve_connection(
-                        upgraded,
-                        service_fn(move |req| handle_h2_request(ctx.clone(), req)),
-                    )
-                    .await;
-                if let Err(e) = result {
-                    tracing::error!("Backup H2 connection error: {:?}", e);
+            match upgrade_fut.await {
+                Ok(upgraded) => {
+                    // Configure H2 with large window sizes for backup workloads
+                    // PBS chunks can be up to 4MB, so we need large flow control windows
+                    let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
+                        .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
+                        .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
+                        .serve_connection(
+                            upgraded,
+                            service_fn(move |req| handle_h2_request(ctx.clone(), req)),
+                        )
+                        .await;
+                    if let Err(e) = result {
+                        tracing::error!("Backup H2 connection error: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Backup protocol upgrade failed: {:?}", e);
                 }
             }
         });
@@ -4585,19 +4590,24 @@ async fn handle_protocol_upgrade(
 
         let upgrade_fut = hyper::upgrade::on(req);
         tokio::spawn(async move {
-            if let Ok(upgraded) = upgrade_fut.await {
-                // Configure H2 with large window sizes for restore workloads
-                let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
-                    .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
-                    .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
-                    .serve_connection(
-                        upgraded,
-                        service_fn(move |req| handle_h2_request(ctx.clone(), req)),
-                    )
-                    .await;
-                if let Err(e) = result {
-                    tracing::error!("Reader H2 connection error: {:?}", e);
+            match upgrade_fut.await {
+                Ok(upgraded) => {
+                    // Configure H2 with large window sizes for restore workloads
+                    let result = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .initial_stream_window_size(32 * 1024 * 1024) // 32MB per stream
+                        .initial_connection_window_size(32 * 1024 * 1024) // 32MB connection
+                        .max_frame_size(4 * 1024 * 1024) // Match upstream PBS (4MB)
+                        .serve_connection(
+                            upgraded,
+                            service_fn(move |req| handle_h2_request(ctx.clone(), req)),
+                        )
+                        .await;
+                    if let Err(e) = result {
+                        tracing::error!("Reader H2 connection error: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Reader protocol upgrade failed: {:?}", e);
                 }
             }
         });
@@ -4894,12 +4904,12 @@ async fn handle_h2_backup(ctx: &H2BackupContext, req: Request<Incoming>) -> Resp
             }
         }
         (Method::POST, "finish") => {
+            if req.collect().await.is_err() {
+                return bad_request("Failed to read finish body");
+            }
             let handler = BackupProtocolHandler::new(ctx.state.clone());
             match handler.finish_backup(&ctx.session_id, &ctx.tenant_id).await {
-                Ok(result) => {
-                    let response: FinishBackupResponse = result.into();
-                    json_response(StatusCode::OK, &serde_json::json!({"data": response}))
-                }
+                Ok(_) => json_response(StatusCode::OK, &serde_json::json!({"data": null})),
                 Err(e) => {
                     tracing::error!("H2 backup finish error: {}", e);
                     error_response(e)
