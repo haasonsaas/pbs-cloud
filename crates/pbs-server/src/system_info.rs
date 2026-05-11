@@ -243,15 +243,11 @@ fn read_cpu_info() -> Option<CpuInfo> {
         let value = parts.next().unwrap_or("").trim();
         match key {
             "processor" => cpus += 1,
-            "model name" => {
-                if model.is_empty() {
-                    model = value.to_string();
-                }
+            "model name" if model.is_empty() => {
+                model = value.to_string();
             }
-            "physical id" => {
-                if !value.is_empty() {
-                    sockets.insert(value.to_string());
-                }
+            "physical id" if !value.is_empty() => {
+                sockets.insert(value.to_string());
             }
             _ => {}
         }

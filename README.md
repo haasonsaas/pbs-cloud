@@ -1,3 +1,8 @@
+# Archived
+
+This repository has moved into the `haasonsaas/homelab` monorepo under
+`services/pbs-cloud`. New code changes and releases should be made there.
+
 # PBS Cloud
 
 [![CI](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml/badge.svg)](https://github.com/haasonsaas/pbs-cloud/actions/workflows/ci.yaml)
